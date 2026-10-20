@@ -26,7 +26,10 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `DescribeAddon` | Describe an addon by cluster and addon name |
 | `ListAddons` | List addon names installed in a cluster with pagination |
 | `UpdateAddon` | Update addon configuration, version, or service account role |
-| `DescribeUpdate` | Describe an update for an addon |
+| `UpdateClusterConfig` | Update endpoint access, control-plane logging, or the authentication mode of a cluster |
+| `UpdateClusterVersion` | Move a cluster to the next Kubernetes minor version (metadata only) |
+| `DescribeUpdate` | Describe a cluster or addon update by update ID |
+| `ListUpdates` | List update IDs for a cluster, optionally filtered by addon or node group name |
 | `DeleteAddon` | Delete an addon from a cluster |
 | `DescribeAddonVersions` | Describe supported addon versions by Kubernetes version or addon name |
 | `CreateNodegroup` | Create node group metadata for a cluster |
@@ -40,6 +43,32 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `TagResource` | Add tags to a cluster |
 | `UntagResource` | Remove tags from a cluster |
 | `ListTagsForResource` | List tags on a cluster |
+
+## Cluster updates
+
+`UpdateClusterConfig` (`POST /clusters/{name}/update-config`) changes exactly one of
+`resourcesVpcConfig`, `logging`, or `accessConfig` per request, as on AWS: a request that
+names none of them, or more than one, is an `InvalidParameterException`. The cluster must be
+`ACTIVE`. Updates complete synchronously and return an `Update` with status `Successful`:
+
+- `resourcesVpcConfig`: `endpointPublicAccess`, `endpointPrivateAccess` and `publicAccessCidrs`
+  are applied to the cluster (update type `VpcConfigUpdate`). Disabling both endpoints is
+  rejected. `subnetIds` and `securityGroupIds` cannot be changed in Floci.
+- `logging`: each `clusterLogging` entry enables or disables the listed types, leaving the
+  others as they were (`LoggingUpdate`). The cluster keeps the normalized enabled/disabled form
+  returned by `DescribeCluster`.
+- `accessConfig.authenticationMode`: moves forward only, `CONFIG_MAP` to `API_AND_CONFIG_MAP`
+  to `API` (`AccessConfigUpdate`). A no-op or backward change is rejected, as on AWS.
+
+`UpdateClusterVersion` (`POST /clusters/{name}/updates`) accepts the next minor version
+only and records it on the cluster (`VersionUpdate`). In real mode the running k3s control
+plane is not upgraded in place; the new version is used when the cluster is next started.
+
+`ListUpdates` (`GET /clusters/{name}/updates`) returns the IDs of cluster and addon updates,
+with `maxResults` and `nextToken` pagination; `addonName` narrows it to that addon's updates and
+`nodegroupName` yields an empty list because node group updates are not modeled. `DescribeUpdate`
+(`GET /clusters/{name}/updates/{updateId}`) resolves either kind of update and returns
+`ResourceNotFoundException` when neither store has it. Deleting a cluster drops its updates.
 
 ## Access-entry management
 
@@ -1064,8 +1093,6 @@ eks.deleteCluster(r -> r.name("my-cluster"));
 
 The following EKS features are not yet supported:
 
-- `UpdateClusterConfig` / `UpdateClusterVersion`
 - `UpdateNodegroupConfig` / `UpdateNodegroupVersion`
-- Add-ons (`CreateAddon`, `DescribeAddon`, `ListAddons`)
 - Identity provider configs
 - Access policies
