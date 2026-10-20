@@ -9,12 +9,14 @@ import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
+import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -31,6 +33,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -68,6 +71,66 @@ class EksCfnProvisionerTest {
         assertEquals("LS0tLS1CRUdJTg==", r.getAttributes().get("CertificateAuthorityData"));
         assertEquals("https://oidc.eks.us-east-1.amazonaws.com/id/ABC",
                 r.getAttributes().get("OpenIdConnectIssuerUrl"));
+    }
+
+    @Test
+    void clusterInCreatingStateIsReportedOnlyOnceActiveWithTheEndpointItThenHas() throws Exception {
+        Cluster creating = new Cluster();
+        creating.setName("prod");
+        creating.setStatus(ClusterStatus.CREATING);
+        Cluster active = new Cluster();
+        active.setName("prod");
+        active.setStatus(ClusterStatus.ACTIVE);
+        active.setArn("arn:aws:eks:us-east-1:000000000000:cluster/prod");
+        active.setEndpoint("https://floci-service:6500");
+        active.setCertificateAuthority(new CertificateAuthority("LS0tLS1CRUdJTg=="));
+        when(eks.createCluster(any(CreateClusterRequest.class))).thenReturn(creating);
+        when(eks.describeCluster("prod")).thenReturn(creating, creating, active);
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, Duration.ofSeconds(5), Duration.ofMillis(1));
+
+        StackResource r = resource("AWS::EKS::Cluster", "Control");
+        waiting.provision(r, props("{\"Name\": \"prod\"}"), ctx());
+
+        verify(eks, times(3)).describeCluster("prod");
+        assertEquals("https://floci-service:6500", r.getAttributes().get("Endpoint"));
+        assertEquals("LS0tLS1CRUdJTg==", r.getAttributes().get("CertificateAuthorityData"));
+        assertNull(r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+    }
+
+    @Test
+    void clusterStillCreatingAtTheDeadlineFailsTheResourceAndLeavesItRollbackOwned() throws Exception {
+        Cluster creating = new Cluster();
+        creating.setName("prod");
+        creating.setStatus(ClusterStatus.CREATING);
+        when(eks.createCluster(any(CreateClusterRequest.class))).thenReturn(creating);
+        when(eks.describeCluster("prod")).thenReturn(creating);
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, Duration.ofMillis(20), Duration.ofMillis(1));
+
+        StackResource r = resource("AWS::EKS::Cluster", "Control");
+        AwsException failure = assertThrows(AwsException.class,
+                () -> waiting.provision(r, props("{\"Name\": \"prod\"}"), ctx()));
+
+        assertEquals("ResourceNotReady", failure.getErrorCode());
+        assertEquals("prod", r.getPhysicalId());
+        assertEquals("true", r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+    }
+
+    @Test
+    void clusterThatFailsWhileCreatingFailsTheResource() throws Exception {
+        Cluster creating = new Cluster();
+        creating.setName("prod");
+        creating.setStatus(ClusterStatus.CREATING);
+        Cluster failed = new Cluster();
+        failed.setName("prod");
+        failed.setStatus(ClusterStatus.FAILED);
+        when(eks.createCluster(any(CreateClusterRequest.class))).thenReturn(creating);
+        when(eks.describeCluster("prod")).thenReturn(failed);
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, Duration.ofSeconds(5), Duration.ofMillis(1));
+
+        AwsException failure = assertThrows(AwsException.class, () ->
+                waiting.provision(resource("AWS::EKS::Cluster", "Control"), props("{\"Name\": \"prod\"}"), ctx()));
+
+        assertEquals("ResourceNotReady", failure.getErrorCode());
     }
 
     @Test

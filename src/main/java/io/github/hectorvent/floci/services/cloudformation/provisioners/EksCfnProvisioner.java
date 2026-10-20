@@ -4,12 +4,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.eks.model.AccessConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
+import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.Set;
 
@@ -26,11 +29,23 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
     private static final String CLUSTER = "AWS::EKS::Cluster";
     private static final String NODEGROUP = "AWS::EKS::Nodegroup";
 
+    /** Real-mode clusters boot a k3s container; CloudFormation reports the cluster once it is ACTIVE. */
+    static final Duration CLUSTER_ACTIVE_TIMEOUT = Duration.ofMinutes(15);
+    static final Duration CLUSTER_ACTIVE_POLL = Duration.ofSeconds(3);
+
     private final EksService eksService;
+    private final Duration clusterActiveTimeout;
+    private final Duration clusterActivePoll;
 
     @Inject
     public EksCfnProvisioner(EksService eksService) {
+        this(eksService, CLUSTER_ACTIVE_TIMEOUT, CLUSTER_ACTIVE_POLL);
+    }
+
+    EksCfnProvisioner(EksService eksService, Duration clusterActiveTimeout, Duration clusterActivePoll) {
         this.eksService = eksService;
+        this.clusterActiveTimeout = clusterActiveTimeout;
+        this.clusterActivePoll = clusterActivePoll;
     }
 
     @Override
@@ -64,6 +79,9 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
 
         Cluster cluster = eksService.createCluster(request);
         r.setPhysicalId(cluster.getName());
+        if (cluster.getStatus() == ClusterStatus.CREATING) {
+            cluster = awaitClusterActive(r, cluster.getName());
+        }
         r.getAttributes().put("Arn", cluster.getArn());
         if (cluster.getEndpoint() != null) {
             r.getAttributes().put("Endpoint", cluster.getEndpoint());
@@ -74,6 +92,38 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         if (cluster.getIdentity() != null && cluster.getIdentity().getOidc() != null
                 && cluster.getIdentity().getOidc().getIssuer() != null) {
             r.getAttributes().put("OpenIdConnectIssuerUrl", cluster.getIdentity().getOidc().getIssuer());
+        }
+    }
+
+    /**
+     * Waits for a cluster this provision created to become ACTIVE, as CloudFormation does before
+     * it reports the resource complete and lets its dependants (access entries, addons, pod
+     * identity associations) proceed. The resource is marked as owned meanwhile, so a cluster
+     * that never comes up is deleted by the create rollback.
+     */
+    private Cluster awaitClusterActive(StackResource r, String name) {
+        r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+        long deadline = System.nanoTime() + clusterActiveTimeout.toNanos();
+        while (true) {
+            Cluster current = eksService.describeCluster(name);
+            if (current.getStatus() == ClusterStatus.ACTIVE) {
+                r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
+                return current;
+            }
+            if (current.getStatus() != ClusterStatus.CREATING) {
+                throw new AwsException("ResourceNotReady", "Cluster " + name + " did not become ACTIVE: "
+                        + current.getStatus(), 400);
+            }
+            if (System.nanoTime() - deadline >= 0) {
+                throw new AwsException("ResourceNotReady", "Cluster " + name + " was still CREATING after "
+                        + clusterActiveTimeout.toSeconds() + " seconds", 400);
+            }
+            try {
+                Thread.sleep(clusterActivePoll.toMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AwsException("ResourceNotReady", "Interrupted while waiting for cluster " + name, 400);
+            }
         }
     }
 
