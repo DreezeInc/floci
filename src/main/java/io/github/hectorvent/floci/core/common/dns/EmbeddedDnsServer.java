@@ -97,6 +97,8 @@ public class EmbeddedDnsServer {
 
     private volatile String serverIp;
     private final SequencedSet<String> suffixes = new LinkedHashSet<>();
+    private final SequencedSet<String> awsSuffixes = new LinkedHashSet<>();
+    private final SequencedSet<String> spoofedAwsServices = new LinkedHashSet<>();
     private volatile List<String> upstreamDnsServers = List.of();
     private volatile WorkerExecutor forwardPool;
     // Held as the Iterable a CDI Instance already is, so iterating resolves the beans lazily on
@@ -119,9 +121,20 @@ public class EmbeddedDnsServer {
     }
 
     EmbeddedDnsServer(List<String> suffixes, boolean spoofAwsEndpoints) {
+        this(suffixes, spoofAwsEndpoints, List.of());
+    }
+
+    EmbeddedDnsServer(List<String> suffixes, boolean spoofAwsEndpoints, List<String> spoofAwsServices) {
         this(suffixes, List.of());
         if (spoofAwsEndpoints) {
-            this.suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+            spoofAwsEndpoints(spoofAwsServices);
+        }
+    }
+
+    private void spoofAwsEndpoints(List<String> services) {
+        awsSuffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+        for (String service : services) {
+            spoofedAwsServices.add(service.trim().toLowerCase());
         }
     }
 
@@ -159,7 +172,7 @@ public class EmbeddedDnsServer {
             config.hostname().ifPresent(suffixes::add);
             config.dns().extraSuffixes().ifPresent(suffixes::addAll);
             if (config.dns().spoofAwsEndpoints()) {
-                suffixes.addAll(TlsConfigSource.awsEndpointSuffixes());
+                spoofAwsEndpoints(config.dns().spoofAwsServices().orElse(List.of()));
                 if (shouldWarnSpoofInvisibleToTls(true, TlsConfigSource.tlsEnabledVisibleToTls(),
                         TlsConfigSource.spoofAwsEndpointsVisibleToTls())) {
                     LOG.warnv("floci.dns.spoof-aws-endpoints is set in application config but the TLS certificate only reads it from FLOCI_DNS_SPOOF_AWS_ENDPOINTS or -Dfloci.dns.spoof-aws-endpoints; https:// calls to {0} will fail the handshake until it is set there.", TlsConfigSource.awsEndpointSuffixes());
@@ -173,7 +186,10 @@ public class EmbeddedDnsServer {
             socket.listen(DNS_PORT, myIp, ar -> {
                 if (ar.succeeded()) {
                     serverIp = myIp;
-                    LOG.infov("Embedded DNS server started on {0}:53, resolving {1} → {0}", myIp, suffixes);
+                    LOG.infov("Embedded DNS server started on {0}:53, resolving {1} → {0}{2}", myIp, suffixes,
+                            awsSuffixes.isEmpty() ? "" : spoofedAwsServices.isEmpty()
+                                    ? ", spoofing every AWS endpoint name"
+                                    : ", spoofing AWS endpoint names of " + spoofedAwsServices);
                     socket.handler(packet -> handleQuery(
                             vertx, socket, packet.data().getBytes(),
                             packet.sender().host(), packet.sender().port(), myIp));
@@ -249,6 +265,20 @@ public class EmbeddedDnsServer {
             if (DomainNames.isWithin(lower, s)) {
                 return true;
             }
+        }
+        return matchesSpoofedAwsEndpoint(lower);
+    }
+
+    private boolean matchesSpoofedAwsEndpoint(String lower) {
+        for (String suffix : awsSuffixes) {
+            if (!DomainNames.isWithin(lower, suffix.toLowerCase())) {
+                continue;
+            }
+            if (spoofedAwsServices.isEmpty()) {
+                return true;
+            }
+            int firstDot = lower.indexOf('.');
+            return firstDot > 0 && spoofedAwsServices.contains(lower.substring(0, firstDot));
         }
         return false;
     }

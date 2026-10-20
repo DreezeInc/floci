@@ -243,6 +243,18 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean spoofAwsEndpoints();
+
+        /**
+         * Narrows {@link #spoofAwsEndpoints()} to the listed service ids: only AWS endpoint names
+         * whose first label is one of them ({@code sts} covers {@code sts.amazonaws.com} and
+         * {@code sts.<region>.amazonaws.com}) resolve to Floci; every other AWS name keeps the
+         * normal upstream resolution, so public content hosted on AWS (container registries
+         * redirecting to S3, package mirrors) stays reachable from spawned containers.
+         *
+         * <p>Unset means every AWS name is spoofed, as before.
+         * Env: {@code FLOCI_DNS_SPOOF_AWS_SERVICES} (comma-separated)
+         */
+        Optional<List<String>> spoofAwsServices();
     }
 
     interface SecurityConfig {

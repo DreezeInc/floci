@@ -325,6 +325,8 @@ class EventBridgeSchedulerIntegrationTest {
                     public List<String> containerFallbackServers() { return List.of("8.8.8.8", "8.8.4.4"); }
                     @Override
                     public boolean spoofAwsEndpoints() { return false; }
+                    @Override
+                    public Optional<List<String>> spoofAwsServices() { return Optional.empty(); }
                 };
             }
             @Override
