@@ -3144,6 +3144,7 @@ class EksClusterManagerTest {
         private ContainerLifecycleManager lifecycleManager;
         private CopyArchiveToContainerCmd copyCmd;
         private EksClusterManager manager;
+        private ContainerBuilder.Builder builder;
 
         @BeforeEach
         void setUp() {
@@ -3173,7 +3174,7 @@ class EksClusterManagerTest {
                     .thenReturn(new ContainerInfo("container-1", Map.of()));
 
             ContainerBuilder containerBuilder = Mockito.mock(ContainerBuilder.class);
-            ContainerBuilder.Builder builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
+            builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
             when(containerBuilder.newContainer(anyString())).thenReturn(builder);
             when(builder.build()).thenReturn(new ContainerSpec("test-image"));
 
@@ -3246,6 +3247,69 @@ class EksClusterManagerTest {
             when(eks.podIdentityWebhook()).thenReturn(false);
 
             manager.registerPodIdentityWebhook("container-1", cluster());
+
+            verify(lifecycleManager, never()).getDockerClient();
+        }
+
+        @Test
+        void startClusterAlwaysWrapsK3sInTheRshareEntrypoint() {
+            when(eks.disableCni()).thenReturn(false);
+
+            manager.startCluster(cluster());
+
+            verify(builder).withEntrypoint(EksClusterManager.RSHARE_ENTRYPOINT);
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<String>> cmdCaptor = ArgumentCaptor.forClass(List.class);
+            verify(builder).withCmd(cmdCaptor.capture());
+            // DaemonSets that mount the node root with mountPropagation (node-exporter) need
+            // the shared root as much as an external CNI does, so the wrap is not CNI-gated.
+            assertEquals("floci-k3s", cmdCaptor.getValue().get(0));
+            assertTrue(cmdCaptor.getValue().contains("server"));
+        }
+
+        @Test
+        void ebsStorageManifestServesGp2AndBothEbsProvisionerNames() {
+            String manifest = EksClusterManager.buildEbsStorageManifest(true);
+
+            assertTrue(manifest.contains("kind: StorageClass\nmetadata:\n  name: gp2\n"));
+            assertTrue(manifest.contains("storageclass.kubernetes.io/is-default-class: \"true\""));
+            assertTrue(manifest.contains("provisioner: kubernetes.io/aws-ebs\n"));
+            assertTrue(manifest.contains("- --provisioner-name\n        - ebs.csi.aws.com\n"));
+            assertTrue(manifest.contains("- --provisioner-name\n        - kubernetes.io/aws-ebs\n"));
+            // Node-path mode refuses Immediate binding; shared mode serves both binding modes.
+            assertTrue(manifest.contains("\"sharedFileSystemPath\": \"/var/lib/rancher/k3s/storage/floci-ebs\""));
+            assertFalse(manifest.contains("nodePathMap"));
+            assertTrue(manifest.contains("kind: ClusterRoleBinding"), "k3s's local-storage RBAC is off, so it ships its own");
+        }
+
+        @Test
+        void gp2StaysNonDefaultWhenK3sKeepsItsOwnDefaultClass() {
+            String manifest = EksClusterManager.buildEbsStorageManifest(false);
+
+            assertFalse(manifest.contains("is-default-class"));
+            assertTrue(manifest.contains("  name: gp2\n"));
+        }
+
+        @Test
+        void writesTheEbsStorageManifestIntoTheK3sManifestsDirectory() throws Exception {
+            when(eks.emulateEbsStorage()).thenReturn(true);
+            Cluster cluster = cluster();
+            cluster.setDefaultStorageClass(false);
+
+            manager.registerEbsStorageEmulation("container-1", cluster);
+
+            verify(copyCmd).withRemotePath("/var/lib/rancher/k3s");
+            verify(copyCmd).exec();
+            String written = Files.readString(tempDir.resolve("storage").resolve("demo")
+                    .resolve("floci-eks-ebs-storage.yaml"));
+            assertTrue(written.contains("is-default-class"));
+        }
+
+        @Test
+        void skipsEbsStorageWhenTheKnobIsOff() {
+            when(eks.emulateEbsStorage()).thenReturn(false);
+
+            manager.registerEbsStorageEmulation("container-1", cluster());
 
             verify(lifecycleManager, never()).getDockerClient();
         }

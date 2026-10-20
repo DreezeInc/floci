@@ -3392,6 +3392,16 @@ public interface EmulatorConfig {
         boolean defaultStorageClass();
 
         /**
+         * When true, every new cluster gets the stock EKS {@code gp2} StorageClass and a provisioner
+         * that serves it, and any other StorageClass naming {@code ebs.csi.aws.com} or
+         * {@code kubernetes.io/aws-ebs}, from the node's filesystem, so workloads written for EBS
+         * bind their claims without the EBS CSI driver. {@code gp2} is the cluster's default class
+         * unless {@link #defaultStorageClass()} keeps k3s's own.
+         */
+        @WithDefault("false")
+        boolean emulateEbsStorage();
+
+        /**
          * When true, exposes an IMDS link-local proxy (169.254.169.254:80) inside the cluster container's
          * network namespace that relays to Floci's EC2 metadata service.
          */

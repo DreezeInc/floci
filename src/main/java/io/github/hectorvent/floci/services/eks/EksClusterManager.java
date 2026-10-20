@@ -129,6 +129,13 @@ public class EksClusterManager
     static final String CONTAINERD_CERTS_LINK = "etc/containerd/certs.d";
     static final String POD_IDENTITY_MANIFEST_FILE = "floci-eks-pod-identity.yaml";
     static final String POD_IDENTITY_MANIFEST_TAR_ENTRY = "server/manifests/" + POD_IDENTITY_MANIFEST_FILE;
+    static final String EBS_STORAGE_MANIFEST_FILE = "floci-eks-ebs-storage.yaml";
+    static final String EBS_STORAGE_MANIFEST_TAR_ENTRY = "server/manifests/" + EBS_STORAGE_MANIFEST_FILE;
+    static final String EBS_CSI_PROVISIONER = "ebs.csi.aws.com";
+    static final String EBS_IN_TREE_PROVISIONER = "kubernetes.io/aws-ebs";
+    static final String EBS_STORAGE_PATH = K3S_DATA_DIR + "/storage/floci-ebs";
+    static final String EBS_PROVISIONER_IMAGE = "rancher/local-path-provisioner:v0.0.37";
+    static final String EBS_HELPER_IMAGE = "rancher/mirrored-library-busybox:1.37.0";
     /** The pod identity webhook reads service account annotations through the cluster's own kubectl. */
     static final int SERVICE_ACCOUNT_LOOKUP_TIMEOUT_SECONDS = 10;
     private static final ObjectMapper SERVICE_ACCOUNT_JSON = new ObjectMapper();
@@ -706,19 +713,16 @@ public class EksClusterManager
             serverArgs.addAll(callerArgs);
         }
 
-        if (config.services().eks().disableCni()) {
-            // A container's /sys mount defaults to private propagation, which breaks
-            // Cilium's BPF filesystem mount ("mounted on /sys but it is not a shared or
-            // slave mount") — real EKS/kubeadm nodes don't hit this since they're VMs,
-            // not nested containers. `mount --make-rshared /` before k3s starts fixes
-            // it; kind's own node image runs the same fix in its entrypoint for the
-            // same reason. RSHARE_ENTRYPOINT is POSIX sh-compatible (no bashisms) — the
-            // k3s image has no bash, only busybox sh.
-            specBuilder.withEntrypoint(RSHARE_ENTRYPOINT);
-            specBuilder.withCmd(buildRshareWrappedCmd(serverArgs));
-        } else {
-            specBuilder.withCmd(serverArgs);
-        }
+        // A container's mounts default to private propagation, which breaks anything that
+        // needs a shared or slave mount on the node: Cilium's BPF filesystem mount on /sys
+        // ("mounted on /sys but it is not a shared or slave mount"), and every DaemonSet
+        // that mounts the node root with mountPropagation (node-exporter, CSI drivers).
+        // Real EKS/kubeadm nodes don't hit this since they're VMs, not nested containers.
+        // `mount --make-rshared /` before k3s starts fixes it; kind's own node image runs
+        // the same fix in its entrypoint for the same reason. RSHARE_ENTRYPOINT is POSIX
+        // sh-compatible (no bashisms) — the k3s image has no bash, only busybox sh.
+        specBuilder.withEntrypoint(RSHARE_ENTRYPOINT);
+        specBuilder.withCmd(buildRshareWrappedCmd(serverArgs));
         ContainerSpec spec = specBuilder.build();
 
         // create -> inject webhook kubeconfig -> start, so the file exists before the API server boots.
@@ -733,6 +737,7 @@ public class EksClusterManager
         injectEcrRegistryMirror(containerId, cluster);
         linkContainerdCertsDir(containerId, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
+        registerEbsStorageEmulation(containerId, cluster);
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
@@ -2102,6 +2107,184 @@ public class EksClusterManager
             LOG.warnv("EKS cluster {0} gets no pod identity injection: could not copy {1} into the k3s "
                     + "container: {2}", clusterName, POD_IDENTITY_MANIFEST_FILE, e.getMessage());
         }
+    }
+
+    /**
+     * Gives the cluster the stock EKS {@code gp2} StorageClass and a provisioner for it and for any
+     * StorageClass naming an EBS provisioner, so claims written for EBS bind to the node's
+     * filesystem. local-path-provisioner runs in shared-filesystem mode because node-path mode
+     * refuses {@code Immediate} binding ("no node was specified"); on a one-node cluster the two
+     * modes mean the same disk. Like the webhook manifest, a copy failure leaves the cluster
+     * running, without the storage.
+     */
+    void registerEbsStorageEmulation(String containerId, Cluster cluster) {
+        if (!config.services().eks().emulateEbsStorage()) {
+            return;
+        }
+        String clusterName = cluster.getName();
+        boolean gp2IsDefault = !Boolean.TRUE.equals(cluster.getDefaultStorageClass());
+        String manifest = buildEbsStorageManifest(gp2IsDefault);
+        writeLocalCopy(Paths.get(config.services().eks().dataPath(), "storage", clusterName,
+                EBS_STORAGE_MANIFEST_FILE), manifest, clusterName);
+        try {
+            lifecycleManager.getDockerClient()
+                    .copyArchiveToContainerCmd(containerId)
+                    .withTarInputStream(new ByteArrayInputStream(
+                            tarSingleFile(EBS_STORAGE_MANIFEST_TAR_ENTRY, manifest)))
+                    .withRemotePath(K3S_DATA_DIR)
+                    .exec();
+            LOG.infov("Serving the gp2, {0} and {1} StorageClasses of cluster {2} from {3}",
+                    EBS_CSI_PROVISIONER, EBS_IN_TREE_PROVISIONER, clusterName, EBS_STORAGE_PATH);
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} gets no EBS storage emulation: could not copy {1} into the k3s "
+                    + "container: {2}", clusterName, EBS_STORAGE_MANIFEST_FILE, e.getMessage());
+        }
+    }
+
+    /**
+     * The gp2 StorageClass as EKS ships it (minus the default annotation when k3s keeps its own
+     * default), and one Deployment running local-path-provisioner once per EBS provisioner name,
+     * with its own RBAC because k3s's local-storage objects are absent when that component is off.
+     */
+    static String buildEbsStorageManifest(boolean gp2IsDefault) {
+        String defaultAnnotation = gp2IsDefault
+                ? "    storageclass.kubernetes.io/is-default-class: \"true\"\n"
+                : "";
+        return "apiVersion: storage.k8s.io/v1\n"
+                + "kind: StorageClass\n"
+                + "metadata:\n"
+                + "  name: gp2\n"
+                + "  annotations:\n"
+                + "    floci.io/emulated: \"ebs\"\n"
+                + defaultAnnotation
+                + "provisioner: " + EBS_IN_TREE_PROVISIONER + "\n"
+                + "parameters:\n"
+                + "  fsType: ext4\n"
+                + "  type: gp2\n"
+                + "volumeBindingMode: WaitForFirstConsumer\n"
+                + "reclaimPolicy: Delete\n"
+                + "---\n"
+                + "apiVersion: v1\n"
+                + "kind: ServiceAccount\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "---\n"
+                + "apiVersion: rbac.authorization.k8s.io/v1\n"
+                + "kind: ClusterRole\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "rules:\n"
+                + "- apiGroups: [\"\"]\n"
+                + "  resources: [\"nodes\", \"persistentvolumeclaims\", \"configmaps\", \"pods/log\"]\n"
+                + "  verbs: [\"get\", \"list\", \"watch\"]\n"
+                + "- apiGroups: [\"\"]\n"
+                + "  resources: [\"endpoints\", \"persistentvolumes\", \"pods\"]\n"
+                + "  verbs: [\"*\"]\n"
+                + "- apiGroups: [\"\"]\n"
+                + "  resources: [\"events\"]\n"
+                + "  verbs: [\"create\", \"patch\"]\n"
+                + "- apiGroups: [\"storage.k8s.io\"]\n"
+                + "  resources: [\"storageclasses\"]\n"
+                + "  verbs: [\"get\", \"list\", \"watch\"]\n"
+                + "---\n"
+                + "apiVersion: rbac.authorization.k8s.io/v1\n"
+                + "kind: ClusterRoleBinding\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "roleRef:\n"
+                + "  apiGroup: rbac.authorization.k8s.io\n"
+                + "  kind: ClusterRole\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "subjects:\n"
+                + "- kind: ServiceAccount\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "---\n"
+                + "apiVersion: v1\n"
+                + "kind: ConfigMap\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "data:\n"
+                + "  config.json: |-\n"
+                + "    {\"sharedFileSystemPath\": \"" + EBS_STORAGE_PATH + "\"}\n"
+                + "  setup: |-\n"
+                + "    #!/bin/sh\n"
+                + "    set -eu\n"
+                + "    mkdir -m 0777 -p \"${VOL_DIR}\"\n"
+                + "  teardown: |-\n"
+                + "    #!/bin/sh\n"
+                + "    set -eu\n"
+                + "    rm -rf \"${VOL_DIR}\"\n"
+                + "  helperPod.yaml: |-\n"
+                + "    apiVersion: v1\n"
+                + "    kind: Pod\n"
+                + "    metadata:\n"
+                + "      name: helper-pod\n"
+                + "    spec:\n"
+                + "      containers:\n"
+                + "      - name: helper-pod\n"
+                + "        image: " + EBS_HELPER_IMAGE + "\n"
+                + "        imagePullPolicy: IfNotPresent\n"
+                + "---\n"
+                + "apiVersion: apps/v1\n"
+                + "kind: Deployment\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "spec:\n"
+                + "  revisionHistoryLimit: 0\n"
+                + "  selector:\n"
+                + "    matchLabels:\n"
+                + "      app: floci-ebs-provisioner\n"
+                + "  template:\n"
+                + "    metadata:\n"
+                + "      labels:\n"
+                + "        app: floci-ebs-provisioner\n"
+                + "    spec:\n"
+                + "      priorityClassName: system-node-critical\n"
+                + "      serviceAccountName: floci-ebs-provisioner\n"
+                + "      tolerations:\n"
+                + "      - key: CriticalAddonsOnly\n"
+                + "        operator: Exists\n"
+                + "      - key: node-role.kubernetes.io/control-plane\n"
+                + "        operator: Exists\n"
+                + "        effect: NoSchedule\n"
+                + "      containers:\n"
+                + ebsProvisionerContainer("csi", EBS_CSI_PROVISIONER)
+                + ebsProvisionerContainer("in-tree", EBS_IN_TREE_PROVISIONER)
+                + "      volumes:\n"
+                + "      - name: config\n"
+                + "        configMap:\n"
+                + "          name: floci-ebs-provisioner\n";
+    }
+
+    private static String ebsProvisionerContainer(String name, String provisionerName) {
+        return "      - name: " + name + "\n"
+                + "        image: " + EBS_PROVISIONER_IMAGE + "\n"
+                + "        imagePullPolicy: IfNotPresent\n"
+                + "        command:\n"
+                + "        - local-path-provisioner\n"
+                + "        - start\n"
+                + "        - --config\n"
+                + "        - /etc/config/config.json\n"
+                + "        - --provisioner-name\n"
+                + "        - " + provisionerName + "\n"
+                + "        - --configmap-name\n"
+                + "        - floci-ebs-provisioner\n"
+                + "        - --service-account-name\n"
+                + "        - floci-ebs-provisioner\n"
+                + "        volumeMounts:\n"
+                + "        - name: config\n"
+                + "          mountPath: /etc/config/\n"
+                + "        env:\n"
+                + "        - name: POD_NAMESPACE\n"
+                + "          valueFrom:\n"
+                + "            fieldRef:\n"
+                + "              fieldPath: metadata.namespace\n"
+                + "        - name: CONFIG_MOUNT_PATH\n"
+                + "          value: /etc/config/\n";
     }
 
     /**
