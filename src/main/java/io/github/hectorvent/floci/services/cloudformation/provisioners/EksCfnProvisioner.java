@@ -3,12 +3,14 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eks.EksService;
+import io.github.hectorvent.floci.services.eks.model.AccessConfig;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -54,6 +56,11 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         request.setName(name);
         request.setVersion(ctx.resolveOptional(props, "Version"));
         request.setRoleArn(ctx.resolveOptional(props, "RoleArn"));
+        request.setAccessConfig(accessConfig(props, ctx));
+        Map<String, String> tags = ctx.resolveTags(props, "Tags");
+        if (!tags.isEmpty()) {
+            request.setTags(tags);
+        }
 
         Cluster cluster = eksService.createCluster(request);
         r.setPhysicalId(cluster.getName());
@@ -68,6 +75,23 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
                 && cluster.getIdentity().getOidc().getIssuer() != null) {
             r.getAttributes().put("OpenIdConnectIssuerUrl", cluster.getIdentity().getOidc().getIssuer());
         }
+    }
+
+    /**
+     * Without this every CloudFormation cluster is CONFIG_MAP, and an {@code AWS::EKS::AccessEntry}
+     * in the same template fails on it.
+     */
+    private static AccessConfig accessConfig(JsonNode props, ProvisionContext ctx) {
+        if (props == null || !props.hasNonNull("AccessConfig")) {
+            return null;
+        }
+        JsonNode resolved = ctx.engine().resolveNode(props.get("AccessConfig"));
+        if (resolved == null || !resolved.isObject()) {
+            return null;
+        }
+        String bootstrap = ctx.resolveOptional(resolved, "BootstrapClusterCreatorAdminPermissions");
+        return new AccessConfig(ctx.resolveOptional(resolved, "AuthenticationMode"),
+                bootstrap == null ? null : Boolean.parseBoolean(bootstrap));
     }
 
     private void provisionNodegroup(StackResource r, JsonNode props, ProvisionContext ctx) {

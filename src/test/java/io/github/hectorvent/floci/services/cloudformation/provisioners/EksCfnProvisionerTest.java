@@ -18,10 +18,12 @@ import org.mockito.ArgumentCaptor;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -66,6 +68,42 @@ class EksCfnProvisionerTest {
         assertEquals("LS0tLS1CRUdJTg==", r.getAttributes().get("CertificateAuthorityData"));
         assertEquals("https://oidc.eks.us-east-1.amazonaws.com/id/ABC",
                 r.getAttributes().get("OpenIdConnectIssuerUrl"));
+    }
+
+    @Test
+    void clusterPassesAccessConfigAndTagsThrough() throws Exception {
+        Cluster created = new Cluster();
+        created.setName("prod");
+        created.setArn("arn:aws:eks:us-east-1:000000000000:cluster/prod");
+        when(eks.createCluster(any(CreateClusterRequest.class))).thenReturn(created);
+
+        provisioner.provision(resource("AWS::EKS::Cluster", "Control"), props("""
+                {"Name": "prod", "RoleArn": "arn:aws:iam::000000000000:role/eks",
+                 "AccessConfig": {"AuthenticationMode": "API_AND_CONFIG_MAP",
+                                  "BootstrapClusterCreatorAdminPermissions": false},
+                 "Tags": [{"Key": "application", "Value": "demo"}]}
+                """), ctx());
+
+        ArgumentCaptor<CreateClusterRequest> request = ArgumentCaptor.forClass(CreateClusterRequest.class);
+        verify(eks).createCluster(request.capture());
+        assertEquals("API_AND_CONFIG_MAP", request.getValue().getAccessConfig().authenticationMode());
+        assertEquals(Boolean.FALSE, request.getValue().getAccessConfig().bootstrapClusterCreatorAdminPermissions());
+        assertEquals(Map.of("application", "demo"), request.getValue().getTags());
+    }
+
+    @Test
+    void clusterWithoutAccessConfigLeavesItToTheServiceDefault() throws Exception {
+        Cluster created = new Cluster();
+        created.setName("prod");
+        created.setArn("arn:aws:eks:us-east-1:000000000000:cluster/prod");
+        when(eks.createCluster(any(CreateClusterRequest.class))).thenReturn(created);
+
+        provisioner.provision(resource("AWS::EKS::Cluster", "Control"), props("{\"Name\": \"prod\"}"), ctx());
+
+        ArgumentCaptor<CreateClusterRequest> request = ArgumentCaptor.forClass(CreateClusterRequest.class);
+        verify(eks).createCluster(request.capture());
+        assertNull(request.getValue().getAccessConfig());
+        assertNull(request.getValue().getTags());
     }
 
     @Test

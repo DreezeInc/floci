@@ -56,13 +56,18 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2Networ
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2SecurityGroupCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2SecurityGroupRuleCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VolumeCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcEndpointCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcGatewayAttachmentCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcrCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCapacityCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EfsCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EksAccessEntryCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EksAddonCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EksPodIdentityAssociationCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCacheCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCacheServerlessCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElbV2CfnProvisioner;
@@ -73,6 +78,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.GuardDuty
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamAccessKeyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamInstanceProfileCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamManagedPolicyCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.IamOidcProviderCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamPolicyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamRoleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamUserCfnProvisioner;
@@ -124,6 +130,10 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.FlowLogService;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.efs.EfsService;
+import io.github.hectorvent.floci.services.eks.EksAccessEntryService;
+import io.github.hectorvent.floci.services.eks.EksAddonService;
+import io.github.hectorvent.floci.services.eks.EksPodIdentityAssociationService;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheMemcachedService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheServerlessService;
@@ -213,6 +223,10 @@ final class CfnProvisionerFixture {
         private Ec2Service ec2Service;
         private RdsService rdsService;
         private EksService eksService;
+        private EksAddonService eksAddonService;
+        private EksAccessEntryService eksAccessEntryService;
+        private EksPodIdentityAssociationService eksPodIdentityAssociationService;
+        private EfsService efsService;
         private CloudWatchLogsService logsService;
         private KinesisService kinesisService;
         private CloudWatchMetricsService cloudWatchMetricsService;
@@ -357,9 +371,24 @@ final class CfnProvisionerFixture {
                 discovered.add(new IamInstanceProfileCfnProvisioner(iamService));
                 discovered.add(new IamPolicyCfnProvisioner(iamService));
                 discovered.add(new IamManagedPolicyCfnProvisioner(iamService));
+                discovered.add(new IamOidcProviderCfnProvisioner(iamService));
             }
             if (eksService != null) {
                 discovered.add(new EksCfnProvisioner(eksService));
+            }
+            // The EKS sub-resource provisioners take the cluster lookup too; a test naming only the
+            // sub-service gets a provisioner that fails loudly rather than a silent stub.
+            if (eksAddonService != null) {
+                discovered.add(new EksAddonCfnProvisioner(eksService, eksAddonService));
+            }
+            if (eksAccessEntryService != null) {
+                discovered.add(new EksAccessEntryCfnProvisioner(eksService, eksAccessEntryService));
+            }
+            if (eksPodIdentityAssociationService != null) {
+                discovered.add(new EksPodIdentityAssociationCfnProvisioner(eksService, eksPodIdentityAssociationService));
+            }
+            if (efsService != null) {
+                discovered.add(new EfsCfnProvisioner(efsService));
             }
             if (elbV2Service != null) {
                 discovered.add(new ElbV2CfnProvisioner(elbV2Service));
@@ -446,6 +475,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new WafV2CfnProvisioner(wafV2Service));
             }
             if (ec2Service != null) {
+                discovered.add(new Ec2VolumeCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcEndpointCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcGatewayAttachmentCfnProvisioner(ec2Service));
@@ -646,6 +676,26 @@ final class CfnProvisionerFixture {
 
         public Builder eks(EksService v) {
             this.eksService = v;
+            return this;
+        }
+
+        public Builder eksAddons(EksAddonService v) {
+            this.eksAddonService = v;
+            return this;
+        }
+
+        public Builder eksAccessEntries(EksAccessEntryService v) {
+            this.eksAccessEntryService = v;
+            return this;
+        }
+
+        public Builder eksPodIdentityAssociations(EksPodIdentityAssociationService v) {
+            this.eksPodIdentityAssociationService = v;
+            return this;
+        }
+
+        public Builder efs(EfsService v) {
+            this.efsService = v;
             return this;
         }
 

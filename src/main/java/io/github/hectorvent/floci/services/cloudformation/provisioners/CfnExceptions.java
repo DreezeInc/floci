@@ -18,4 +18,13 @@ public final class CfnExceptions {
                 "CloudFormation cannot update a stack when a custom-named resource requires replacing. "
                         + "Rename " + name + " and update the stack again.", 400);
     }
+
+    /**
+     * Thrown when an update changes a createOnly property of a type whose provisioner reuses the
+     * prior entity and has no replacement path.
+     */
+    public static AwsException replacementNotSupported(String property) {
+        return new AwsException("ValidationError",
+                "Updating " + property + " requires resource replacement, which is not supported.", 400);
+    }
 }
