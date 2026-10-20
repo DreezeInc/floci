@@ -132,7 +132,6 @@ public class EksClusterManager
     static final String EBS_STORAGE_MANIFEST_FILE = "floci-eks-ebs-storage.yaml";
     static final String EBS_STORAGE_MANIFEST_TAR_ENTRY = "server/manifests/" + EBS_STORAGE_MANIFEST_FILE;
     static final String EBS_CSI_PROVISIONER = "ebs.csi.aws.com";
-    static final String EBS_IN_TREE_PROVISIONER = "kubernetes.io/aws-ebs";
     static final String EBS_STORAGE_PATH = K3S_DATA_DIR + "/storage/floci-ebs";
     static final String EBS_PROVISIONER_IMAGE = "rancher/local-path-provisioner:v0.0.37";
     static final String EBS_HELPER_IMAGE = "rancher/mirrored-library-busybox:1.37.0";
@@ -2110,12 +2109,15 @@ public class EksClusterManager
     }
 
     /**
-     * Gives the cluster the stock EKS {@code gp2} StorageClass and a provisioner for it and for any
-     * StorageClass naming an EBS provisioner, so claims written for EBS bind to the node's
-     * filesystem. local-path-provisioner runs in shared-filesystem mode because node-path mode
-     * refuses {@code Immediate} binding ("no node was specified"); on a one-node cluster the two
-     * modes mean the same disk. Like the webhook manifest, a copy failure leaves the cluster
-     * running, without the storage.
+     * Gives the cluster the stock EKS {@code gp2} StorageClass and a provisioner named
+     * {@code ebs.csi.aws.com} that serves it and any other StorageClass naming that driver, so
+     * claims written for EBS bind to the node's filesystem. gp2 names the CSI driver rather than
+     * the in-tree {@code kubernetes.io/aws-ebs} EKS ships because CSI migration makes the
+     * controller manager annotate every such claim for {@code ebs.csi.aws.com} anyway, and an
+     * external provisioner only serves classes that name it. local-path-provisioner runs in
+     * shared-filesystem mode because node-path mode refuses {@code Immediate} binding ("no node
+     * was specified"); on a one-node cluster the two modes mean the same disk. Like the webhook
+     * manifest, a copy failure leaves the cluster running, without the storage.
      */
     void registerEbsStorageEmulation(String containerId, Cluster cluster) {
         if (!config.services().eks().emulateEbsStorage()) {
@@ -2133,8 +2135,8 @@ public class EksClusterManager
                             tarSingleFile(EBS_STORAGE_MANIFEST_TAR_ENTRY, manifest)))
                     .withRemotePath(K3S_DATA_DIR)
                     .exec();
-            LOG.infov("Serving the gp2, {0} and {1} StorageClasses of cluster {2} from {3}",
-                    EBS_CSI_PROVISIONER, EBS_IN_TREE_PROVISIONER, clusterName, EBS_STORAGE_PATH);
+            LOG.infov("Serving gp2 and every {0} StorageClass of cluster {1} from {2}",
+                    EBS_CSI_PROVISIONER, clusterName, EBS_STORAGE_PATH);
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no EBS storage emulation: could not copy {1} into the k3s "
                     + "container: {2}", clusterName, EBS_STORAGE_MANIFEST_FILE, e.getMessage());
@@ -2143,7 +2145,7 @@ public class EksClusterManager
 
     /**
      * The gp2 StorageClass as EKS ships it (minus the default annotation when k3s keeps its own
-     * default), and one Deployment running local-path-provisioner once per EBS provisioner name,
+     * default), and one Deployment running local-path-provisioner under the EBS CSI driver name,
      * with its own RBAC because k3s's local-storage objects are absent when that component is off.
      */
     static String buildEbsStorageManifest(boolean gp2IsDefault) {
@@ -2157,7 +2159,7 @@ public class EksClusterManager
                 + "  annotations:\n"
                 + "    floci.io/emulated: \"ebs\"\n"
                 + defaultAnnotation
-                + "provisioner: " + EBS_IN_TREE_PROVISIONER + "\n"
+                + "provisioner: " + EBS_CSI_PROVISIONER + "\n"
                 + "parameters:\n"
                 + "  fsType: ext4\n"
                 + "  type: gp2\n"
@@ -2252,16 +2254,15 @@ public class EksClusterManager
                 + "        operator: Exists\n"
                 + "        effect: NoSchedule\n"
                 + "      containers:\n"
-                + ebsProvisionerContainer("csi", EBS_CSI_PROVISIONER)
-                + ebsProvisionerContainer("in-tree", EBS_IN_TREE_PROVISIONER)
+                + ebsProvisionerContainer()
                 + "      volumes:\n"
                 + "      - name: config\n"
                 + "        configMap:\n"
                 + "          name: floci-ebs-provisioner\n";
     }
 
-    private static String ebsProvisionerContainer(String name, String provisionerName) {
-        return "      - name: " + name + "\n"
+    private static String ebsProvisionerContainer() {
+        return "      - name: provisioner\n"
                 + "        image: " + EBS_PROVISIONER_IMAGE + "\n"
                 + "        imagePullPolicy: IfNotPresent\n"
                 + "        command:\n"
@@ -2270,7 +2271,7 @@ public class EksClusterManager
                 + "        - --config\n"
                 + "        - /etc/config/config.json\n"
                 + "        - --provisioner-name\n"
-                + "        - " + provisionerName + "\n"
+                + "        - " + EBS_CSI_PROVISIONER + "\n"
                 + "        - --configmap-name\n"
                 + "        - floci-ebs-provisioner\n"
                 + "        - --service-account-name\n"

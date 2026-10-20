@@ -3268,14 +3268,16 @@ class EksClusterManagerTest {
         }
 
         @Test
-        void ebsStorageManifestServesGp2AndBothEbsProvisionerNames() {
+        void ebsStorageManifestServesGp2ThroughTheEbsCsiDriverName() {
             String manifest = EksClusterManager.buildEbsStorageManifest(true);
 
             assertTrue(manifest.contains("kind: StorageClass\nmetadata:\n  name: gp2\n"));
             assertTrue(manifest.contains("storageclass.kubernetes.io/is-default-class: \"true\""));
-            assertTrue(manifest.contains("provisioner: kubernetes.io/aws-ebs\n"));
+            // CSI migration annotates a kubernetes.io/aws-ebs claim for ebs.csi.aws.com, and an
+            // external provisioner only serves classes that name it, so gp2 names the driver.
+            assertTrue(manifest.contains("provisioner: ebs.csi.aws.com\n"));
+            assertFalse(manifest.contains("kubernetes.io/aws-ebs"));
             assertTrue(manifest.contains("- --provisioner-name\n        - ebs.csi.aws.com\n"));
-            assertTrue(manifest.contains("- --provisioner-name\n        - kubernetes.io/aws-ebs\n"));
             // Node-path mode refuses Immediate binding; shared mode serves both binding modes.
             assertTrue(manifest.contains("\"sharedFileSystemPath\": \"/var/lib/rancher/k3s/storage/floci-ebs\""));
             assertFalse(manifest.contains("nodePathMap"));

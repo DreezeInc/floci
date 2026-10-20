@@ -3393,10 +3393,10 @@ public interface EmulatorConfig {
 
         /**
          * When true, every new cluster gets the stock EKS {@code gp2} StorageClass and a provisioner
-         * that serves it, and any other StorageClass naming {@code ebs.csi.aws.com} or
-         * {@code kubernetes.io/aws-ebs}, from the node's filesystem, so workloads written for EBS
-         * bind their claims without the EBS CSI driver. {@code gp2} is the cluster's default class
-         * unless {@link #defaultStorageClass()} keeps k3s's own.
+         * that serves it, and any other StorageClass naming {@code ebs.csi.aws.com}, from the
+         * node's filesystem, so workloads written for EBS bind their claims without the EBS CSI
+         * driver. {@code gp2} is the cluster's default class unless {@link #defaultStorageClass()}
+         * keeps k3s's own.
          */
         @WithDefault("false")
         boolean emulateEbsStorage();
