@@ -3,6 +3,9 @@ package io.github.hectorvent.floci.services.eks;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.fasterxml.jackson.dataformat.yaml.YAMLGenerator;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
@@ -83,6 +86,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -138,6 +142,11 @@ public class EksClusterManager
     /** The pod identity webhook reads service account annotations through the cluster's own kubectl. */
     static final int SERVICE_ACCOUNT_LOOKUP_TIMEOUT_SECONDS = 10;
     private static final ObjectMapper SERVICE_ACCOUNT_JSON = new ObjectMapper();
+    static final String AWS_AUTH_NODE_USERNAME = "system:node:{{EC2PrivateDNSName}}";
+    static final List<String> AWS_AUTH_NODE_GROUPS = List.of("system:bootstrappers", "system:nodes");
+    private static final ObjectMapper AWS_AUTH_YAML = new ObjectMapper(
+            new YAMLFactory().disable(YAMLGenerator.Feature.WRITE_DOC_START_MARKER));
+    private static final TypeReference<List<Map<String, Object>>> MAP_ROLES_TYPE = new TypeReference<>() { };
     private static final String ENDPOINT_MODE_NETWORK = "network";
     public static final String DEFAULT_POD_CIDR = "10.42.0.0/16";
 
@@ -2106,6 +2115,79 @@ public class EksClusterManager
             LOG.warnv("EKS cluster {0} gets no pod identity injection: could not copy {1} into the k3s "
                     + "container: {2}", clusterName, POD_IDENTITY_MANIFEST_FILE, e.getMessage());
         }
+    }
+
+    /**
+     * Maps managed node group roles in {@code kube-system/aws-auth}, as EKS does for clusters that
+     * authenticate through the ConfigMap. Creates the ConfigMap when absent and otherwise appends
+     * only the missing roles, keeping every other entry. The replace carries the read
+     * resourceVersion, so a concurrent edit makes it fail instead of being overwritten.
+     *
+     * @return true when every role is mapped; false when the caller should try again later
+     */
+    boolean ensureAwsAuthNodeRoles(Cluster cluster, Collection<String> nodeRoleArns) {
+        String containerId = cluster.getContainerId();
+        if (containerId == null || nodeRoleArns.isEmpty()) {
+            return true;
+        }
+        try {
+            ContainerExec.Result current = execInContainerForResult(containerId, new String[]{
+                    "kubectl", "get", "configmap", "aws-auth", "-n", "kube-system", "-o", "json",
+                    "--ignore-not-found"}, 15);
+            if (current.timedOut() || current.exitCode() != 0) {
+                LOG.warnv("Could not read aws-auth of EKS cluster {0}: {1}", cluster.getName(), current.summary());
+                return false;
+            }
+            String existing = current.stdout().trim();
+            ObjectNode configMap = existing.isEmpty()
+                    ? newAwsAuthConfigMap()
+                    : (ObjectNode) SERVICE_ACCOUNT_JSON.readTree(existing);
+            ObjectNode data = configMap.has("data") && configMap.get("data").isObject()
+                    ? (ObjectNode) configMap.get("data")
+                    : configMap.putObject("data");
+            String mapRolesYaml = data.path("mapRoles").asText("");
+            List<Map<String, Object>> mapRoles = mapRolesYaml.isBlank()
+                    ? new ArrayList<>()
+                    : new ArrayList<>(AWS_AUTH_YAML.readValue(mapRolesYaml, MAP_ROLES_TYPE));
+            Set<Object> mappedArns = mapRoles.stream().map(role -> role.get("rolearn")).collect(Collectors.toSet());
+            List<String> missing = nodeRoleArns.stream().filter(arn -> !mappedArns.contains(arn)).toList();
+            if (missing.isEmpty()) {
+                return true;
+            }
+            for (String arn : missing) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("groups", AWS_AUTH_NODE_GROUPS);
+                entry.put("rolearn", arn);
+                entry.put("username", AWS_AUTH_NODE_USERNAME);
+                mapRoles.add(entry);
+            }
+            data.put("mapRoles", AWS_AUTH_YAML.writeValueAsString(mapRoles));
+            ((ObjectNode) configMap.path("metadata")).remove("managedFields");
+            String verb = existing.isEmpty() ? "create" : "replace";
+            String manifest = SERVICE_ACCOUNT_JSON.writeValueAsString(configMap);
+            ContainerExec.Result write = execInContainerForResult(containerId, new String[]{"sh", "-c",
+                    "printf '%s' '" + manifest.replace("'", "'\\''") + "' | kubectl " + verb + " -f -"}, 15);
+            if (write.timedOut() || write.exitCode() != 0) {
+                LOG.warnv("Could not {0} aws-auth of EKS cluster {1}: {2}", verb, cluster.getName(), write.summary());
+                return false;
+            }
+            LOG.infov("Mapped node roles {0} in aws-auth of EKS cluster {1}", missing, cluster.getName());
+            return true;
+        } catch (Exception e) {
+            LOG.warnv("Could not map node roles in aws-auth of EKS cluster {0}: {1}", cluster.getName(), e.getMessage());
+            return false;
+        }
+    }
+
+    private static ObjectNode newAwsAuthConfigMap() {
+        ObjectNode configMap = SERVICE_ACCOUNT_JSON.createObjectNode();
+        configMap.put("apiVersion", "v1");
+        configMap.put("kind", "ConfigMap");
+        ObjectNode metadata = configMap.putObject("metadata");
+        metadata.put("name", "aws-auth");
+        metadata.put("namespace", "kube-system");
+        configMap.putObject("data");
+        return configMap;
     }
 
     /**

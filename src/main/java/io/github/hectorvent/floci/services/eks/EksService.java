@@ -67,6 +67,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -117,6 +118,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     // Storage hands every caller the same live Cluster, and Cluster keeps identity equality.
     private final Set<Cluster> clustersBeingDeleted = ConcurrentHashMap.newKeySet();
     private final Set<String> restoringClusters = ConcurrentHashMap.newKeySet();
+    private final Map<String, Set<String>> awsAuthMappedRoles = new ConcurrentHashMap<>();
 
     @Inject
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -1665,11 +1667,39 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                     } else if (cluster.getStatus() == ClusterStatus.ACTIVE && hasPendingJoinedInstances(cluster)) {
                         restoreJoinedInstancesAsync(entry.accountId(), cluster);
                     }
+                    if (cluster.getStatus() == ClusterStatus.ACTIVE) {
+                        mapNodeGroupRolesInAwsAuth(entry.accountId(), cluster);
+                    }
                 }
             } catch (Exception e) {
                 LOG.error("Error in EKS readiness poller", e);
             }
         }, 2, 3, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Keeps the running cluster's {@code aws-auth} mapping every ACTIVE managed node group role.
+     * Roles are remembered per container, so a replaced container is mapped again and a failed
+     * attempt is retried on the next tick.
+     */
+    void mapNodeGroupRolesInAwsAuth(String accountId, Cluster cluster) {
+        String containerId = cluster.getContainerId();
+        AccessConfig access = cluster.getAccessConfig();
+        if (clusterManager == null || containerId == null
+                || (access != null && "API".equals(access.authenticationMode()))) {
+            return;
+        }
+        Set<String> roles = listNodeGroupsForCluster(cluster.getName(), accountId).stream()
+                .filter(group -> group.getStatus() == NodegroupStatus.ACTIVE && group.getNodeRole() != null)
+                .map(Nodegroup::getNodeRole)
+                .collect(Collectors.toCollection(TreeSet::new));
+        String key = accountId + "/" + cluster.getName() + "/" + containerId;
+        if (roles.isEmpty() || awsAuthMappedRoles.getOrDefault(key, Set.of()).containsAll(roles)) {
+            return;
+        }
+        if (clusterManager.ensureAwsAuthNodeRoles(cluster, roles)) {
+            awsAuthMappedRoles.put(key, roles);
+        }
     }
 
     private void restoreJoinedInstancesAsync(String accountId, Cluster cluster) {
