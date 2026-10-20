@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -41,6 +42,7 @@ class EksPodIdentityWebhookTest {
     private EksClusterManager clusters;
     private EmulatorConfig.EksServiceConfig eksConfig;
     private Cluster cluster;
+    private Optional<Path> caBundle;
     private EksPodIdentityWebhook webhook;
 
     @BeforeEach
@@ -57,7 +59,9 @@ class EksPodIdentityWebhookTest {
         when(config.port()).thenReturn(4566);
         DockerHostResolver dockerHostResolver = Mockito.mock(DockerHostResolver.class);
         when(dockerHostResolver.resolve()).thenReturn("10.0.0.7");
-        webhook = new EksPodIdentityWebhook(eks, addons, associations, clusters, dockerHostResolver, config);
+        caBundle = Optional.empty();
+        webhook = new EksPodIdentityWebhook(eks, addons, associations, clusters, dockerHostResolver, config,
+                () -> caBundle);
 
         cluster = new Cluster();
         cluster.setName(CLUSTER_NAME);
@@ -333,6 +337,40 @@ class EksPodIdentityWebhookTest {
         assertEquals(6, env.size());
         assertEquals("AWS_ENDPOINT_URL", env.get(5).get("name").asText());
         assertEquals("http://10.0.0.7:4566", env.get(5).get("value").asText());
+    }
+
+    @Test
+    void caBundleIsMountedFromTheNodeWhenFlociServesTls() throws Exception {
+        when(eksConfig.injectEndpointUrl()).thenReturn(true);
+        caBundle = Optional.of(Path.of("/app/data/tls/floci-ca-bundle.pem"));
+        irsaAnnotated(Map.of("eks.amazonaws.com/role-arn", "arn:aws:iam::123456789012:role/checkout"));
+
+        JsonNode patch = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+        assertEquals(MAPPER.readTree("""
+                {"name":"floci-ca-bundle","hostPath":{"path":"/etc/floci-ca-bundle.pem","type":"File"}}"""),
+                patch.get(0).get("value").get(1));
+        assertEquals(MAPPER.readTree("""
+                {"name":"floci-ca-bundle","mountPath":"/etc/floci-ca-bundle.pem","readOnly":true}"""),
+                patch.get(1).get("value").get(1));
+        JsonNode env = patch.get(2).get("value");
+        assertEquals(7, env.size());
+        assertEquals("AWS_CA_BUNDLE", env.get(5).get("name").asText());
+        assertEquals("/etc/floci-ca-bundle.pem", env.get(5).get("value").asText());
+        assertEquals("AWS_ENDPOINT_URL", env.get(6).get("name").asText());
+    }
+
+    @Test
+    void caBundleIsLeftOutWithoutEndpointInjection() throws Exception {
+        caBundle = Optional.of(Path.of("/app/data/tls/floci-ca-bundle.pem"));
+        irsaAnnotated(Map.of("eks.amazonaws.com/role-arn", "arn:aws:iam::123456789012:role/checkout"));
+
+        JsonNode patch = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+        assertEquals(1, patch.get(0).get("value").size());
+        assertEquals(5, patch.get(2).get("value").size());
     }
 
     @Test

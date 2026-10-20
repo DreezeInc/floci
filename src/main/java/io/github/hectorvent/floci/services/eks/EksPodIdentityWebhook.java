@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
@@ -10,12 +11,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * Admission logic behind the EKS pod identity mutating webhook.
@@ -78,6 +81,8 @@ public class EksPodIdentityWebhook {
     static final String ENV_ROLE_ARN = "AWS_ROLE_ARN";
     static final String ENV_WEB_IDENTITY_TOKEN_FILE = "AWS_WEB_IDENTITY_TOKEN_FILE";
     static final String ENV_ENDPOINT_URL = "AWS_ENDPOINT_URL";
+    static final String ENV_CA_BUNDLE = "AWS_CA_BUNDLE";
+    static final String CA_BUNDLE_VOLUME_NAME = "floci-ca-bundle";
 
     private static final String DEFAULT_API_VERSION = "admission.k8s.io/v1";
     private static final String DEFAULT_SERVICE_ACCOUNT = "default";
@@ -91,18 +96,28 @@ public class EksPodIdentityWebhook {
     private final EksClusterManager clusters;
     private final DockerHostResolver dockerHostResolver;
     private final EmulatorConfig config;
+    private final Supplier<Optional<Path>> caBundle;
 
     @Inject
     public EksPodIdentityWebhook(EksService eks, EksAddonService addons,
                                  EksPodIdentityAssociationService associations,
                                  EksClusterManager clusters, DockerHostResolver dockerHostResolver,
                                  EmulatorConfig config) {
+        this(eks, addons, associations, clusters, dockerHostResolver, config,
+                () -> ContainerCaBundle.hostPath(config));
+    }
+
+    EksPodIdentityWebhook(EksService eks, EksAddonService addons,
+                          EksPodIdentityAssociationService associations,
+                          EksClusterManager clusters, DockerHostResolver dockerHostResolver,
+                          EmulatorConfig config, Supplier<Optional<Path>> caBundle) {
         this.eks = eks;
         this.addons = addons;
         this.associations = associations;
         this.clusters = clusters;
         this.dockerHostResolver = dockerHostResolver;
         this.config = config;
+        this.caBundle = caBundle;
     }
 
     /**
@@ -150,10 +165,16 @@ public class EksPodIdentityWebhook {
         if (injections.isEmpty()) {
             return List.of();
         }
-        List<Map<String, Object>> sharedEnv = config.services().eks().injectEndpointUrl()
-                ? List.of(env(ENV_ENDPOINT_URL, "http://" + dockerHostResolver.resolve() + ":" + config.port()))
-                : List.of();
-        return buildPatch(pod, injections, sharedEnv);
+        if (!config.services().eks().injectEndpointUrl()) {
+            return buildPatch(pod, injections, List.of());
+        }
+        // The SDKs' web-identity STS call ignores AWS_ENDPOINT_URL, so it reaches Floci only through
+        // spoofed AWS names over HTTPS, and the pod has to trust the CA the k3s node already carries.
+        if (caBundle.get().isPresent()) {
+            injections.add(caBundleInjection());
+        }
+        return buildPatch(pod, injections,
+                List.of(env(ENV_ENDPOINT_URL, "http://" + dockerHostResolver.resolve() + ":" + config.port())));
     }
 
     private Optional<Injection> irsaInjection(Cluster cluster, String namespace, String serviceAccount) {
@@ -189,6 +210,18 @@ public class EksPodIdentityWebhook {
         } catch (NumberFormatException e) {
             return TOKEN_EXPIRATION_SECONDS;
         }
+    }
+
+    /** Mounts the node's copy of Floci's CA bundle and points the AWS SDKs at it. */
+    static Injection caBundleInjection() {
+        Map<String, Object> volume = new LinkedHashMap<>();
+        volume.put("name", CA_BUNDLE_VOLUME_NAME);
+        Map<String, Object> hostPath = new LinkedHashMap<>();
+        hostPath.put("path", ContainerCaBundle.CONTAINER_PATH);
+        hostPath.put("type", "File");
+        volume.put("hostPath", hostPath);
+        return new Injection(volume, mount(CA_BUNDLE_VOLUME_NAME, ContainerCaBundle.CONTAINER_PATH),
+                List.of(env(ENV_CA_BUNDLE, ContainerCaBundle.CONTAINER_PATH)));
     }
 
     static Injection podIdentityInjection() {
