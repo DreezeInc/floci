@@ -167,7 +167,10 @@ public class EmbeddedDnsServer {
             }
 
             DatagramSocket socket = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
-            socket.listen(DNS_PORT, "0.0.0.0", ar -> {
+            // Bound to the advertised address, not the wildcard: a wildcard socket answers from the
+            // interface facing the client (the docker0 gateway when Floci shares a network namespace
+            // with the Docker daemon), and resolvers drop a reply whose source is not the server queried.
+            socket.listen(DNS_PORT, myIp, ar -> {
                 if (ar.succeeded()) {
                     serverIp = myIp;
                     LOG.infov("Embedded DNS server started on {0}:53, resolving {1} → {0}", myIp, suffixes);
