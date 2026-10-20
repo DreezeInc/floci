@@ -59,7 +59,7 @@ public class EksIdentityProviderConfigCfnProvisioner implements CfnResourceProvi
         String type = ctx.resolveRequired(props, "Type", TYPE);
         String name = configName(r, props, ctx);
         String id = name + ID_SEPARATOR + clusterName + ID_SEPARATOR + type;
-        Cluster cluster = eksService.describeCluster(clusterName);
+        Cluster cluster = EksClusterReadiness.awaitActive(eksService, clusterName);
         IdentityProviderConfig handle = new IdentityProviderConfig(type, name);
 
         if (ctx.isUpdate()) {

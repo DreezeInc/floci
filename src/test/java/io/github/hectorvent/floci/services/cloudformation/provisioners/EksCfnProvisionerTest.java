@@ -134,6 +134,29 @@ class EksCfnProvisionerTest {
     }
 
     @Test
+    void nodegroupIsReportedOnlyOnceTheClusterItRebootedIsActiveAgain() throws Exception {
+        Nodegroup created = new Nodegroup();
+        created.setNodegroupName("workers");
+        created.setClusterName("prod");
+        created.setNodegroupArn("arn:aws:eks:us-east-1:000000000000:nodegroup/prod/workers/1");
+        when(eks.createNodeGroup(eq("prod"), any(Nodegroup.class))).thenReturn(created);
+        Cluster creating = new Cluster();
+        creating.setName("prod");
+        creating.setStatus(ClusterStatus.CREATING);
+        Cluster active = new Cluster();
+        active.setName("prod");
+        active.setStatus(ClusterStatus.ACTIVE);
+        when(eks.describeCluster("prod")).thenReturn(creating, active);
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, Duration.ofSeconds(5), Duration.ofMillis(1));
+
+        StackResource r = resource("AWS::EKS::Nodegroup", "Workers");
+        waiting.provision(r, props("{\"ClusterName\": \"prod\", \"NodegroupName\": \"workers\"}"), ctx());
+
+        verify(eks, times(2)).describeCluster("prod");
+        assertEquals("prod/workers", r.getPhysicalId());
+    }
+
+    @Test
     void clusterPassesAccessConfigAndTagsThrough() throws Exception {
         Cluster created = new Cluster();
         created.setName("prod");

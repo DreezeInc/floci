@@ -1,7 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.eks.model.AccessConfig;
@@ -29,17 +28,13 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
     private static final String CLUSTER = "AWS::EKS::Cluster";
     private static final String NODEGROUP = "AWS::EKS::Nodegroup";
 
-    /** Real-mode clusters boot a k3s container; CloudFormation reports the cluster once it is ACTIVE. */
-    static final Duration CLUSTER_ACTIVE_TIMEOUT = Duration.ofMinutes(15);
-    static final Duration CLUSTER_ACTIVE_POLL = Duration.ofSeconds(3);
-
     private final EksService eksService;
     private final Duration clusterActiveTimeout;
     private final Duration clusterActivePoll;
 
     @Inject
     public EksCfnProvisioner(EksService eksService) {
-        this(eksService, CLUSTER_ACTIVE_TIMEOUT, CLUSTER_ACTIVE_POLL);
+        this(eksService, EksClusterReadiness.ACTIVE_TIMEOUT, EksClusterReadiness.ACTIVE_POLL);
     }
 
     EksCfnProvisioner(EksService eksService, Duration clusterActiveTimeout, Duration clusterActivePoll) {
@@ -103,28 +98,9 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
      */
     private Cluster awaitClusterActive(StackResource r, String name) {
         r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
-        long deadline = System.nanoTime() + clusterActiveTimeout.toNanos();
-        while (true) {
-            Cluster current = eksService.describeCluster(name);
-            if (current.getStatus() == ClusterStatus.ACTIVE) {
-                r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
-                return current;
-            }
-            if (current.getStatus() != ClusterStatus.CREATING) {
-                throw new AwsException("ResourceNotReady", "Cluster " + name + " did not become ACTIVE: "
-                        + current.getStatus(), 400);
-            }
-            if (System.nanoTime() - deadline >= 0) {
-                throw new AwsException("ResourceNotReady", "Cluster " + name + " was still CREATING after "
-                        + clusterActiveTimeout.toSeconds() + " seconds", 400);
-            }
-            try {
-                Thread.sleep(clusterActivePoll.toMillis());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AwsException("ResourceNotReady", "Interrupted while waiting for cluster " + name, 400);
-            }
-        }
+        Cluster active = EksClusterReadiness.awaitActive(eksService, name, clusterActiveTimeout, clusterActivePoll);
+        r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
+        return active;
     }
 
     /**
@@ -156,6 +132,8 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         request.setSubnets(ctx.resolveStringList(props, "Subnets"));
 
         Nodegroup nodegroup = eksService.createNodeGroup(clusterName, request);
+        // The first nodegroup may replace the k3s node for its instance type; the cluster is CREATING until it is back.
+        EksClusterReadiness.awaitActive(eksService, clusterName, clusterActiveTimeout, clusterActivePoll);
         // Ref (and the readOnly Id) is the composite the registry primary identifier declares,
         // clusterName/nodegroupName, matching AWS. The plain names stay as their own attributes:
         // ClusterName and NodegroupName back delete() and Fn::GetAtt.

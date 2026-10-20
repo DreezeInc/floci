@@ -54,7 +54,7 @@ public class EksAccessEntryCfnProvisioner implements CfnResourceProvisioner {
         String clusterName = ctx.resolveRequired(props, "ClusterName", TYPE);
         String principalArn = ctx.resolveRequired(props, "PrincipalArn", TYPE);
         String id = principalArn + ID_SEPARATOR + clusterName;
-        Cluster cluster = eksService.describeCluster(clusterName);
+        Cluster cluster = EksClusterReadiness.awaitActive(eksService, clusterName);
         warnOnAccessPolicies(r, props, ctx);
 
         if (ctx.isUpdate()) {

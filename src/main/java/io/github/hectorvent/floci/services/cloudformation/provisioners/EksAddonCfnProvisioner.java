@@ -54,7 +54,7 @@ public class EksAddonCfnProvisioner implements CfnResourceProvisioner {
         String clusterName = ctx.resolveRequired(props, "ClusterName", TYPE);
         String addonName = ctx.resolveRequired(props, "AddonName", TYPE);
         String id = clusterName + ID_SEPARATOR + addonName;
-        Cluster cluster = eksService.describeCluster(clusterName);
+        Cluster cluster = EksClusterReadiness.awaitActive(eksService, clusterName);
 
         if (ctx.isUpdate()) {
             if (!ctx.reusesPriorEntity(id)) {

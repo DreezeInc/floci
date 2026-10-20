@@ -53,7 +53,7 @@ public class EksPodIdentityAssociationCfnProvisioner implements CfnResourceProvi
         String namespace = ctx.resolveRequired(props, "Namespace", TYPE);
         String serviceAccount = ctx.resolveRequired(props, "ServiceAccount", TYPE);
         String roleArn = ctx.resolveRequired(props, "RoleArn", TYPE);
-        Cluster cluster = eksService.describeCluster(clusterName);
+        Cluster cluster = EksClusterReadiness.awaitActive(eksService, clusterName);
 
         if (ctx.isUpdate()) {
             if (!clusterName.equals(r.getAttributes().get("ClusterName"))) {
