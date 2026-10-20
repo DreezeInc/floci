@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
@@ -127,6 +129,9 @@ public class EksClusterManager
     static final String CONTAINERD_CERTS_LINK = "etc/containerd/certs.d";
     static final String POD_IDENTITY_MANIFEST_FILE = "floci-eks-pod-identity.yaml";
     static final String POD_IDENTITY_MANIFEST_TAR_ENTRY = "server/manifests/" + POD_IDENTITY_MANIFEST_FILE;
+    /** The pod identity webhook reads service account annotations through the cluster's own kubectl. */
+    static final int SERVICE_ACCOUNT_LOOKUP_TIMEOUT_SECONDS = 10;
+    private static final ObjectMapper SERVICE_ACCOUNT_JSON = new ObjectMapper();
     private static final String ENDPOINT_MODE_NETWORK = "network";
     public static final String DEFAULT_POD_CIDR = "10.42.0.0/16";
 
@@ -2130,7 +2135,7 @@ public class EksClusterManager
                     sideEffects: None
                     failurePolicy: Ignore
                     reinvocationPolicy: Never
-                    timeoutSeconds: 3
+                    timeoutSeconds: 10
                     clientConfig:
                       url: "%s"
                       caBundle: "%s"
@@ -3108,6 +3113,38 @@ public class EksClusterManager
     Instance getRegisteredClusterNodeInstance(Cluster cluster) {
         ClusterNodeRecord record = clusterNodeInstances.get(clusterResourceName(cluster));
         return record != null ? record.instance() : null;
+    }
+
+    /**
+     * The annotations on one service account of the cluster, read with the k3s container's own
+     * kubectl so the pod identity webhook can honour IRSA. Empty when the cluster has no container
+     * (mock mode), the account does not exist, or kubectl does not answer in time.
+     */
+    Map<String, String> serviceAccountAnnotations(Cluster cluster, String namespace, String name) {
+        String containerId = cluster == null ? null : cluster.getContainerId();
+        if (containerId == null || containerId.isBlank()) {
+            return Map.of();
+        }
+        ContainerExec.Result result = ContainerExec.run(lifecycleManager.getDockerClient(), containerId,
+                new String[]{"kubectl", "get", "serviceaccount", "--namespace", namespace, name, "--output", "json"},
+                SERVICE_ACCOUNT_LOOKUP_TIMEOUT_SECONDS);
+        if (result.exitCode() != 0 || result.timedOut()) {
+            LOG.debugv("EKS cluster {0}: service account {1}/{2} has no readable annotations: {3}",
+                    cluster.getName(), namespace, name, result.summary());
+            return Map.of();
+        }
+        return serviceAccountAnnotationsOf(result.stdout());
+    }
+
+    static Map<String, String> serviceAccountAnnotationsOf(String serviceAccountJson) {
+        try {
+            JsonNode annotations = SERVICE_ACCOUNT_JSON.readTree(serviceAccountJson).path("metadata").path("annotations");
+            Map<String, String> result = new LinkedHashMap<>();
+            annotations.properties().forEach(entry -> result.put(entry.getKey(), entry.getValue().asText()));
+            return Map.copyOf(result);
+        } catch (IOException e) {
+            return Map.of();
+        }
     }
 
     ContainerExec.Result execInContainerForResult(String containerId, String[] cmd, int timeoutSeconds) {

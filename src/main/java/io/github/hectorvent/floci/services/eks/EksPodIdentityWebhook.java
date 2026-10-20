@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -16,16 +18,23 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Admission logic behind the EKS Pod Identity mutating webhook.
+ * Admission logic behind the EKS pod identity mutating webhook.
  *
- * <p>Real EKS mutates a pod at admission when its service account has a pod identity association
- * and the {@code eks-pod-identity-agent} addon is installed. The mutation projects a service
- * account token with the pod identity audience and sets the two container credentials environment
- * variables the AWS SDKs read, so the SDK credential chain reaches the container credentials
- * provider instead of falling through. Floci reproduces exactly that mutation.
+ * <p>Real EKS mutates a pod at admission in two cases. When the pod's service account carries the
+ * IRSA {@code eks.amazonaws.com/role-arn} annotation, the pod identity webhook that ships with
+ * every EKS control plane projects a service account token for STS and sets the web identity
+ * environment variables, so the SDK credential chain assumes the role with
+ * {@code sts:AssumeRoleWithWebIdentity}. When the service account has a pod identity association
+ * and the {@code eks-pod-identity-agent} addon is installed, the mutation projects a token with the
+ * pod identity audience and sets the two container credentials environment variables instead.
+ * Floci reproduces both mutations; a pod that qualifies for both gets both.
  *
- * <p>Nothing answers {@link #CREDENTIALS_FULL_URI} yet: this class injects the plumbing only, so an
- * injected pod still cannot obtain credentials.
+ * <p>With {@code floci.services.eks.inject-endpoint-url} on, every mutated container also gets
+ * {@code AWS_ENDPOINT_URL} pointing at Floci, so the SDKs inside the cluster call the emulator
+ * instead of AWS without each chart being told where Floci is.
+ *
+ * <p>Nothing answers {@link #CREDENTIALS_FULL_URI} yet: for pod identity this class injects the
+ * plumbing only, so an injected pod still cannot obtain credentials that way.
  *
  * <p>Every path here admits the pod. A cluster that is gone, an addon that is not installed, a
  * malformed review and an internal error all return {@code allowed: true} with no patch, which is
@@ -52,19 +61,48 @@ public class EksPodIdentityWebhook {
     static final String ENV_AUTHORIZATION_TOKEN_FILE = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE";
     static final String CREDENTIALS_FULL_URI = "http://169.254.170.23/v1/credentials";
 
+    static final String IRSA_ROLE_ARN_ANNOTATION = "eks.amazonaws.com/role-arn"; // partition-literal: the IRSA annotation key is the same in every partition
+    static final String IRSA_AUDIENCE_ANNOTATION = "eks.amazonaws.com/audience"; // partition-literal: the IRSA annotation key is the same in every partition
+    static final String IRSA_TOKEN_EXPIRATION_ANNOTATION = "eks.amazonaws.com/token-expiration"; // partition-literal: the IRSA annotation key is the same in every partition
+    static final String IRSA_DEFAULT_AUDIENCE = "sts.amazonaws.com"; // partition-literal: the IRSA default audience is sts.amazonaws.com in every partition
+    static final String IRSA_TOKEN_VOLUME_NAME = "aws-iam-token";
+    static final String IRSA_TOKEN_MOUNT_PATH = "/var/run/secrets/eks.amazonaws.com/serviceaccount"; // partition-literal: the projected-token mount path the EKS webhook hardcodes
+    static final String IRSA_TOKEN_FILE_NAME = "token";
+    static final String IRSA_TOKEN_FILE_PATH = IRSA_TOKEN_MOUNT_PATH + "/" + IRSA_TOKEN_FILE_NAME;
+    /** The real webhook refuses a shorter expiration and falls back to its default. */
+    static final int IRSA_MIN_TOKEN_EXPIRATION_SECONDS = 600;
+
+    static final String ENV_STS_REGIONAL_ENDPOINTS = "AWS_STS_REGIONAL_ENDPOINTS";
+    static final String ENV_DEFAULT_REGION = "AWS_DEFAULT_REGION";
+    static final String ENV_REGION = "AWS_REGION";
+    static final String ENV_ROLE_ARN = "AWS_ROLE_ARN";
+    static final String ENV_WEB_IDENTITY_TOKEN_FILE = "AWS_WEB_IDENTITY_TOKEN_FILE";
+    static final String ENV_ENDPOINT_URL = "AWS_ENDPOINT_URL";
+
     private static final String DEFAULT_API_VERSION = "admission.k8s.io/v1";
     private static final String DEFAULT_SERVICE_ACCOUNT = "default";
+
+    /** One credential mechanism's share of the patch: its token volume, the mount, and the env. */
+    record Injection(Map<String, Object> volume, Map<String, Object> mount, List<Map<String, Object>> env) {}
 
     private final EksService eks;
     private final EksAddonService addons;
     private final EksPodIdentityAssociationService associations;
+    private final EksClusterManager clusters;
+    private final DockerHostResolver dockerHostResolver;
+    private final EmulatorConfig config;
 
     @Inject
     public EksPodIdentityWebhook(EksService eks, EksAddonService addons,
-                                 EksPodIdentityAssociationService associations) {
+                                 EksPodIdentityAssociationService associations,
+                                 EksClusterManager clusters, DockerHostResolver dockerHostResolver,
+                                 EmulatorConfig config) {
         this.eks = eks;
         this.addons = addons;
         this.associations = associations;
+        this.clusters = clusters;
+        this.dockerHostResolver = dockerHostResolver;
+        this.config = config;
     }
 
     /**
@@ -100,13 +138,61 @@ public class EksPodIdentityWebhook {
             return List.of();
         }
         Optional<Cluster> cluster = eks.findAuthenticationCluster(accountId, clusterName);
-        if (cluster.isEmpty() || !podIdentityAgentInstalled(cluster.get())) {
+        if (cluster.isEmpty()) {
             return List.of();
         }
-        if (!hasAssociation(cluster.get(), namespace, serviceAccountOf(pod))) {
+        String serviceAccount = serviceAccountOf(pod);
+        List<Injection> injections = new ArrayList<>();
+        irsaInjection(cluster.get(), namespace, serviceAccount).ifPresent(injections::add);
+        if (podIdentityAgentInstalled(cluster.get()) && hasAssociation(cluster.get(), namespace, serviceAccount)) {
+            injections.add(podIdentityInjection());
+        }
+        if (injections.isEmpty()) {
             return List.of();
         }
-        return buildPatch(pod);
+        List<Map<String, Object>> sharedEnv = config.services().eks().injectEndpointUrl()
+                ? List.of(env(ENV_ENDPOINT_URL, "http://" + dockerHostResolver.resolve() + ":" + config.port()))
+                : List.of();
+        return buildPatch(pod, injections, sharedEnv);
+    }
+
+    private Optional<Injection> irsaInjection(Cluster cluster, String namespace, String serviceAccount) {
+        Map<String, String> annotations = clusters.serviceAccountAnnotations(cluster, namespace, serviceAccount);
+        String roleArn = annotations.get(IRSA_ROLE_ARN_ANNOTATION);
+        if (roleArn == null || roleArn.isBlank()) {
+            return Optional.empty();
+        }
+        String audience = annotations.getOrDefault(IRSA_AUDIENCE_ANNOTATION, IRSA_DEFAULT_AUDIENCE);
+        int expiration = irsaTokenExpiration(annotations.get(IRSA_TOKEN_EXPIRATION_ANNOTATION));
+        List<Map<String, Object>> env = new ArrayList<>();
+        env.add(env(ENV_STS_REGIONAL_ENDPOINTS, "regional"));
+        String region = clusters.clusterRegion(cluster);
+        if (region != null && !region.isBlank()) {
+            env.add(env(ENV_DEFAULT_REGION, region));
+            env.add(env(ENV_REGION, region));
+        }
+        env.add(env(ENV_ROLE_ARN, roleArn));
+        env.add(env(ENV_WEB_IDENTITY_TOKEN_FILE, IRSA_TOKEN_FILE_PATH));
+        return Optional.of(new Injection(
+                projectedTokenVolume(IRSA_TOKEN_VOLUME_NAME, audience, expiration, IRSA_TOKEN_FILE_NAME),
+                mount(IRSA_TOKEN_VOLUME_NAME, IRSA_TOKEN_MOUNT_PATH),
+                List.copyOf(env)));
+    }
+
+    static int irsaTokenExpiration(String annotation) {
+        if (annotation == null || annotation.isBlank()) {
+            return TOKEN_EXPIRATION_SECONDS;
+        }
+        try {
+            int seconds = Integer.parseInt(annotation.strip());
+            return seconds < IRSA_MIN_TOKEN_EXPIRATION_SECONDS ? TOKEN_EXPIRATION_SECONDS : seconds;
+        } catch (NumberFormatException e) {
+            return TOKEN_EXPIRATION_SECONDS;
+        }
+    }
+
+    static Injection podIdentityInjection() {
+        return new Injection(tokenVolume(), tokenMount(), credentialsEnv());
     }
 
     private boolean podIdentityAgentInstalled(Cluster cluster) {
@@ -131,29 +217,43 @@ public class EksPodIdentityWebhook {
     }
 
     /**
-     * The JSONPatch that turns a pod into an injected pod: one projected token volume, then a mount
-     * and the two credentials environment variables on every init container and container. An entry
-     * the pod already carries under the same name is left alone, matching the real webhook, which
-     * never overrides a value the workload set itself.
+     * The JSONPatch that turns a pod into an injected pod: one projected token volume per
+     * mechanism, then the mounts and the environment variables on every init container and
+     * container. An entry the pod already carries under the same name is left alone, matching the
+     * real webhook, which never overrides a value the workload set itself.
      */
-    static List<Map<String, Object>> buildPatch(Map<String, Object> pod) {
+    static List<Map<String, Object>> buildPatch(Map<String, Object> pod, List<Injection> injections,
+                                                List<Map<String, Object>> sharedEnv) {
         Map<String, Object> spec = asMap(pod.get("spec"));
         if (spec == null) {
             return List.of();
         }
         List<Map<String, Object>> patch = new ArrayList<>();
         List<Object> volumes = asList(spec.get("volumes"));
-        if (volumes == null) {
-            patch.add(operation("/spec/volumes", List.of(tokenVolume())));
-        } else if (!containsNamed(volumes, TOKEN_VOLUME_NAME)) {
-            patch.add(operation("/spec/volumes/-", tokenVolume()));
+        List<Map<String, Object>> missingVolumes = new ArrayList<>();
+        for (Injection injection : injections) {
+            if (volumes == null || !containsNamed(volumes, String.valueOf(injection.volume().get("name")))) {
+                missingVolumes.add(injection.volume());
+            }
         }
-        patchContainers(patch, spec, "initContainers");
-        patchContainers(patch, spec, "containers");
+        if (volumes == null) {
+            patch.add(operation("/spec/volumes", missingVolumes));
+        } else {
+            for (Map<String, Object> volume : missingVolumes) {
+                patch.add(operation("/spec/volumes/-", volume));
+            }
+        }
+        List<Map<String, Object>> mounts = injections.stream().map(Injection::mount).toList();
+        List<Map<String, Object>> env = new ArrayList<>();
+        injections.forEach(injection -> env.addAll(injection.env()));
+        env.addAll(sharedEnv);
+        patchContainers(patch, spec, "initContainers", mounts, env);
+        patchContainers(patch, spec, "containers", mounts, env);
         return patch;
     }
 
-    private static void patchContainers(List<Map<String, Object>> patch, Map<String, Object> spec, String field) {
+    private static void patchContainers(List<Map<String, Object>> patch, Map<String, Object> spec, String field,
+                                        List<Map<String, Object>> mounts, List<Map<String, Object>> env) {
         List<Object> containers = asList(spec.get(field));
         if (containers == null) {
             return;
@@ -164,51 +264,62 @@ public class EksPodIdentityWebhook {
                 continue;
             }
             String path = "/spec/" + field + "/" + index;
-            List<Object> mounts = asList(container.get("volumeMounts"));
-            if (mounts == null) {
-                patch.add(operation(path + "/volumeMounts", List.of(tokenMount())));
-            } else if (!containsNamed(mounts, TOKEN_VOLUME_NAME)) {
-                patch.add(operation(path + "/volumeMounts/-", tokenMount()));
+            appendMissing(patch, path + "/volumeMounts", asList(container.get("volumeMounts")), mounts);
+            appendMissing(patch, path + "/env", asList(container.get("env")), env);
+        }
+    }
+
+    private static void appendMissing(List<Map<String, Object>> patch, String path, List<Object> existing,
+                                      List<Map<String, Object>> wanted) {
+        List<Map<String, Object>> missing = new ArrayList<>();
+        for (Map<String, Object> entry : wanted) {
+            if (existing == null || !containsNamed(existing, String.valueOf(entry.get("name")))) {
+                missing.add(entry);
             }
-            List<Object> env = asList(container.get("env"));
-            List<Map<String, Object>> missing = new ArrayList<>();
-            for (Map<String, Object> variable : credentialsEnv()) {
-                if (env == null || !containsNamed(env, String.valueOf(variable.get("name")))) {
-                    missing.add(variable);
-                }
-            }
-            if (missing.isEmpty()) {
-                continue;
-            }
-            if (env == null) {
-                patch.add(operation(path + "/env", missing));
-            } else {
-                for (Map<String, Object> variable : missing) {
-                    patch.add(operation(path + "/env/-", variable));
-                }
+        }
+        if (missing.isEmpty()) {
+            return;
+        }
+        if (existing == null) {
+            patch.add(operation(path, missing));
+        } else {
+            for (Map<String, Object> entry : missing) {
+                patch.add(operation(path + "/-", entry));
             }
         }
     }
 
     static Map<String, Object> tokenVolume() {
+        return projectedTokenVolume(TOKEN_VOLUME_NAME, TOKEN_AUDIENCE, TOKEN_EXPIRATION_SECONDS, TOKEN_FILE_NAME);
+    }
+
+    static Map<String, Object> projectedTokenVolume(String name, String audience, int expirationSeconds, String path) {
         return Map.of(
-                "name", TOKEN_VOLUME_NAME,
+                "name", name,
                 "projected", Map.of(
                         "defaultMode", TOKEN_DEFAULT_MODE,
                         "sources", List.of(Map.of("serviceAccountToken", Map.of(
-                                "audience", TOKEN_AUDIENCE,
-                                "expirationSeconds", TOKEN_EXPIRATION_SECONDS,
-                                "path", TOKEN_FILE_NAME)))));
+                                "audience", audience,
+                                "expirationSeconds", expirationSeconds,
+                                "path", path)))));
     }
 
     static Map<String, Object> tokenMount() {
-        return Map.of("name", TOKEN_VOLUME_NAME, "mountPath", TOKEN_MOUNT_PATH, "readOnly", true);
+        return mount(TOKEN_VOLUME_NAME, TOKEN_MOUNT_PATH);
+    }
+
+    static Map<String, Object> mount(String volumeName, String mountPath) {
+        return Map.of("name", volumeName, "mountPath", mountPath, "readOnly", true);
     }
 
     static List<Map<String, Object>> credentialsEnv() {
         return List.of(
-                Map.of("name", ENV_CREDENTIALS_FULL_URI, "value", CREDENTIALS_FULL_URI),
-                Map.of("name", ENV_AUTHORIZATION_TOKEN_FILE, "value", TOKEN_FILE_PATH));
+                env(ENV_CREDENTIALS_FULL_URI, CREDENTIALS_FULL_URI),
+                env(ENV_AUTHORIZATION_TOKEN_FILE, TOKEN_FILE_PATH));
+    }
+
+    static Map<String, Object> env(String name, String value) {
+        return Map.of("name", name, "value", value);
     }
 
     private static Map<String, Object> operation(String path, Object value) {

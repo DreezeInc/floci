@@ -112,6 +112,7 @@ floci:
     # cert-path: ""                          # FLOCI_TLS_CERT_PATH — PEM certificate file path
     # key-path: ""                           # FLOCI_TLS_KEY_PATH — PEM private key file path
     self-signed: true                        # FLOCI_TLS_SELF_SIGNED: auto-generate a cert signed by the local CA when no paths provided
+    # extra-sans: ""                        # FLOCI_TLS_EXTRA_SANS — comma-separated extra hostnames or IPs the generated cert covers
 
   protocols:
     max-request-size: 2048                   # FLOCI_PROTOCOLS_MAX_REQUEST_SIZE — max HTTP request body size in MB (legacy: floci.max-request-size / FLOCI_MAX_REQUEST_SIZE)

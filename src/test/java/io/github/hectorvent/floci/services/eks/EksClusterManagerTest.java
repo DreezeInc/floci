@@ -3214,7 +3214,7 @@ class EksClusterManagerTest {
             assertTrue(manifest.contains("caBundle: \""
                     + Base64.getEncoder().encodeToString(CA_PEM.getBytes(StandardCharsets.UTF_8)) + "\""));
             assertTrue(manifest.contains("failurePolicy: Ignore"));
-            assertTrue(manifest.contains("timeoutSeconds: 3"));
+            assertTrue(manifest.contains("timeoutSeconds: 10"));
             assertTrue(manifest.contains("operations: [\"CREATE\"]"));
             assertTrue(manifest.contains("resources: [\"pods\"]"));
             assertFalse(manifest.contains("url: \"http://"), "Kubernetes rejects a non-https webhook URL");
@@ -4010,6 +4010,45 @@ class EksClusterManagerTest {
             inst.setArchitecture(arch);
             inst.setPrivateIpAddress(ip);
             return inst;
+        }
+    }
+
+    @Nested
+    class ServiceAccountAnnotations {
+
+        @Test
+        void readsTheAnnotationsOffTheServiceAccountJson() {
+            Map<String, String> annotations = EksClusterManager.serviceAccountAnnotationsOf("""
+                    {"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":"karpenter",
+                     "annotations":{"eks.amazonaws.com/role-arn":"arn:aws:iam::123456789012:role/karpenter",
+                                    "meta.helm.sh/release-name":"karpenter"}}}""");
+
+            assertEquals(Map.of(
+                    "eks.amazonaws.com/role-arn", "arn:aws:iam::123456789012:role/karpenter",
+                    "meta.helm.sh/release-name", "karpenter"), annotations);
+        }
+
+        @Test
+        void serviceAccountWithoutAnnotationsReadsEmpty() {
+            assertEquals(Map.of(), EksClusterManager.serviceAccountAnnotationsOf(
+                    "{\"apiVersion\":\"v1\",\"kind\":\"ServiceAccount\",\"metadata\":{\"name\":\"default\"}}"));
+        }
+
+        @Test
+        void unreadableOutputReadsEmpty() {
+            assertEquals(Map.of(), EksClusterManager.serviceAccountAnnotationsOf("Error from server (NotFound)"));
+            assertEquals(Map.of(), EksClusterManager.serviceAccountAnnotationsOf(""));
+        }
+
+        @Test
+        void clusterWithoutAContainerIsNotAsked() {
+            EksClusterManager manager = new EksClusterManager(
+                    Mockito.mock(ContainerBuilder.class), Mockito.mock(ContainerLifecycleManager.class),
+                    Mockito.mock(ContainerDetector.class), Mockito.mock(PortAllocator.class),
+                    Mockito.mock(DockerHostResolver.class), Mockito.mock(EcrRegistryManager.class),
+                    Mockito.mock(EmulatorConfig.class), Mockito.mock(RegionResolver.class));
+
+            assertEquals(Map.of(), manager.serviceAccountAnnotations(new Cluster(), "karpenter", "karpenter"));
         }
     }
 }

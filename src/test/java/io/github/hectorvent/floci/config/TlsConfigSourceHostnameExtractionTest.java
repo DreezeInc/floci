@@ -26,6 +26,7 @@ class TlsConfigSourceHostnameExtractionTest {
         System.clearProperty("floci.hostname");
         System.clearProperty("floci.base-url");
         System.clearProperty("floci.services.iot.endpoint-address");
+        System.clearProperty("floci.tls.extra-sans");
     }
 
     /**
@@ -323,6 +324,26 @@ class TlsConfigSourceHostnameExtractionTest {
     /**
      * Invokes the private extractCustomHostnames() method using reflection.
      */
+
+    @Test
+    void testExtraSansAreAddedVerbatim() throws Exception {
+        System.setProperty("floci.tls.extra-sans", "10.42.0.9, floci.internal");
+
+        List<String> hostnames = invokeExtractCustomHostnames();
+
+        assertTrue(hostnames.contains("10.42.0.9"), "Should add the IP from FLOCI_TLS_EXTRA_SANS");
+        assertTrue(hostnames.contains("floci.internal"), "Should add the hostname from FLOCI_TLS_EXTRA_SANS");
+    }
+
+    @Test
+    void testExtraSansSkipDefaultsAndBlanks() throws Exception {
+        System.setProperty("floci.tls.extra-sans", "127.0.0.1,, localhost ,");
+
+        List<String> hostnames = invokeExtractCustomHostnames();
+
+        assertTrue(hostnames.isEmpty(), "Defaults and blanks from FLOCI_TLS_EXTRA_SANS are not custom hostnames: " + hostnames);
+    }
+
     @SuppressWarnings("unchecked")
     private List<String> invokeExtractCustomHostnames() throws Exception {
         TlsConfigSource configSource = new TlsConfigSource();

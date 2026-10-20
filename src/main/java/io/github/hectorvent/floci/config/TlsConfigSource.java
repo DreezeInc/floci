@@ -452,8 +452,8 @@ public class TlsConfigSource implements ConfigSource {
     }
 
     /**
-     * Extracts custom hostnames from FLOCI_HOSTNAME, FLOCI_BASE_URL and
-     * FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS configuration.
+     * Extracts custom hostnames from FLOCI_HOSTNAME, FLOCI_BASE_URL,
+     * FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS and FLOCI_TLS_EXTRA_SANS configuration.
      * Filters out default values like "localhost" and "127.0.0.1".
      * Returns a deduplicated list of custom hostnames.
      *
@@ -499,6 +499,15 @@ public class TlsConfigSource implements ConfigSource {
             } catch (URISyntaxException e) {
                 LOG.warnv("TLS: failed to parse floci.services.iot.endpoint-address for hostname extraction: {0}",
                         iotEndpoint);
+            }
+        }
+
+        // Extract from FLOCI_TLS_EXTRA_SANS: addresses clients reach Floci on that nothing else configures, such as a pod IP
+        for (String extra : resolveProperty("floci.tls.extra-sans", "").split(",")) {
+            String san = extra.strip();
+            if (!san.isEmpty() && !isDefaultHostname(san)) {
+                hostnames.add(san);
+                LOG.debugv("TLS: extracted SAN from floci.tls.extra-sans: {0}", san);
             }
         }
 
