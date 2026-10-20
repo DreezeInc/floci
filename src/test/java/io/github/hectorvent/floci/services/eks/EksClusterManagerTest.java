@@ -313,6 +313,31 @@ class EksClusterManagerTest {
     }
 
     @Test
+    void serverArgsAddTheEndpointHostAsASecondTlsSan() {
+        List<String> args = EksClusterManager.buildServerArgs(false, false, null, null,
+                Optional.of("floci-service.floci-pr-1.svc.cluster.local"));
+
+        assertTrue(args.contains("--tls-san=localhost"));
+        assertTrue(args.contains("--tls-san=floci-service.floci-pr-1.svc.cluster.local"));
+    }
+
+    @Test
+    void serverArgsIgnoreABlankEndpointHost() {
+        List<String> args = EksClusterManager.buildServerArgs(false, false, null, null, Optional.of(" "));
+
+        assertEquals(1, args.stream().filter(a -> a.startsWith("--tls-san=")).count());
+    }
+
+    @Test
+    void publicEndpointUsesTheEndpointHostOverEveryMode() {
+        assertEquals("https://floci-service.floci-pr-1.svc.cluster.local:6512",
+                EksClusterManager.resolvePublicEndpoint(true, "network", "floci-eks-demo", 6512,
+                        Optional.of("floci-service.floci-pr-1.svc.cluster.local")));
+        assertEquals("https://localhost:6512",
+                EksClusterManager.resolvePublicEndpoint(false, "host", "floci-eks-demo", 6512, Optional.empty()));
+    }
+
+    @Test
     void serverArgsRetainLocalStorageWhenDefaultStorageClassEnabled() {
         List<String> args = EksClusterManager.buildServerArgs(false, true, null, null);
 

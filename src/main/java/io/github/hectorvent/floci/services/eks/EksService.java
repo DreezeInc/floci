@@ -726,7 +726,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
      */
     private void markMetadataOnlyActive(Cluster cluster) {
         cluster.setStatus(ClusterStatus.ACTIVE);
-        cluster.setEndpoint("https://localhost:" + config.services().eks().apiServerBasePort());
+        String host = config.services().eks().endpointHost().filter(h -> !h.isBlank()).orElse("localhost");
+        cluster.setEndpoint("https://" + host + ":" + config.services().eks().apiServerBasePort());
     }
 
     public Optional<Cluster> findAuthenticationCluster(String accountId, String name) {
