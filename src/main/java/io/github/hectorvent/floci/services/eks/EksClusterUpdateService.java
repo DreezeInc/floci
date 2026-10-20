@@ -48,15 +48,20 @@ public class EksClusterUpdateService {
 
     private final StorageBackend<String, Update> updates;
     private final EksAddonService addons;
+    private final EksIdentityProviderConfigService identityProviderConfigs;
 
     @Inject
-    public EksClusterUpdateService(StorageFactory factory, EksAddonService addons) {
-        this(factory.create("eks", "eks-cluster-updates.json", new TypeReference<Map<String, Update>>() {}), addons);
+    public EksClusterUpdateService(StorageFactory factory, EksAddonService addons,
+                                   EksIdentityProviderConfigService identityProviderConfigs) {
+        this(factory.create("eks", "eks-cluster-updates.json", new TypeReference<Map<String, Update>>() {}), addons,
+                identityProviderConfigs);
     }
 
-    EksClusterUpdateService(StorageBackend<String, Update> updates, EksAddonService addons) {
+    EksClusterUpdateService(StorageBackend<String, Update> updates, EksAddonService addons,
+                            EksIdentityProviderConfigService identityProviderConfigs) {
         this.updates = updates;
         this.addons = addons;
+        this.identityProviderConfigs = identityProviderConfigs;
     }
 
     @RegisterForReflection
@@ -127,10 +132,13 @@ public class EksClusterUpdateService {
         }
         boolean scopedToSubResource = !isBlank(addonName) || !isBlank(nodegroupName);
         Optional<Update> clusterUpdate = scopedToSubResource ? Optional.empty() : updates.get(prefix(cluster) + updateId);
+        Optional<Update> identityProviderUpdate = scopedToSubResource ? Optional.empty()
+                : identityProviderConfigs.findUpdate(cluster, updateId);
         Optional<Update> addonUpdate = isBlank(nodegroupName) ? addons.findUpdate(cluster, updateId, addonName)
                 : Optional.empty();
-        return clusterUpdate.or(() -> addonUpdate).orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                "No update: " + updateId + " found for cluster: " + cluster.getName(), 404));
+        return clusterUpdate.or(() -> identityProviderUpdate).or(() -> addonUpdate)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "No update: " + updateId + " found for cluster: " + cluster.getName(), 404));
     }
 
     public Page listUpdates(Cluster cluster, String addonName, String nodegroupName,
@@ -139,6 +147,7 @@ public class EksClusterUpdateService {
         if (isBlank(addonName) && isBlank(nodegroupName)) {
             String prefix = prefix(cluster);
             updates.scan(key -> key.startsWith(prefix)).forEach(update -> ids.add(update.id()));
+            identityProviderConfigs.listUpdates(cluster).forEach(update -> ids.add(update.id()));
         }
         if (isBlank(nodegroupName)) {
             addons.listUpdates(cluster, addonName).forEach(update -> ids.add(update.id()));

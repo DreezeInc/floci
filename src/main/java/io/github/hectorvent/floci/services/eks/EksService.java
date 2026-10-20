@@ -109,6 +109,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
     private final EksClusterUpdateService clusterUpdates;
+    private final EksIdentityProviderConfigService identityProviderConfigs;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
     private final Map<String, UserDataClaim> appliedClusterUserData = new ConcurrentHashMap<>();
     private final Map<String, Object> nodeGroupCapacityLocks = new ConcurrentHashMap<>();
@@ -122,7 +123,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations,
-            EksAddonService addons, EksClusterUpdateService clusterUpdates) {
+            EksAddonService addons, EksClusterUpdateService clusterUpdates,
+            EksIdentityProviderConfigService identityProviderConfigs) {
         this.storage = storageFactory.create("eks", "eks-clusters.json",
                 new TypeReference<Map<String, Cluster>>() {
                 });
@@ -141,6 +143,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
         this.clusterUpdates = clusterUpdates;
+        this.identityProviderConfigs = identityProviderConfigs;
         if (this.clusterManager != null) {
             this.clusterManager.setEc2Service(this.ec2Service);
         }
@@ -150,9 +153,18 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations,
+            EksAddonService addons, EksClusterUpdateService clusterUpdates) {
+        this(storageFactory, config, regionResolver, clusterManager, ec2Service,
+                oidcService, accessEntries, podIdentityAssociations, addons, clusterUpdates, null);
+    }
+
+    public EksService(StorageFactory storageFactory, EmulatorConfig config,
+            RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
+            EksOidcService oidcService, EksAccessEntryService accessEntries,
+            EksPodIdentityAssociationService podIdentityAssociations,
             EksAddonService addons) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
-                oidcService, accessEntries, podIdentityAssociations, addons, null);
+                oidcService, accessEntries, podIdentityAssociations, addons, null, null);
     }
 
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -160,14 +172,14 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
-                oidcService, accessEntries, podIdentityAssociations, null, null);
+                oidcService, accessEntries, podIdentityAssociations, null, null, null);
     }
 
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
-                oidcService, accessEntries, null, null, null);
+                oidcService, accessEntries, null, null, null, null);
     }
 
     @PostConstruct
@@ -878,6 +890,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
             if (clusterUpdates != null) {
                 clusterUpdates.deleteClusterUpdates(cluster);
+            }
+            if (identityProviderConfigs != null) {
+                identityProviderConfigs.deleteClusterConfigs(cluster);
             }
             synchronized (clustersBeingDeleted) {
                 storage.delete(name);

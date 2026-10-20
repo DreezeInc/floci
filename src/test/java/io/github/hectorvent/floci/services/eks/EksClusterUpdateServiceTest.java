@@ -294,7 +294,9 @@ class EksClusterUpdateServiceTest {
         EksAddonService addons = new EksAddonService(new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new EksAddonCatalog(), iam, podIdentityAssociations);
         InMemoryStorage<String, Update> storage = new InMemoryStorage<>();
-        return new Fixture(cluster, addons, storage, new EksClusterUpdateService(storage, addons));
+        EksIdentityProviderConfigService identityProviderConfigs = new EksIdentityProviderConfigService(
+                new InMemoryStorage<>(), new InMemoryStorage<>());
+        return new Fixture(cluster, addons, storage, new EksClusterUpdateService(storage, addons, identityProviderConfigs));
     }
 
     private record Fixture(Cluster cluster, EksAddonService addons, InMemoryStorage<String, Update> storage,

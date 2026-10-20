@@ -86,7 +86,7 @@ type_order:
   AWS::KMS: [Key, Alias]
   AWS::SecretsManager: [Secret, SecretTargetAttachment]
   AWS::ECS: [Cluster, TaskDefinition, Service]
-  AWS::EKS: [Cluster, Nodegroup, Addon, AccessEntry, PodIdentityAssociation]
+  AWS::EKS: [Cluster, Nodegroup, Addon, AccessEntry, PodIdentityAssociation, IdentityProviderConfig]
   AWS::EFS: [FileSystem, MountTarget, AccessPoint]
   AWS::RDS:
     [DBInstance, DBCluster, DBSubnetGroup, DBParameterGroup, DBClusterParameterGroup]
@@ -203,6 +203,7 @@ notes:
   AWS::EKS::Addon: '`PreserveOnDelete` is ignored; a stack delete removes the addon; a reused addon is not reconciled on update'
   AWS::EKS::AccessEntry: '`AccessPolicies` are accepted and not associated; a reused entry is not reconciled on update'
   AWS::EKS::PodIdentityAssociation: 'a reused association is not reconciled on update'
+  AWS::EKS::IdentityProviderConfig: 'metadata only, the issuer is never contacted and the config is ACTIVE at once; a reused config is not reconciled on update'
   AWS::IAM::OIDCProvider: 'a reused provider is not reconciled on update'
   AWS::EFS::FileSystem: '`FileSystemPolicy`, `BackupPolicy` and `LifecyclePolicies` are applied on create and update; `ReplicationConfiguration` and `FileSystemProtection` are ignored'
   AWS::EC2::Volume: '`KmsKeyId` is accepted and not stored; a reused volume is not reconciled on update'

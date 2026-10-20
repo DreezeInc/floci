@@ -19,8 +19,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * The resource types an EKS workload stack declares around its cluster, provisioned for real through
- * CloudFormation: EKS addon, access entry and pod identity association, the IAM OIDC provider for
- * the cluster issuer, the EFS file system with its access point and mount target, and an EBS volume.
+ * CloudFormation: EKS addon, access entry, pod identity association and OIDC identity provider config,
+ * the IAM OIDC provider for the cluster issuer, the EFS file system with its access point and mount
+ * target, and an EBS volume.
  * EKS runs in mock mode under test, so no cluster container starts.
  */
 @QuarkusTest
@@ -63,6 +64,9 @@ class CloudFormationEksSubResourcesIntegrationTest {
         assertThat(outputs.get("AssociationArn"), containsString(":podidentityassociation/" + clusterName + "/"));
         assertEquals(outputs.get("AssociationArn"), outputs.get("AssociationRef"));
         assertThat(outputs.get("AssociationId"), startsWith("a-"));
+        assertEquals(clusterName + "-oidc-idp|" + clusterName + "|oidc", outputs.get("IdpRef"));
+        assertThat(outputs.get("IdpArn"), containsString(":identityproviderconfig/" + clusterName + "/oidc/"
+                + clusterName + "-oidc-idp/"));
         assertThat(outputs.get("OidcArn"), startsWith("arn:aws:iam::"));
         assertThat(outputs.get("OidcArn"), containsString(":oidc-provider/"));
         assertEquals(outputs.get("OidcArn"), outputs.get("OidcRef"));
@@ -95,6 +99,21 @@ class CloudFormationEksSubResourcesIntegrationTest {
                 .body("association.namespace", equalTo("default"))
                 .body("association.serviceAccount", equalTo("app"))
                 .body("association.roleArn", equalTo(roleArn));
+        given().contentType("application/json").body(idpHandle(clusterName))
+                .post("/clusters/" + clusterName + "/identity-provider-configs/describe").then()
+                .statusCode(200)
+                .body("identityProviderConfig.oidc.identityProviderConfigArn", equalTo(outputs.get("IdpArn")))
+                .body("identityProviderConfig.oidc.status", equalTo("ACTIVE"))
+                .body("identityProviderConfig.oidc.issuerUrl", equalTo("https://accounts.google.com"))
+                .body("identityProviderConfig.oidc.clientId", equalTo("example-client"))
+                .body("identityProviderConfig.oidc.usernameClaim", equalTo("email"))
+                .body("identityProviderConfig.oidc.usernamePrefix", equalTo("google:"))
+                .body("identityProviderConfig.oidc.groupsClaim", equalTo("groups"))
+                .body("identityProviderConfig.oidc.groupsPrefix", equalTo("gid:"))
+                .body("identityProviderConfig.oidc.tags.Name", equalTo(clusterName + "-oidc-idp"));
+        given().get("/clusters/" + clusterName + "/identity-provider-configs").then()
+                .statusCode(200)
+                .body("identityProviderConfigs.name", equalTo(List.of(clusterName + "-oidc-idp")));
         given().get("/clusters/" + clusterName).then()
                 .statusCode(200)
                 .body("cluster.accessConfig.authenticationMode", equalTo("API_AND_CONFIG_MAP"))
@@ -149,6 +168,9 @@ class CloudFormationEksSubResourcesIntegrationTest {
         CfnStackWaits.awaitStackDeleted(stackName, CFN_AUTH);
 
         given().get("/clusters/" + clusterName).then().statusCode(404);
+        given().contentType("application/json").body(idpHandle(clusterName))
+                .post("/clusters/" + clusterName + "/identity-provider-configs/describe").then()
+                .statusCode(404);
         given().header("Authorization", IAM_AUTH)
                 .formParam("Action", "GetOpenIDConnectProvider")
                 .formParam("OpenIDConnectProviderArn", outputs.get("OidcArn"))
@@ -185,6 +207,10 @@ class CloudFormationEksSubResourcesIntegrationTest {
                 .formParam("TemplateBody", template)
                 .post("/").then()
                 .statusCode(200);
+    }
+
+    private static Map<String, Object> idpHandle(String clusterName) {
+        return Map.of("identityProviderConfig", Map.of("type", "oidc", "name", clusterName + "-oidc-idp"));
     }
 
     private static String describeStack(String stackName) {
@@ -266,6 +292,25 @@ class CloudFormationEksSubResourcesIntegrationTest {
                         "Tags": [{"Key": "Name", "Value": "pia"}]
                       }
                     },
+                    "Idp": {
+                      "Type": "AWS::EKS::IdentityProviderConfig",
+                      "DependsOn": "Cluster",
+                      "Properties": {
+                        "ClusterName": {"Ref": "Cluster"},
+                        "Type": "oidc",
+                        "IdentityProviderConfigName": "%1$s-oidc-idp",
+                        "Oidc": {
+                          "IssuerUrl": "https://accounts.google.com",
+                          "ClientId": "example-client",
+                          "UsernameClaim": "email",
+                          "UsernamePrefix": "google:",
+                          "GroupsClaim": "groups",
+                          "GroupsPrefix": "gid:"
+                        },
+                        "Tags": [{"Key": "Name", "Value": "%1$s-oidc-idp"},
+                                 {"Key": "backup-plan", "Value": "true"}]
+                      }
+                    },
                     "Fs": {
                       "Type": "AWS::EFS::FileSystem",
                       "Properties": {
@@ -321,6 +366,8 @@ class CloudFormationEksSubResourcesIntegrationTest {
                     "AssociationRef": {"Value": {"Ref": "Pia"}},
                     "AssociationArn": {"Value": {"Fn::GetAtt": ["Pia", "AssociationArn"]}},
                     "AssociationId": {"Value": {"Fn::GetAtt": ["Pia", "AssociationId"]}},
+                    "IdpRef": {"Value": {"Ref": "Idp"}},
+                    "IdpArn": {"Value": {"Fn::GetAtt": ["Idp", "IdentityProviderConfigArn"]}},
                     "OidcRef": {"Value": {"Ref": "Oidc"}},
                     "OidcArn": {"Value": {"Fn::GetAtt": ["Oidc", "Arn"]}},
                     "FileSystemRef": {"Value": {"Ref": "Fs"}},

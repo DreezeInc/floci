@@ -22,6 +22,10 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `ListPodIdentityAssociations` | List pod identity associations in a cluster with optional filtering and pagination |
 | `UpdatePodIdentityAssociation` | Update the IAM role, target role, or session tags for a pod identity association |
 | `DeletePodIdentityAssociation` | Delete a pod identity association |
+| `AssociateIdentityProviderConfig` | Associate an OIDC identity provider config with a cluster (metadata only) |
+| `DescribeIdentityProviderConfig` | Describe an OIDC identity provider config by type and name |
+| `ListIdentityProviderConfigs` | List identity provider config handles for a cluster with pagination |
+| `DisassociateIdentityProviderConfig` | Disassociate an identity provider config from a cluster |
 | `CreateAddon` | Create an addon for an EKS cluster |
 | `DescribeAddon` | Describe an addon by cluster and addon name |
 | `ListAddons` | List addon names installed in a cluster with pagination |
@@ -64,11 +68,33 @@ names none of them, or more than one, is an `InvalidParameterException`. The clu
 only and records it on the cluster (`VersionUpdate`). In real mode the running k3s control
 plane is not upgraded in place; the new version is used when the cluster is next started.
 
-`ListUpdates` (`GET /clusters/{name}/updates`) returns the IDs of cluster and addon updates,
-with `maxResults` and `nextToken` pagination; `addonName` narrows it to that addon's updates and
-`nodegroupName` yields an empty list because node group updates are not modeled. `DescribeUpdate`
-(`GET /clusters/{name}/updates/{updateId}`) resolves either kind of update and returns
-`ResourceNotFoundException` when neither store has it. Deleting a cluster drops its updates.
+`ListUpdates` (`GET /clusters/{name}/updates`) returns the IDs of cluster, identity provider
+config and addon updates, with `maxResults` and `nextToken` pagination; `addonName` narrows it to
+that addon's updates and `nodegroupName` yields an empty list because node group updates are not
+modeled. `DescribeUpdate` (`GET /clusters/{name}/updates/{updateId}`) resolves any of those kinds
+and returns `ResourceNotFoundException` when no store has it. Deleting a cluster drops its updates.
+
+## Identity provider configs
+
+`AssociateIdentityProviderConfig` (`POST /clusters/{name}/identity-provider-configs/associate`)
+records an OIDC identity provider config on an `ACTIVE` cluster and returns an `Update` of type
+`AssociateIdentityProviderConfig` with status `Successful` plus the request's `tags`. The config
+is metadata only: the issuer is never contacted, so it is `ACTIVE` at once. `oidc` must carry
+`identityProviderConfigName`, an `https://` `issuerUrl` and a `clientId`; `usernameClaim`,
+`usernamePrefix`, `groupsClaim`, `groupsPrefix` and `requiredClaims` are stored as given, and a
+prefix containing `system:` is rejected. As on AWS a cluster holds one OIDC config: a second
+association, or one reusing a name, is a `ResourceInUseException`. `clientRequestToken` replays
+return the original update. The ARN has the form
+`arn:<partition>:eks:<region>:<account>:identityproviderconfig/<cluster>/oidc/<name>/<uuid>`.
+
+`DescribeIdentityProviderConfig` (`POST .../identity-provider-configs/describe`) and
+`DisassociateIdentityProviderConfig` (`POST .../identity-provider-configs/disassociate`) take
+`identityProviderConfig: {type: "oidc", name}`; the former returns the stored config under
+`identityProviderConfig.oidc`, the latter removes it and returns a
+`DisassociateIdentityProviderConfig` update. `ListIdentityProviderConfigs`
+(`GET .../identity-provider-configs`) returns `{type, name}` handles with `maxResults` (1-100)
+and `nextToken` pagination. Both updates stay visible to `DescribeUpdate` and `ListUpdates` after
+a disassociation. Deleting a cluster drops its configs and their updates.
 
 ## Access-entry management
 
@@ -1094,5 +1120,4 @@ eks.deleteCluster(r -> r.name("my-cluster"));
 The following EKS features are not yet supported:
 
 - `UpdateNodegroupConfig` / `UpdateNodegroupVersion`
-- Identity provider configs
 - Access policies
