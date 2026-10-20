@@ -450,7 +450,7 @@ class EksAddonServiceTest {
     @Test
     void clusterVersionOutsideCatalogRangeAllowsCatalogVersionsAndResolvesDefault() {
         Fixture fixture = fixture();
-        fixture.cluster.setVersion("1.35");
+        fixture.cluster.setVersion("1.40");
 
         // Create with no version resolves a default version from the catalog without error
         CreateAddonRequest reqDefault = new CreateAddonRequest(
@@ -608,7 +608,7 @@ class EksAddonServiceTest {
         assertEquals("storage", addonInfo.type());
         assertEquals("aws", addonInfo.owner());
         assertEquals("eks", addonInfo.publisher());
-        assertEquals(5, addonInfo.addonVersions().size());
+        assertEquals(6, addonInfo.addonVersions().size());
 
         // Filtering by addon name and cluster version works
         EksAddonService.AddonVersionsPage byCluster = fixture.service.describeAddonVersions(
