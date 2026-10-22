@@ -2,7 +2,6 @@ package io.github.hectorvent.floci.services.eks.csi;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
-import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.grpc.Server;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.quarkus.runtime.ShutdownEvent;
@@ -15,7 +14,6 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
-import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -60,7 +58,7 @@ public class EbsCsiServer {
                     .intercept(new CsiCallerAddress())
                     .addService(new EbsCsiIdentityService())
                     .addService(controller)
-                    .addService(new EbsCsiNodeService(nodes, disk, controller, EbsCsiServer::seedOf))
+                    .addService(new EbsCsiNodeService(nodes, disk, controller, EbsCsiVolumeContent::seedOf))
                     .addService(new KubeletRegistrationService())
                     .build()
                     .start();
@@ -85,9 +83,5 @@ public class EbsCsiServer {
             Thread.currentThread().interrupt();
         }
         server = null;
-    }
-
-    static Path seedOf(Volume volume) {
-        return null;
     }
 }
