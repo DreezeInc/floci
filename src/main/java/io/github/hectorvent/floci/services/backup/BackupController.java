@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.backup.model.*;
 import jakarta.inject.Inject;
@@ -16,9 +18,13 @@ import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 @Path("/")
 @Produces(MediaType.APPLICATION_JSON)
@@ -26,6 +32,7 @@ import java.util.Map;
 public class BackupController {
 
     private static final Logger LOG = Logger.getLogger(BackupController.class);
+    private static final int MAX_RESULTS = 1000;
 
     private final BackupService service;
     private final RegionResolver regionResolver;
@@ -60,12 +67,33 @@ public class BackupController {
         return Response.status(200).entity(out).build();
     }
 
+    @PUT
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/logically-air-gapped-backup-vaults/{backupVaultName}")
+    public Response createLogicallyAirGappedBackupVault(@Context HttpHeaders headers,
+                                                        @PathParam("backupVaultName") String vaultName,
+                                                        String body) throws IOException {
+        String region = regionResolver.resolveRegion(headers);
+        JsonNode req = objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
+        BackupVault vault = service.createLogicallyAirGappedBackupVault(vaultName,
+                stringOrNull(req, "EncryptionKeyArn"), textOrNull(req, "CreatorRequestId"),
+                readStringMap(req, "BackupVaultTags"), longOrNull(req, "MinRetentionDays"),
+                longOrNull(req, "MaxRetentionDays"), region);
+
+        ObjectNode out = objectMapper.createObjectNode();
+        out.put("BackupVaultName", vault.getBackupVaultName());
+        out.put("BackupVaultArn", vault.getBackupVaultArn());
+        out.put("CreationDate", vault.getCreationDate());
+        out.put("VaultState", vault.getVaultState());
+        return Response.ok(out).build();
+    }
+
     @GET
     @Path("/backup-vaults/{backupVaultName}")
     public Response describeBackupVault(@Context HttpHeaders headers,
-                                         @PathParam("backupVaultName") String vaultName) {
+                                         @PathParam("backupVaultName") String vaultName,
+                                         @QueryParam("backupVaultAccountId") String vaultAccountId) {
         String region = regionResolver.resolveRegion(headers);
-        return Response.ok(service.describeBackupVault(vaultName, region)).build();
+        return Response.ok(service.describeBackupVault(vaultName, vaultAccountId, region)).build();
     }
 
     @DELETE
@@ -79,13 +107,15 @@ public class BackupController {
 
     @GET
     @Path("/backup-vaults/")
-    public Response listBackupVaults(@Context HttpHeaders headers) {
+    public Response listBackupVaults(@Context HttpHeaders headers,
+                                     @QueryParam("vaultType") String vaultType,
+                                     @QueryParam("shared") String shared,
+                                     @QueryParam("maxResults") String maxResults,
+                                     @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
-        List<BackupVault> vaults = service.listBackupVaults(region);
-        ObjectNode out = objectMapper.createObjectNode();
-        ArrayNode list = out.putArray("BackupVaultList");
-        vaults.forEach(list::addPOJO);
-        return Response.ok(out).build();
+        List<BackupVault> vaults = service.listBackupVaults(region, vaultType, booleanOrNull("shared", shared));
+        return page(vaults, BackupVault::getBackupVaultArn, maxResults, nextToken, "backup-vaults",
+                "BackupVaultList", (list, vault) -> list.addPOJO(vault));
     }
 
     // ── Vault access policy ────────────────────────────────────────────────────
@@ -403,27 +433,140 @@ public class BackupController {
         return Response.ok(out).build();
     }
 
+    // ── Copy job ───────────────────────────────────────────────────────────────
+
+    @PUT
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/copy-jobs")
+    public Response startCopyJob(@Context HttpHeaders headers, String body) throws IOException {
+        String region = regionResolver.resolveRegion(headers);
+        JsonNode req = objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
+        CopyJob job = service.startCopyJob(stringOrNull(req, "RecoveryPointArn"),
+                stringOrNull(req, "SourceBackupVaultName"), stringOrNull(req, "DestinationBackupVaultArn"),
+                stringOrNull(req, "IamRoleArn"), readLifecycle(req), textOrNull(req, "IdempotencyToken"), region);
+
+        ObjectNode out = objectMapper.createObjectNode();
+        out.put("CopyJobId", job.getCopyJobId());
+        out.put("CreationDate", job.getCreationDate());
+        out.put("IsParent", job.isParent());
+        return Response.ok(out).build();
+    }
+
+    @GET
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/copy-jobs/{copyJobId}")
+    public Response describeCopyJob(@PathParam("copyJobId") String copyJobId) {
+        ObjectNode out = objectMapper.createObjectNode();
+        out.putPOJO("CopyJob", service.describeCopyJob(copyJobId));
+        return Response.ok(out).build();
+    }
+
+    @GET
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/copy-jobs/")
+    public Response listCopyJobs(@QueryParam("resourceArn") String byResourceArn,
+                                 @QueryParam("state") String byState,
+                                 @QueryParam("resourceType") String byResourceType,
+                                 @QueryParam("destinationVaultArn") String byDestinationVaultArn,
+                                 @QueryParam("accountId") String byAccountId,
+                                 @QueryParam("sourceRecoveryPointArn") String bySourceRecoveryPointArn,
+                                 @QueryParam("createdBefore") String createdBefore,
+                                 @QueryParam("createdAfter") String createdAfter,
+                                 @QueryParam("maxResults") String maxResults,
+                                 @QueryParam("nextToken") String nextToken) {
+        List<CopyJob> jobs = service.listCopyJobs(byResourceArn, byState, byResourceType, byDestinationVaultArn,
+                byAccountId, bySourceRecoveryPointArn, epochSecondsOrNull("createdBefore", createdBefore),
+                epochSecondsOrNull("createdAfter", createdAfter));
+        return page(jobs, CopyJob::getCopyJobId, maxResults, nextToken, "copy-jobs",
+                "CopyJobs", (list, job) -> list.addPOJO(job));
+    }
+
     // ── Recovery Point ─────────────────────────────────────────────────────────
 
     @GET
     @Path("/backup-vaults/{backupVaultName}/recovery-points/{recoveryPointArn}")
     public Response describeRecoveryPoint(@Context HttpHeaders headers,
                                            @PathParam("backupVaultName") String vaultName,
-                                           @PathParam("recoveryPointArn") String recoveryPointArn) {
+                                           @PathParam("recoveryPointArn") String recoveryPointArn,
+                                           @QueryParam("backupVaultAccountId") String vaultAccountId) {
         String region = regionResolver.resolveRegion(headers);
-        return Response.ok(service.describeRecoveryPoint(vaultName, recoveryPointArn, region)).build();
+        return Response.ok(service.describeRecoveryPoint(vaultName, vaultAccountId, recoveryPointArn, region))
+                .build();
     }
 
     @GET
     @Path("/backup-vaults/{backupVaultName}/recovery-points/")
     public Response listRecoveryPointsByBackupVault(@Context HttpHeaders headers,
-                                                     @PathParam("backupVaultName") String vaultName) {
+                                                     @PathParam("backupVaultName") String vaultName,
+                                                     @QueryParam("backupVaultAccountId") String vaultAccountId,
+                                                     @QueryParam("resourceArn") String byResourceArn,
+                                                     @QueryParam("resourceType") String byResourceType,
+                                                     @QueryParam("backupPlanId") String byBackupPlanId,
+                                                     @QueryParam("createdBefore") String createdBefore,
+                                                     @QueryParam("createdAfter") String createdAfter,
+                                                     @QueryParam("maxResults") String maxResults,
+                                                     @QueryParam("nextToken") String nextToken) {
         String region = regionResolver.resolveRegion(headers);
-        List<RecoveryPoint> points = service.listRecoveryPointsByBackupVault(vaultName, region);
+        List<RecoveryPoint> points = service.listRecoveryPointsByBackupVault(vaultName, vaultAccountId, region,
+                byResourceArn, byResourceType, byBackupPlanId, epochSecondsOrNull("createdBefore", createdBefore),
+                epochSecondsOrNull("createdAfter", createdAfter));
+        return page(points, RecoveryPoint::getRecoveryPointArn, maxResults, nextToken, "recovery-points",
+                "RecoveryPoints", (list, point) -> list.addPOJO(point));
+    }
+
+    // ── Protected resources ────────────────────────────────────────────────────
+
+    @GET
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/resources/{resourceArn: .+}/recovery-points/")
+    public Response listRecoveryPointsByResource(@Context HttpHeaders headers,
+                                                 @PathParam("resourceArn") String resourceArn,
+                                                 @QueryParam("maxResults") String maxResults,
+                                                 @QueryParam("nextToken") String nextToken) {
+        String region = regionResolver.resolveRegion(headers);
+        List<RecoveryPoint> points = service.listRecoveryPointsByResource(resourceArn, region);
+        return page(points, RecoveryPoint::getRecoveryPointArn, maxResults, nextToken, "recovery-points",
+                "RecoveryPoints", (list, point) -> {
+                    ObjectNode node = list.addObject();
+                    node.put("RecoveryPointArn", point.getRecoveryPointArn());
+                    node.put("CreationDate", point.getCreationDate());
+                    node.put("Status", point.getStatus());
+                    putIfNotNull(node, "StatusMessage", point.getStatusMessage());
+                    putIfNotNull(node, "EncryptionKeyArn", point.getEncryptionKeyArn());
+                    if (point.getBackupSizeInBytes() != null) {
+                        node.put("BackupSizeBytes", point.getBackupSizeInBytes());
+                    }
+                    node.put("BackupVaultName", point.getBackupVaultName());
+                    node.put("IsParent", false);
+                    putIfNotNull(node, "ResourceName", point.getResourceName());
+                    putIfNotNull(node, "VaultType", point.getVaultType());
+                    putIfNotNull(node, "EncryptionKeyType", point.getEncryptionKeyType());
+                });
+    }
+
+    @GET
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/resources/")
+    public Response listProtectedResources(@Context HttpHeaders headers,
+                                           @QueryParam("maxResults") String maxResults,
+                                           @QueryParam("nextToken") String nextToken) {
+        String region = regionResolver.resolveRegion(headers);
+        return page(service.listProtectedResources(region), RecoveryPoint::getResourceArn, maxResults, nextToken,
+                "resources", "Results", (list, point) -> writeProtectedResource(list.addObject(), point));
+    }
+
+    @GET
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/resources/{resourceArn: .+}")
+    public Response describeProtectedResource(@Context HttpHeaders headers,
+                                              @PathParam("resourceArn") String resourceArn) {
+        String region = regionResolver.resolveRegion(headers);
         ObjectNode out = objectMapper.createObjectNode();
-        ArrayNode list = out.putArray("RecoveryPoints");
-        points.forEach(list::addPOJO);
+        writeProtectedResource(out, service.describeProtectedResource(resourceArn, region));
         return Response.ok(out).build();
+    }
+
+    private static void writeProtectedResource(ObjectNode node, RecoveryPoint latest) {
+        node.put("ResourceArn", latest.getResourceArn());
+        putIfNotNull(node, "ResourceType", latest.getResourceType());
+        node.put("LastBackupTime", latest.getCreationDate());
+        putIfNotNull(node, "ResourceName", latest.getResourceName());
+        node.put("LastBackupVaultArn", latest.getBackupVaultArn());
+        node.put("LastRecoveryPointArn", latest.getRecoveryPointArn());
     }
 
     @DELETE
@@ -460,6 +603,63 @@ public class BackupController {
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private <T> Response page(List<T> items, Function<T, String> cursorOf, String maxResults, String nextToken,
+                              String namespace, String listName,
+                              BiConsumer<ArrayNode, T> writer) {
+        Integer limit = Pagination.parseMaxResults(maxResults, "InvalidParameterValueException");
+        if (limit != null && (limit < 1 || limit > MAX_RESULTS)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "MaxResults must be between 1 and " + MAX_RESULTS, 400);
+        }
+        PaginatedResult<T> result = Pagination.paginate(items, cursorOf, limit == null ? MAX_RESULTS : limit,
+                nextToken, namespace, token -> new AwsException("InvalidParameterValueException",
+                        "Invalid NextToken: " + token, 400));
+        ObjectNode out = objectMapper.createObjectNode();
+        ArrayNode list = out.putArray(listName);
+        result.items().forEach(item -> writer.accept(list, item));
+        if (result.nextToken() != null) {
+            out.put("NextToken", result.nextToken());
+        }
+        return Response.ok(out).build();
+    }
+
+    private static void putIfNotNull(ObjectNode node, String field, String value) {
+        if (value != null) {
+            node.put(field, value);
+        }
+    }
+
+    private static Boolean booleanOrNull(String field, String value) {
+        if (value == null || value.isEmpty()) {
+            return null;
+        }
+        if (!"true".equalsIgnoreCase(value) && !"false".equalsIgnoreCase(value)) {
+            throw new AwsException("InvalidParameterValueException", field + " must be true or false", 400);
+        }
+        return Boolean.parseBoolean(value);
+    }
+
+    /** Query-string timestamps arrive as ISO 8601 from the SDKs; epoch seconds are accepted too. */
+    private static Long epochSecondsOrNull(String field, String value) {
+        if (value == null || value.isEmpty()) {
+            return null;
+        }
+        try {
+            return Instant.parse(value).getEpochSecond();
+        } catch (DateTimeParseException e) {
+            try {
+                return (long) Double.parseDouble(value);
+            } catch (NumberFormatException ignored) {
+                throw new AwsException("InvalidParameterValueException", field + " is not a valid timestamp", 400);
+            }
+        }
+    }
+
+    private Lifecycle readLifecycle(JsonNode req) throws IOException {
+        JsonNode node = req.path("Lifecycle");
+        return node.isMissingNode() || node.isNull() ? null : objectMapper.treeToValue(node, Lifecycle.class);
+    }
 
     // Absent and null both mean "not supplied", which for these members is meaningful:
     // omitting ChangeableForDays is what selects compliance mode.

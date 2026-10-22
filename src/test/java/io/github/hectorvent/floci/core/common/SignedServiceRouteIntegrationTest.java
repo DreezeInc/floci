@@ -24,7 +24,8 @@ class SignedServiceRouteIntegrationTest {
             + "/20260215/us-east-1/s3/aws4_request";
 
     @ParameterizedTest
-    @ValueSource(strings = {"/_guardduty/malware-protection-plan", "/_dlm/policies", "/_re2/CreateIndex"})
+    @ValueSource(strings = {"/_guardduty/malware-protection-plan", "/_dlm/policies", "/_re2/CreateIndex",
+            "/_backup/copy-jobs/"})
     void aRequestStraightToAnInternalPrefixIsRefusedAsAnInvalidBucket(String path) {
         given().header("Authorization", S3_AUTH)
                 .when().get(path)

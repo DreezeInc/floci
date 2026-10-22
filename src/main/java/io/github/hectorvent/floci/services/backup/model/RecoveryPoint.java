@@ -19,11 +19,20 @@ public class RecoveryPoint {
     @JsonProperty("BackupVaultArn")
     private String backupVaultArn;
 
+    @JsonProperty("SourceBackupVaultArn")
+    private String sourceBackupVaultArn;
+
+    @JsonProperty("VaultType")
+    private String vaultType;
+
     @JsonProperty("ResourceArn")
     private String resourceArn;
 
     @JsonProperty("ResourceType")
     private String resourceType;
+
+    @JsonProperty("ResourceName")
+    private String resourceName;
 
     @JsonProperty("IamRoleArn")
     private String iamRoleArn;
@@ -45,6 +54,12 @@ public class RecoveryPoint {
 
     @JsonProperty("Lifecycle")
     private Lifecycle lifecycle;
+
+    @JsonProperty("CalculatedLifecycle")
+    private CalculatedLifecycle calculatedLifecycle;
+
+    @JsonProperty("EncryptionKeyType")
+    private String encryptionKeyType;
 
     @JsonProperty("EncryptionKeyArn")
     private String encryptionKeyArn;
@@ -68,6 +83,21 @@ public class RecoveryPoint {
 
     public String getBackupVaultArn() { return backupVaultArn; }
     public void setBackupVaultArn(String backupVaultArn) { this.backupVaultArn = backupVaultArn; }
+
+    public String getSourceBackupVaultArn() { return sourceBackupVaultArn; }
+    public void setSourceBackupVaultArn(String sourceBackupVaultArn) { this.sourceBackupVaultArn = sourceBackupVaultArn; }
+
+    public String getVaultType() { return vaultType; }
+    public void setVaultType(String vaultType) { this.vaultType = vaultType; }
+
+    public String getResourceName() { return resourceName; }
+    public void setResourceName(String resourceName) { this.resourceName = resourceName; }
+
+    public CalculatedLifecycle getCalculatedLifecycle() { return calculatedLifecycle; }
+    public void setCalculatedLifecycle(CalculatedLifecycle calculatedLifecycle) { this.calculatedLifecycle = calculatedLifecycle; }
+
+    public String getEncryptionKeyType() { return encryptionKeyType; }
+    public void setEncryptionKeyType(String encryptionKeyType) { this.encryptionKeyType = encryptionKeyType; }
 
     public String getResourceArn() { return resourceArn; }
     public void setResourceArn(String resourceArn) { this.resourceArn = resourceArn; }

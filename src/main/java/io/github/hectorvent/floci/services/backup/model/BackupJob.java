@@ -61,6 +61,12 @@ public class BackupJob {
     @JsonProperty("AccountId")
     private String accountId;
 
+    @JsonProperty("RecoveryPointLifecycle")
+    private Lifecycle recoveryPointLifecycle;
+
+    @JsonProperty("ResourceName")
+    private String resourceName;
+
     public BackupJob() {}
 
     public String getBackupJobId() { return backupJobId; }
@@ -113,4 +119,10 @@ public class BackupJob {
 
     public String getAccountId() { return accountId; }
     public void setAccountId(String accountId) { this.accountId = accountId; }
+
+    public Lifecycle getRecoveryPointLifecycle() { return recoveryPointLifecycle; }
+    public void setRecoveryPointLifecycle(Lifecycle recoveryPointLifecycle) { this.recoveryPointLifecycle = recoveryPointLifecycle; }
+
+    public String getResourceName() { return resourceName; }
+    public void setResourceName(String resourceName) { this.resourceName = resourceName; }
 }

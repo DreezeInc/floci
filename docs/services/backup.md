@@ -11,9 +11,10 @@
 | Action | Method | Path | Description |
 |---|---|---|---|
 | `CreateBackupVault` | `PUT` | `/backup-vaults/{backupVaultName}` | Create a backup vault |
-| `DescribeBackupVault` | `GET` | `/backup-vaults/{backupVaultName}` | Describe a backup vault |
+| `CreateLogicallyAirGappedBackupVault` | `PUT` | `/logically-air-gapped-backup-vaults/{backupVaultName}` | Create a logically air-gapped vault with its retention window |
+| `DescribeBackupVault` | `GET` | `/backup-vaults/{backupVaultName}` | Describe a backup vault, or with `BackupVaultAccountId` a vault shared through RAM |
 | `DeleteBackupVault` | `DELETE` | `/backup-vaults/{backupVaultName}` | Delete an empty backup vault, locked or not |
-| `ListBackupVaults` | `GET` | `/backup-vaults/` | List all backup vaults |
+| `ListBackupVaults` | `GET` | `/backup-vaults/` | List vaults, filtered by `ByVaultType` and `ByShared`, paginated |
 
 ### Backup Vault Access Policy
 
@@ -71,8 +72,31 @@
 | Action | Method | Path | Description |
 |---|---|---|---|
 | `DescribeRecoveryPoint` | `GET` | `/backup-vaults/{backupVaultName}/recovery-points/{recoveryPointArn}` | Describe a recovery point |
-| `ListRecoveryPointsByBackupVault` | `GET` | `/backup-vaults/{backupVaultName}/recovery-points/` | List recovery points in a vault |
+| `ListRecoveryPointsByBackupVault` | `GET` | `/backup-vaults/{backupVaultName}/recovery-points/` | List recovery points in a vault, filtered by resource, type and creation time, paginated |
+| `ListRecoveryPointsByResource` | `GET` | `/resources/{resourceArn}/recovery-points/` | List the caller's recovery points of one resource |
 | `DeleteRecoveryPoint` | `DELETE` | `/backup-vaults/{backupVaultName}/recovery-points/{recoveryPointArn}` | Delete a recovery point |
+
+`DescribeRecoveryPoint` and `ListRecoveryPointsByBackupVault` accept `BackupVaultAccountId` to
+read a logically air-gapped vault another account shares with the caller.
+
+### Copy Jobs
+
+| Action | Method | Path | Description |
+|---|---|---|---|
+| `StartCopyJob` | `PUT` | `/copy-jobs` | Copy a recovery point into another vault, account or region |
+| `DescribeCopyJob` | `GET` | `/copy-jobs/{copyJobId}` | Get copy job status |
+| `ListCopyJobs` | `GET` | `/copy-jobs/` | List copy jobs with optional filters, paginated |
+
+### Protected Resources
+
+| Action | Method | Path | Description |
+|---|---|---|---|
+| `ListProtectedResources` | `GET` | `/resources/` | List resources the caller has recovery points of |
+| `DescribeProtectedResource` | `GET` | `/resources/{resourceArn}` | Describe the latest backup of one resource |
+
+S3 also serves `/{bucket}` paths, so `/resources`, `/copy-jobs` and
+`/logically-air-gapped-backup-vaults` answer only requests signed for `backup`; anything else
+on those paths reaches S3.
 
 ### Tagging
 
@@ -108,6 +132,29 @@ FLOCI_SERVICES_BACKUP_JOB_COMPLETION_DELAY_SECONDS=3
 ```
 
 Use a shorter delay (e.g. `1`) in test environments to speed up job-completion assertions.
+
+Copy jobs follow the same timing. When a copy job reaches `COMPLETED`, the copy exists in the
+destination vault with the lifecycle the job asked for and the source recovery point's
+`CreationDate`; `CalculatedLifecycle` is computed from that date. Problems with the destination
+vault (missing, still `CREATING`, a lifecycle outside its lock window, or another account's vault
+whose access policy does not allow `backup:CopyIntoBackupVault` to the caller) fail the job with a
+`StatusMessage` instead of failing the request.
+
+## Logically Air-Gapped Vaults
+
+- `CreateLogicallyAirGappedBackupVault` requires `MinRetentionDays` (at least 7) and
+  `MaxRetentionDays` (at most 36,500, not below the minimum). The vault is reported `CREATING`
+  in the response and `AVAILABLE` from the next second on.
+- The vault is locked from creation with that window. `PutBackupVaultLockConfiguration` and
+  `DeleteBackupVaultLockConfiguration` return `InvalidRequestException` (400) for it, and
+  recovery points in it cannot be deleted before `MinRetentionDays`.
+- Recovery points reach the vault through `StartCopyJob`. `StartBackupJob` naming it as
+  `BackupVaultName` returns `InvalidParameterValueException` (400).
+- Without `EncryptionKeyArn` the vault reports `EncryptionKeyType` `AWS_OWNED_KMS_KEY`.
+- **Sharing.** Share the vault ARN through RAM. Once the other account accepts the invitation,
+  `ListBackupVaults` with `ByShared=true` lists the vault for it, and it can read the vault and
+  its recovery points by passing `BackupVaultAccountId`. A pending invitation, a share of a
+  standard backup vault, or no share at all answers `ResourceNotFoundException`.
 
 ## Supported Resource Types
 
@@ -208,17 +255,22 @@ Actual backup is simulated — no data is read from or written to the referenced
   modelled, the delivery is not, so a Terraform configuration that attaches notifications
   applies and reads back correctly while a test asserting on a received message will fail.
 - **Access policy enforcement.** `PutBackupVaultAccessPolicy` stores a resource policy and
-  `GetBackupVaultAccessPolicy` reports it, but no authorization path consults it: a policy
-  denying a vault operation does not prevent that operation, even with IAM enforcement
-  enabled. This matches the rest of Floci rather than being specific to Backup -- S3 bucket
-  policies are the only resource policies any service enforces today. Stated here because a
-  stored-and-ignored policy is otherwise indistinguishable from an enforced one.
+  `GetBackupVaultAccessPolicy` reports it. The only check that consults it is a copy job into
+  another account's vault, which needs an `Allow` for `backup:CopyIntoBackupVault` to the
+  source account (conditions are not evaluated). Otherwise a policy denying a vault operation
+  does not prevent that operation, even with IAM enforcement enabled. This matches the rest of
+  Floci rather than being specific to Backup -- S3 bucket policies are the only resource
+  policies any service enforces today. Stated here because a stored-and-ignored policy is
+  otherwise indistinguishable from an enforced one.
 - Restore jobs (`StartRestoreJob`, `DescribeRestoreJob`, `ListRestoreJobs`)
-- Copy jobs (`StartCopyJob`, `DescribeCopyJob`, `ListCopyJobs`)
+- Backing up straight into a logically air-gapped vault with `LogicallyAirGappedBackupVaultArn`;
+  the parameter is ignored and the backup lands in `BackupVaultName`
+- Organization-level cross-account backup settings; a cross-account copy needs only the
+  destination vault policy
 - Report plans (`CreateReportPlan`, `DescribeReportPlan`, etc.)
 - Framework operations (`CreateFramework`, etc.)
 - Legal holds
-- Pagination tokens on list operations
+- Pagination tokens on `ListBackupPlans`, `ListBackupSelections` and `ListBackupJobs`
 
 ## Examples
 

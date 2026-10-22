@@ -2,15 +2,18 @@ package io.github.hectorvent.floci.services.backup;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.backup.model.*;
+import io.github.hectorvent.floci.services.ram.RamService;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -23,6 +26,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class BackupService {
@@ -34,14 +39,25 @@ public class BackupService {
             "Aurora", "DocumentDB", "Neptune", "FSx", "VirtualMachine"
     );
 
-    private final StorageBackend<String, BackupVault>     vaultStore;
-    private final StorageBackend<String, BackupPlan>      planStore;
-    private final StorageBackend<String, BackupSelection> selectionStore;
-    private final StorageBackend<String, BackupJob>       jobStore;
-    private final StorageBackend<String, RecoveryPoint>   recoveryStore;
-    private final StorageBackend<String, String>          accessPolicyStore;
-    private final StorageBackend<String, BackupVaultNotifications> notificationStore;
+    static final String STANDARD_VAULT = "BACKUP_VAULT";
+    static final String AIR_GAPPED_VAULT = "LOGICALLY_AIR_GAPPED_BACKUP_VAULT";
+    private static final Set<String> VAULT_TYPES =
+            Set.of(STANDARD_VAULT, AIR_GAPPED_VAULT, "RESTORE_ACCESS_BACKUP_VAULT");
+    private static final Set<String> COPY_JOB_STATES = Set.of("CREATED", "RUNNING", "COMPLETED", "FAILED", "PARTIAL");
+    private static final long AIR_GAPPED_MIN_RETENTION_FLOOR = 7;
+    private static final String VAULT_RESOURCE_PREFIX = "backup-vault:";
 
+    private final AccountAwareStorageBackend<BackupVault>   vaultStore;
+    private final StorageBackend<String, BackupPlan>        planStore;
+    private final StorageBackend<String, BackupSelection>   selectionStore;
+    private final StorageBackend<String, BackupJob>         jobStore;
+    private final AccountAwareStorageBackend<RecoveryPoint> recoveryStore;
+    private final AccountAwareStorageBackend<String>        accessPolicyStore;
+    private final StorageBackend<String, BackupVaultNotifications> notificationStore;
+    private final StorageBackend<String, CopyJob>           copyJobStore;
+    private final StorageBackend<String, String>            idempotencyStore;
+
+    private final RamService ramService;
     private final RegionResolver regionResolver;
     private final int jobCompletionDelaySeconds;
     private final ObjectMapper objectMapper;
@@ -63,7 +79,7 @@ public class BackupService {
 
     @Inject
     public BackupService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
-                         ObjectMapper objectMapper) {
+                         ObjectMapper objectMapper, RamService ramService) {
         this.vaultStore     = storageFactory.create("backup", "backup-vaults.json",     new TypeReference<>() {});
         this.planStore      = storageFactory.create("backup", "backup-plans.json",      new TypeReference<>() {});
         this.selectionStore = storageFactory.create("backup", "backup-selections.json", new TypeReference<>() {});
@@ -71,6 +87,9 @@ public class BackupService {
         this.recoveryStore  = storageFactory.create("backup", "backup-recovery-points.json", new TypeReference<>() {});
         this.accessPolicyStore  = storageFactory.create("backup", "backup-vault-access-policies.json", new TypeReference<>() {});
         this.notificationStore  = storageFactory.create("backup", "backup-vault-notifications.json",   new TypeReference<>() {});
+        this.copyJobStore       = storageFactory.create("backup", "backup-copy-jobs.json",             new TypeReference<>() {});
+        this.idempotencyStore   = storageFactory.create("backup", "backup-idempotency-tokens.json",    new TypeReference<>() {});
+        this.ramService = ramService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.jobCompletionDelaySeconds = config.services().backup().jobCompletionDelaySeconds();
@@ -105,7 +124,7 @@ public class BackupService {
             }
             BackupVault vault = new BackupVault();
             vault.setBackupVaultName(vaultName);
-            vault.setBackupVaultArn(regionResolver.buildArn("backup", region, "backup-vault:" + vaultName));
+            vault.setBackupVaultArn(regionResolver.buildArn("backup", region, VAULT_RESOURCE_PREFIX + vaultName));
             vault.setEncryptionKeyArn(encryptionKeyArn);
             vault.setCreationDate(Instant.now().getEpochSecond());
             vault.setCreatorRequestId(creatorRequestId);
@@ -117,9 +136,88 @@ public class BackupService {
         }
     }
 
+    public BackupVault createLogicallyAirGappedBackupVault(String vaultName, String encryptionKeyArn,
+                                                           String creatorRequestId, Map<String, String> tags,
+                                                           Long minRetentionDays, Long maxRetentionDays,
+                                                           String region) {
+        if (minRetentionDays == null) {
+            throw new AwsException("MissingParameterValueException", "MinRetentionDays is required", 400);
+        }
+        if (maxRetentionDays == null) {
+            throw new AwsException("MissingParameterValueException", "MaxRetentionDays is required", 400);
+        }
+        requireDayRange("MinRetentionDays", minRetentionDays, AIR_GAPPED_MIN_RETENTION_FLOOR, MAX_RETENTION_DAYS);
+        requireDayRange("MaxRetentionDays", maxRetentionDays, AIR_GAPPED_MIN_RETENTION_FLOOR, MAX_RETENTION_DAYS);
+        if (maxRetentionDays < minRetentionDays) {
+            throw new AwsException("InvalidParameterValueException",
+                    "MaxRetentionDays must be greater than or equal to MinRetentionDays", 400);
+        }
+        String key = vaultKey(region, vaultName);
+        synchronized (lockFor(key)) {
+            if (vaultStore.get(key).isPresent()) {
+                throw new AwsException("AlreadyExistsException", "Backup vault already exists: " + vaultName, 400);
+            }
+            BackupVault vault = new BackupVault();
+            vault.setBackupVaultName(vaultName);
+            vault.setBackupVaultArn(regionResolver.buildArn("backup", region, VAULT_RESOURCE_PREFIX + vaultName));
+            vault.setVaultType(AIR_GAPPED_VAULT);
+            vault.setVaultState("CREATING");
+            vault.setEncryptionKeyArn(encryptionKeyArn);
+            vault.setEncryptionKeyType(encryptionKeyArn == null ? "AWS_OWNED_KMS_KEY" : "CUSTOMER_MANAGED_KMS_KEY");
+            vault.setCreationDate(Instant.now().getEpochSecond());
+            vault.setCreatorRequestId(creatorRequestId);
+            vault.setNumberOfRecoveryPoints(0);
+            vault.setTags(tags);
+            vault.setLocked(true);
+            vault.setMinRetentionDays(minRetentionDays);
+            vault.setMaxRetentionDays(maxRetentionDays);
+            vaultStore.put(key, vault);
+            LOG.infov("Created logically air-gapped backup vault {0} in {1}", vaultName, region);
+            return vault;
+        }
+    }
+
     public BackupVault describeBackupVault(String vaultName, String region) {
+        String accountId = regionResolver.getAccountId();
         return vaultStore.get(vaultKey(region, vaultName))
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Backup vault not found: " + vaultName, 404));
+                .map(vault -> settle(accountId, vault))
+                .orElseThrow(() -> vaultNotFound(vaultName));
+    }
+
+    /** DescribeBackupVault with {@code BackupVaultAccountId}: another account's vault, if RAM shares it. */
+    public BackupVault describeBackupVault(String vaultName, String vaultAccountId, String region) {
+        return resolveVault(vaultName, vaultAccountId, region).vault();
+    }
+
+    private record VaultRef(String accountId, BackupVault vault) {}
+
+    private VaultRef resolveVault(String vaultName, String vaultAccountId, String region) {
+        String caller = regionResolver.getAccountId();
+        if (vaultAccountId == null || vaultAccountId.isEmpty() || vaultAccountId.equals(caller)) {
+            return new VaultRef(caller, describeBackupVault(vaultName, region));
+        }
+        BackupVault vault = vaultStore.getForAccount(vaultAccountId, vaultKey(region, vaultName))
+                .filter(v -> isSharedWith(v, caller))
+                .orElseThrow(() -> vaultNotFound(vaultName));
+        return new VaultRef(vaultAccountId, settle(vaultAccountId, vault));
+    }
+
+    private boolean isSharedWith(BackupVault vault, String callerAccountId) {
+        return AIR_GAPPED_VAULT.equals(vault.getVaultType())
+                && ramService.isResourceSharedWith(vault.getBackupVaultArn(), callerAccountId);
+    }
+
+    private BackupVault settle(String accountId, BackupVault vault) {
+        if ("CREATING".equals(vault.getVaultState())
+                && Instant.now().getEpochSecond() > vault.getCreationDate()) {
+            vault.setVaultState("AVAILABLE");
+            vaultStore.putForAccount(accountId, vaultKey(vault), vault);
+        }
+        return vault;
+    }
+
+    private static AwsException vaultNotFound(String vaultName) {
+        return new AwsException("ResourceNotFoundException", "Backup vault not found: " + vaultName, 404);
     }
 
     public void deleteBackupVault(String vaultName, String region) {
@@ -158,9 +256,40 @@ public class BackupService {
         vaultStore.delete(vaultKey(region, vaultName));
     }
 
-    public List<BackupVault> listBackupVaults(String region) {
-        String prefix = region + ":";
-        return vaultStore.scan(k -> k.startsWith(prefix));
+    /** {@code shared=true} lists the air-gapped vaults other accounts share with the caller through RAM. */
+    public List<BackupVault> listBackupVaults(String region, String vaultType, Boolean shared) {
+        if (vaultType != null && !VAULT_TYPES.contains(vaultType)) {
+            throw new AwsException("InvalidParameterValueException", "Invalid vault type: " + vaultType, 400);
+        }
+        String caller = regionResolver.getAccountId();
+        List<BackupVault> vaults;
+        if (Boolean.TRUE.equals(shared)) {
+            vaults = sharedVaults(caller, region);
+        } else {
+            String prefix = region + ":";
+            vaults = vaultStore.scan(k -> k.startsWith(prefix)).stream()
+                    .map(vault -> settle(caller, vault))
+                    .toList();
+        }
+        return vaults.stream()
+                .filter(vault -> vaultType == null || vaultType.equals(vault.getVaultType()))
+                .toList();
+    }
+
+    private List<BackupVault> sharedVaults(String caller, String region) {
+        List<BackupVault> vaults = new ArrayList<>();
+        for (String arn : ramService.resourceArnsSharedWith(caller, region)) {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            if (!"backup".equals(parsed.service()) || !parsed.resource().startsWith(VAULT_RESOURCE_PREFIX)) {
+                continue;
+            }
+            String name = parsed.resource().substring(VAULT_RESOURCE_PREFIX.length());
+            vaultStore.getForAccount(parsed.accountId(), vaultKey(region, name))
+                    .filter(vault -> arn.equals(vault.getBackupVaultArn()) && isSharedWith(vault, caller))
+                    .map(vault -> settle(parsed.accountId(), vault))
+                    .ifPresent(vaults::add);
+        }
+        return vaults;
     }
 
     // ── Vault sub-resources: access policy, notifications, lock ────────────────
@@ -347,6 +476,7 @@ public class BackupService {
                                                        Long maxRetentionDays,
                                                        Long changeableForDays) {
         BackupVault vault = describeBackupVault(vaultName, region);
+        requireStandardVault(vault, "its vault lock cannot be changed");
         if (vault.isLocked() && !lockIsStillChangeable(vault)) {
             throw new AwsException("InvalidRequestException",
                     "Backup vault lock is immutable and cannot be changed: " + vaultName, 400);
@@ -406,6 +536,7 @@ public class BackupService {
 
     public void deleteBackupVaultLockConfiguration(String vaultName, String region) {
         BackupVault vault = describeBackupVault(vaultName, region);
+        requireStandardVault(vault, "its vault lock cannot be deleted");
         if (vault.isLocked() && !lockIsStillChangeable(vault)) {
             throw new AwsException("InvalidRequestException",
                     "Backup vault lock is immutable and cannot be deleted: " + vaultName, 400);
@@ -470,6 +601,13 @@ public class BackupService {
             throw new AwsException("InvalidParameterValueException",
                     "Lifecycle DeleteAfterDays of " + deleteAfter + " exceeds the vault lock's "
                             + "maximum retention of " + max + " day(s)", 400);
+        }
+    }
+
+    private static void requireStandardVault(BackupVault vault, String consequence) {
+        if (AIR_GAPPED_VAULT.equals(vault.getVaultType())) {
+            throw new AwsException("InvalidRequestException", "Backup vault " + vault.getBackupVaultName()
+                    + " is logically air-gapped, so " + consequence, 400);
         }
     }
 
@@ -581,6 +719,10 @@ public class BackupService {
     public BackupJob startBackupJob(String vaultName, String resourceArn, String iamRoleArn,
                                      Lifecycle lifecycle, String region) {
         BackupVault vault = describeBackupVault(vaultName, region);
+        if (AIR_GAPPED_VAULT.equals(vault.getVaultType())) {
+            throw new AwsException("InvalidParameterValueException", "Backup vault " + vaultName
+                    + " is logically air-gapped: back up to a backup vault and copy the recovery point into it", 400);
+        }
         requireLifecycleWithinLock(vault, lifecycle);
 
         String jobId = UUID.randomUUID().toString();
@@ -592,6 +734,8 @@ public class BackupService {
         job.setBackupVaultArn(vault.getBackupVaultArn());
         job.setResourceArn(resourceArn);
         job.setResourceType(inferResourceType(resourceArn));
+        job.setResourceName(inferResourceName(resourceArn));
+        job.setRecoveryPointLifecycle(lifecycle);
         job.setIamRoleArn(iamRoleArn);
         job.setState("CREATED");
         job.setPercentDone("0.0");
@@ -644,17 +788,62 @@ public class BackupService {
     // ── Recovery Point ─────────────────────────────────────────────────────────
 
     public RecoveryPoint describeRecoveryPoint(String vaultName, String recoveryPointArn, String region) {
-        describeBackupVault(vaultName, region);
-        return recoveryStore.get(recoveryPointArn)
-                .filter(rp -> vaultName.equals(rp.getBackupVaultName()))
+        return describeRecoveryPoint(vaultName, null, recoveryPointArn, region);
+    }
+
+    public RecoveryPoint describeRecoveryPoint(String vaultName, String vaultAccountId,
+                                               String recoveryPointArn, String region) {
+        VaultRef ref = resolveVault(vaultName, vaultAccountId, region);
+        return recoveryStore.getForAccount(ref.accountId(), recoveryPointArn)
+                .filter(rp -> ref.vault().getBackupVaultArn().equals(rp.getBackupVaultArn()))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Recovery point not found: " + recoveryPointArn, 404));
     }
 
-    public List<RecoveryPoint> listRecoveryPointsByBackupVault(String vaultName, String region) {
-        describeBackupVault(vaultName, region);
+    public List<RecoveryPoint> listRecoveryPointsByBackupVault(String vaultName, String vaultAccountId,
+                                                               String region, String byResourceArn,
+                                                               String byResourceType, String byBackupPlanId,
+                                                               Long createdBefore, Long createdAfter) {
+        VaultRef ref = resolveVault(vaultName, vaultAccountId, region);
+        String vaultArn = ref.vault().getBackupVaultArn();
+        return recoveryStore.scanForAccount(ref.accountId(), k -> true).stream()
+                .filter(rp -> vaultArn.equals(rp.getBackupVaultArn()))
+                .filter(rp -> byResourceArn == null || byResourceArn.equals(rp.getResourceArn()))
+                .filter(rp -> byResourceType == null || byResourceType.equals(rp.getResourceType()))
+                // No recovery point here is created by a backup plan, so a plan filter matches none.
+                .filter(rp -> byBackupPlanId == null)
+                .filter(rp -> createdBefore == null || rp.getCreationDate() < createdBefore)
+                .filter(rp -> createdAfter == null || rp.getCreationDate() > createdAfter)
+                .toList();
+    }
+
+    public List<RecoveryPoint> listRecoveryPointsByResource(String resourceArn, String region) {
+        return recoveryPointsInRegion(region).stream()
+                .filter(rp -> resourceArn.equals(rp.getResourceArn()))
+                .toList();
+    }
+
+    public List<RecoveryPoint> listProtectedResources(String region) {
+        Map<String, RecoveryPoint> latest = new HashMap<>();
+        for (RecoveryPoint rp : recoveryPointsInRegion(region)) {
+            if (rp.getResourceArn() != null) {
+                latest.merge(rp.getResourceArn(), rp,
+                        (a, b) -> b.getCreationDate() > a.getCreationDate() ? b : a);
+            }
+        }
+        return List.copyOf(latest.values());
+    }
+
+    public RecoveryPoint describeProtectedResource(String resourceArn, String region) {
+        return listRecoveryPointsByResource(resourceArn, region).stream()
+                .max(Comparator.comparingLong(RecoveryPoint::getCreationDate))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "No recovery point found for resource: " + resourceArn, 404));
+    }
+
+    private List<RecoveryPoint> recoveryPointsInRegion(String region) {
         return recoveryStore.scan(k -> true).stream()
-                .filter(rp -> vaultName.equals(rp.getBackupVaultName()))
+                .filter(rp -> region.equals(AwsArnUtils.parse(rp.getRecoveryPointArn()).region()))
                 .toList();
     }
 
@@ -691,6 +880,236 @@ public class BackupService {
         }
         recoveryStore.delete(recoveryPointArn);
         decrementVaultCount(vaultName, region);
+    }
+
+    // ── Copy job ───────────────────────────────────────────────────────────────
+
+    /** Destination problems fail the job, not the request: the caller may not see that vault. */
+    public CopyJob startCopyJob(String recoveryPointArn, String sourceVaultName, String destinationVaultArn,
+                                String iamRoleArn, Lifecycle lifecycle, String idempotencyToken, String region) {
+        requireParameter("RecoveryPointArn", recoveryPointArn);
+        requireParameter("SourceBackupVaultName", sourceVaultName);
+        requireParameter("DestinationBackupVaultArn", destinationVaultArn);
+        requireParameter("IamRoleArn", iamRoleArn);
+        parseVaultArn(destinationVaultArn);
+        String tokenKey = idempotencyToken == null ? null : "copy:" + idempotencyToken;
+        if (tokenKey != null) {
+            Optional<CopyJob> existing = idempotencyStore.get(tokenKey).flatMap(copyJobStore::get);
+            if (existing.isPresent()) {
+                return existing.get();
+            }
+        }
+        BackupVault source = describeBackupVault(sourceVaultName, region);
+        RecoveryPoint rp = recoveryStore.get(recoveryPointArn)
+                .filter(p -> source.getBackupVaultArn().equals(p.getBackupVaultArn()))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Recovery point not found: " + recoveryPointArn, 404));
+        if (!"COMPLETED".equals(rp.getStatus())) {
+            throw new AwsException("InvalidRequestException",
+                    "Recovery point " + recoveryPointArn + " is " + rp.getStatus() + ", not COMPLETED", 400);
+        }
+
+        String accountId = regionResolver.getAccountId();
+        CopyJob job = new CopyJob();
+        job.setCopyJobId(UUID.randomUUID().toString());
+        job.setAccountId(accountId);
+        job.setSourceBackupVaultArn(source.getBackupVaultArn());
+        job.setSourceRecoveryPointArn(recoveryPointArn);
+        job.setDestinationBackupVaultArn(destinationVaultArn);
+        job.setDestinationRecoveryPointLifecycle(lifecycle);
+        job.setResourceArn(rp.getResourceArn());
+        job.setResourceType(rp.getResourceType());
+        job.setResourceName(rp.getResourceName());
+        job.setBackupSizeInBytes(rp.getBackupSizeInBytes());
+        job.setIamRoleArn(iamRoleArn);
+        job.setCreationDate(Instant.now().getEpochSecond());
+        job.setState("CREATED");
+        String jobId = job.getCopyJobId();
+        copyJobStore.put(jobId, job);
+        if (tokenKey != null) {
+            idempotencyStore.put(tokenKey, jobId);
+        }
+
+        scheduler.schedule(() -> RequestScopes.runAs(accountId, () -> {
+            copyJobStore.get(jobId).filter(j -> "CREATED".equals(j.getState())).ifPresent(j -> {
+                j.setState("RUNNING");
+                copyJobStore.put(jobId, j);
+            });
+        }), 1, TimeUnit.SECONDS);
+        scheduler.schedule(() -> RequestScopes.runAs(accountId, () -> completeCopyJob(jobId)),
+                jobCompletionDelaySeconds, TimeUnit.SECONDS);
+        return job;
+    }
+
+    public CopyJob describeCopyJob(String copyJobId) {
+        return copyJobStore.get(copyJobId)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Copy job not found: " + copyJobId, 404));
+    }
+
+    public List<CopyJob> listCopyJobs(String byResourceArn, String byState, String byResourceType,
+                                      String byDestinationVaultArn, String byAccountId,
+                                      String bySourceRecoveryPointArn, Long createdBefore, Long createdAfter) {
+        if (byState != null && !COPY_JOB_STATES.contains(byState)) {
+            throw new AwsException("InvalidParameterValueException", "Invalid copy job state: " + byState, 400);
+        }
+        return copyJobStore.scan(k -> true).stream()
+                .filter(j -> byResourceArn == null || byResourceArn.equals(j.getResourceArn()))
+                .filter(j -> byState == null || byState.equals(j.getState()))
+                .filter(j -> byResourceType == null || byResourceType.equals(j.getResourceType()))
+                .filter(j -> byDestinationVaultArn == null || byDestinationVaultArn.equals(j.getDestinationBackupVaultArn()))
+                .filter(j -> byAccountId == null || byAccountId.equals(j.getAccountId()))
+                .filter(j -> bySourceRecoveryPointArn == null || bySourceRecoveryPointArn.equals(j.getSourceRecoveryPointArn()))
+                .filter(j -> createdBefore == null || j.getCreationDate() < createdBefore)
+                .filter(j -> createdAfter == null || j.getCreationDate() > createdAfter)
+                .toList();
+    }
+
+    private void completeCopyJob(String jobId) {
+        copyJobStore.get(jobId).filter(j -> "RUNNING".equals(j.getState())).ifPresent(job -> {
+            try {
+                copyRecoveryPoint(job);
+                job.setState("COMPLETED");
+            } catch (AwsException e) {
+                job.setState("FAILED");
+                job.setStatusMessage(e.getMessage());
+            }
+            job.setCompletionDate(Instant.now().getEpochSecond());
+            copyJobStore.put(jobId, job);
+            LOG.infov("Copy job {0} {1}", jobId, job.getState());
+        });
+    }
+
+    private void copyRecoveryPoint(CopyJob job) {
+        RecoveryPoint source = recoveryStore.get(job.getSourceRecoveryPointArn())
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Source recovery point no longer exists: " + job.getSourceRecoveryPointArn(), 404));
+        AwsArnUtils.Arn dest = parseVaultArn(job.getDestinationBackupVaultArn());
+        String destName = dest.resource().substring(VAULT_RESOURCE_PREFIX.length());
+        BackupVault destVault = vaultStore.getForAccount(dest.accountId(), vaultKey(dest.region(), destName))
+                .map(vault -> settle(dest.accountId(), vault))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Destination backup vault not found: " + job.getDestinationBackupVaultArn(), 404));
+        job.setDestinationVaultType(destVault.getVaultType());
+        job.setDestinationEncryptionKeyArn(destVault.getEncryptionKeyArn());
+        if ("CREATING".equals(destVault.getVaultState())) {
+            throw new AwsException("InvalidRequestException", "Destination backup vault is still being created", 400);
+        }
+        if (!dest.accountId().equals(job.getAccountId())) {
+            requireCopyIntoVaultAllowed(dest, destVault, job.getAccountId());
+        }
+        Lifecycle lifecycle = job.getDestinationRecoveryPointLifecycle();
+        requireLifecycleWithinLock(destVault, lifecycle);
+
+        String rpArn = regionResolver.buildArn("backup", dest.region(), dest.accountId(),
+                "recovery-point:" + UUID.randomUUID());
+        RecoveryPoint copy = new RecoveryPoint();
+        copy.setRecoveryPointArn(rpArn);
+        copy.setBackupVaultName(destName);
+        copy.setBackupVaultArn(destVault.getBackupVaultArn());
+        copy.setSourceBackupVaultArn(job.getSourceBackupVaultArn());
+        copy.setVaultType(destVault.getVaultType());
+        copy.setResourceArn(source.getResourceArn());
+        copy.setResourceType(source.getResourceType());
+        copy.setResourceName(source.getResourceName());
+        copy.setIamRoleArn(job.getIamRoleArn());
+        copy.setStatus("COMPLETED");
+        copy.setCreationDate(source.getCreationDate());
+        copy.setCompletionDate(Instant.now().getEpochSecond());
+        copy.setBackupSizeInBytes(source.getBackupSizeInBytes());
+        copy.setLifecycle(lifecycle);
+        copy.setCalculatedLifecycle(calculatedLifecycle(source.getCreationDate(), lifecycle));
+        copy.setStorageClass("WARM");
+        copy.setEncryptionKeyArn(destVault.getEncryptionKeyArn());
+        copy.setEncryptionKeyType(destVault.getEncryptionKeyType());
+        copy.setEncrypted(AIR_GAPPED_VAULT.equals(destVault.getVaultType()) || destVault.getEncryptionKeyArn() != null);
+        recoveryStore.putForAccount(dest.accountId(), rpArn, copy);
+        adjustVaultCount(dest.accountId(), dest.region(), destName, 1);
+        job.setDestinationRecoveryPointArn(rpArn);
+    }
+
+    /** Policy conditions are not evaluated. */
+    private void requireCopyIntoVaultAllowed(AwsArnUtils.Arn dest, BackupVault destVault, String sourceAccountId) {
+        String policy = accessPolicyStore.getForAccount(dest.accountId(), subResourceKey(dest.region(), destVault))
+                .orElse(null);
+        if (policy == null || !policyAllows(policy, "backup:CopyIntoBackupVault", sourceAccountId)) {
+            throw new AwsException("AccessDeniedException", "The access policy of backup vault "
+                    + destVault.getBackupVaultArn() + " does not allow backup:CopyIntoBackupVault from account "
+                    + sourceAccountId, 403);
+        }
+    }
+
+    private boolean policyAllows(String policy, String action, String accountId) {
+        JsonNode statements;
+        try {
+            statements = objectMapper.readTree(policy).path("Statement");
+        } catch (JsonProcessingException e) {
+            return false;
+        }
+        boolean allowed = false;
+        for (JsonNode statement : statements.isArray() ? statements : List.of(statements)) {
+            if (!matchesAny(statement.path("Action"), value -> actionMatches(value, action))
+                    || !principalMatches(statement.path("Principal"), accountId)) {
+                continue;
+            }
+            if ("Deny".equals(statement.path("Effect").asText())) {
+                return false;
+            }
+            allowed |= "Allow".equals(statement.path("Effect").asText());
+        }
+        return allowed;
+    }
+
+    private static boolean actionMatches(String pattern, String action) {
+        String regex = Pattern.quote(pattern.toLowerCase(Locale.ROOT)).replace("*", "\\E.*\\Q");
+        return action.toLowerCase(Locale.ROOT).matches(regex);
+    }
+
+    private static boolean principalMatches(JsonNode principal, String accountId) {
+        if (principal.isTextual()) {
+            return "*".equals(principal.asText());
+        }
+        return matchesAny(principal.path("AWS"), value -> "*".equals(value) || accountId.equals(value)
+                || (AwsArnUtils.isArnFor(value, "iam") && accountId.equals(AwsArnUtils.parse(value).accountId())));
+    }
+
+    private static boolean matchesAny(JsonNode node, Predicate<String> test) {
+        if (node.isTextual()) {
+            return test.test(node.asText());
+        }
+        for (JsonNode element : node) {
+            if (element.isTextual() && test.test(element.asText())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static AwsArnUtils.Arn parseVaultArn(String vaultArn) {
+        String resource = AwsArnUtils.resourceIfArnFor(vaultArn, "backup").orElse("");
+        if (!resource.startsWith(VAULT_RESOURCE_PREFIX) || resource.length() == VAULT_RESOURCE_PREFIX.length()) {
+            throw new AwsException("InvalidParameterValueException", "Invalid backup vault ARN: " + vaultArn, 400);
+        }
+        return AwsArnUtils.parse(vaultArn);
+    }
+
+    private static void requireParameter(String name, String value) {
+        if (value == null || value.isEmpty()) {
+            throw new AwsException("MissingParameterValueException", name + " is required", 400);
+        }
+    }
+
+    static CalculatedLifecycle calculatedLifecycle(long creationDate, Lifecycle lifecycle) {
+        if (lifecycle == null
+                || (lifecycle.getDeleteAfterDays() == null && lifecycle.getMoveToColdStorageAfterDays() == null)) {
+            return null;
+        }
+        return new CalculatedLifecycle(
+                plusDays(creationDate, lifecycle.getMoveToColdStorageAfterDays()),
+                plusDays(creationDate, lifecycle.getDeleteAfterDays()));
+    }
+
+    private static Long plusDays(long epochSecond, Long days) {
+        return days == null ? null : Instant.ofEpochSecond(epochSecond).plus(days, ChronoUnit.DAYS).getEpochSecond();
     }
 
     // ── Tags ───────────────────────────────────────────────────────────────────
@@ -746,11 +1165,15 @@ public class BackupService {
                 rp.setBackupVaultArn(job.getBackupVaultArn());
                 rp.setResourceArn(job.getResourceArn());
                 rp.setResourceType(job.getResourceType());
+                rp.setResourceName(job.getResourceName());
+                rp.setVaultType(STANDARD_VAULT);
                 rp.setIamRoleArn(job.getIamRoleArn());
                 rp.setStatus("COMPLETED");
                 rp.setCreationDate(job.getCreationDate());
                 rp.setCompletionDate(now);
                 rp.setBackupSizeInBytes(0L);
+                rp.setLifecycle(job.getRecoveryPointLifecycle());
+                rp.setCalculatedLifecycle(calculatedLifecycle(job.getCreationDate(), job.getRecoveryPointLifecycle()));
                 rp.setStorageClass("WARM");
                 rp.setEncrypted(false);
                 recoveryStore.put(rpArn, rp);
@@ -772,17 +1195,21 @@ public class BackupService {
     }
 
     private void incrementVaultCount(String vaultName, String region) {
-        vaultStore.get(vaultKey(region, vaultName)).ifPresent(vault -> {
-            vault.setNumberOfRecoveryPoints(vault.getNumberOfRecoveryPoints() + 1);
-            vaultStore.put(vaultKey(region, vaultName), vault);
-        });
+        adjustVaultCount(regionResolver.getAccountId(), region, vaultName, 1);
     }
 
     private void decrementVaultCount(String vaultName, String region) {
-        vaultStore.get(vaultKey(region, vaultName)).ifPresent(vault -> {
-            vault.setNumberOfRecoveryPoints(Math.max(0, vault.getNumberOfRecoveryPoints() - 1));
-            vaultStore.put(vaultKey(region, vaultName), vault);
-        });
+        adjustVaultCount(regionResolver.getAccountId(), region, vaultName, -1);
+    }
+
+    private void adjustVaultCount(String accountId, String region, String vaultName, int delta) {
+        String key = vaultKey(region, vaultName);
+        synchronized (lockFor(key)) {
+            vaultStore.getForAccount(accountId, key).ifPresent(vault -> {
+                vault.setNumberOfRecoveryPoints(Math.max(0, vault.getNumberOfRecoveryPoints() + delta));
+                vaultStore.putForAccount(accountId, key, vault);
+            });
+        }
     }
 
     private Map<String, String> findTagsByArn(String arn) {
@@ -858,6 +1285,12 @@ public class BackupService {
             return "EFS";
         }
         return null;
+    }
+
+    private static String inferResourceName(String resourceArn) {
+        return AwsArnUtils.resourceIfArnFor(resourceArn, "s3")
+                .filter(bucket -> !bucket.isEmpty() && bucket.indexOf('/') < 0)
+                .orElse(null);
     }
 
     private static String vaultKey(String region, String vaultName) {
