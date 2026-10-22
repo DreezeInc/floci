@@ -3,15 +3,20 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eks.EksAccessEntryService;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.eks.model.AccessEntry;
+import io.github.hectorvent.floci.services.eks.model.AccessScope;
+import io.github.hectorvent.floci.services.eks.model.AssociateAccessPolicyRequest;
+import io.github.hectorvent.floci.services.eks.model.AssociatedAccessPolicy;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.CreateAccessEntryRequest;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -26,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -34,12 +40,15 @@ import static org.mockito.Mockito.when;
 /**
  * {@code AWS::EKS::AccessEntry} in isolation: the {@code principal|cluster} Ref, the AccessEntryArn
  * attribute, the request mapping (an absent KubernetesGroups stays null so EC2_LINUX entries pass),
- * AccessPolicies being tolerated, and the update and delete paths.
+ * AccessPolicies associated on create and reconciled on update, and the update and delete paths.
  */
 class EksAccessEntryCfnProvisionerTest {
 
     private static final String PRINCIPAL = "arn:aws:iam::000000000000:role/ops";
     private static final String ARN = "arn:aws:eks:us-east-1:000000000000:access-entry/prod/role/000000000000/ops/uuid";
+    private static final String VIEW = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy";
+    private static final String EDIT = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy";
+    private static final String ADMIN = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy";
 
     private final EksService eks = mock(EksService.class);
     private final EksAccessEntryService entries = mock(EksAccessEntryService.class);
@@ -71,6 +80,92 @@ class EksAccessEntryCfnProvisionerTest {
         assertEquals("ops-user", request.getValue().username());
         assertEquals(List.of("viewers"), request.getValue().kubernetesGroups());
         assertEquals(Map.of("Name", "prod-ops"), request.getValue().tags());
+        InOrder order = inOrder(entries);
+        order.verify(entries).create(eq(cluster), any(CreateAccessEntryRequest.class));
+        order.verify(entries).associatePolicy(cluster, PRINCIPAL,
+                new AssociateAccessPolicyRequest(VIEW, new AccessScope("cluster", List.of())));
+        assertNull(r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+    }
+
+    @Test
+    void namespaceScopedPoliciesCarryTheirNamespacesAndALaterDuplicateWins() throws Exception {
+        when(eks.describeCluster("prod")).thenReturn(cluster);
+        when(entries.create(eq(cluster), any(CreateAccessEntryRequest.class))).thenReturn(entry());
+
+        provisioner.provision(resource("Ops"), props("""
+                {"ClusterName": "prod", "PrincipalArn": "%s",
+                 "AccessPolicies": [
+                   {"PolicyArn": "%s", "AccessScope": {"Type": "cluster"}},
+                   {"PolicyArn": "%s", "AccessScope": {"Type": "namespace", "Namespaces": ["dev-*", "team"]}},
+                   {"PolicyArn": "%s", "AccessScope": {"Type": "namespace", "Namespaces": ["team"]}}]}
+                """.formatted(PRINCIPAL, VIEW, EDIT, VIEW)), ctx());
+
+        verify(entries).associatePolicy(cluster, PRINCIPAL,
+                new AssociateAccessPolicyRequest(VIEW, new AccessScope("namespace", List.of("team"))));
+        verify(entries).associatePolicy(cluster, PRINCIPAL,
+                new AssociateAccessPolicyRequest(EDIT, new AccessScope("namespace", List.of("dev-*", "team"))));
+        verify(entries, never()).associatePolicy(cluster, PRINCIPAL,
+                new AssociateAccessPolicyRequest(VIEW, new AccessScope("cluster", List.of())));
+    }
+
+    @Test
+    void aFailedAssociationLeavesTheNewEntryOwnedForTheCreateRollback() throws Exception {
+        when(eks.describeCluster("prod")).thenReturn(cluster);
+        when(entries.create(eq(cluster), any(CreateAccessEntryRequest.class))).thenReturn(entry());
+        when(entries.associatePolicy(eq(cluster), eq(PRINCIPAL), any(AssociateAccessPolicyRequest.class)))
+                .thenThrow(new AwsException("InvalidParameterException", "bad policy", 400));
+
+        StackResource r = resource("Ops");
+        assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"ClusterName": "prod", "PrincipalArn": "%s",
+                 "AccessPolicies": [{"PolicyArn": "%s", "AccessScope": {"Type": "cluster"}}]}
+                """.formatted(PRINCIPAL, VIEW)), ctx()));
+
+        assertEquals(PRINCIPAL + "|prod", r.getPhysicalId());
+        assertEquals("true", r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+    }
+
+    @Test
+    void updateReconcilesAccessPoliciesAgainstTheLiveAssociations() throws Exception {
+        when(eks.describeCluster("prod")).thenReturn(cluster);
+        when(entries.describe(cluster, PRINCIPAL)).thenReturn(entry());
+        when(entries.listAssociatedPolicies(cluster, PRINCIPAL, null, null)).thenReturn(new PaginatedResult<>(
+                List.of(associated(VIEW, new AccessScope("cluster", List.of()))), "page-2"));
+        when(entries.listAssociatedPolicies(cluster, PRINCIPAL, null, "page-2")).thenReturn(new PaginatedResult<>(
+                List.of(associated(EDIT, new AccessScope("namespace", List.of("dev"))),
+                        associated(ADMIN, new AccessScope("namespace", List.of("ops")))), null));
+
+        StackResource r = resource("Ops");
+        r.setPhysicalId(PRINCIPAL + "|prod");
+        provisioner.provision(r, props("""
+                {"ClusterName": "prod", "PrincipalArn": "%s",
+                 "AccessPolicies": [
+                   {"PolicyArn": "%s", "AccessScope": {"Type": "cluster"}},
+                   {"PolicyArn": "%s", "AccessScope": {"Type": "namespace", "Namespaces": ["dev", "qa"]}}]}
+                """.formatted(PRINCIPAL, VIEW, EDIT)), updateCtx(PRINCIPAL + "|prod"));
+
+        verify(entries, never()).associatePolicy(eq(cluster), eq(PRINCIPAL),
+                eq(new AssociateAccessPolicyRequest(VIEW, new AccessScope("cluster", List.of()))));
+        verify(entries).associatePolicy(cluster, PRINCIPAL,
+                new AssociateAccessPolicyRequest(EDIT, new AccessScope("namespace", List.of("dev", "qa"))));
+        verify(entries).disassociatePolicy(cluster, PRINCIPAL, ADMIN);
+        verify(entries, never()).disassociatePolicy(cluster, PRINCIPAL, VIEW);
+        verify(entries, never()).disassociatePolicy(cluster, PRINCIPAL, EDIT);
+        verify(entries, never()).create(any(), any());
+    }
+
+    @Test
+    void updateThatDropsAccessPoliciesDisassociatesThemAll() throws Exception {
+        when(eks.describeCluster("prod")).thenReturn(cluster);
+        when(entries.describe(cluster, PRINCIPAL)).thenReturn(entry());
+        when(entries.listAssociatedPolicies(cluster, PRINCIPAL, null, null)).thenReturn(new PaginatedResult<>(
+                List.of(associated(VIEW, new AccessScope("cluster", List.of()))), null));
+
+        provisioner.provision(resource("Ops"), props("{\"ClusterName\": \"prod\", \"PrincipalArn\": \"%s\"}"
+                .formatted(PRINCIPAL)), updateCtx(PRINCIPAL + "|prod"));
+
+        verify(entries).disassociatePolicy(cluster, PRINCIPAL, VIEW);
+        verify(entries, never()).associatePolicy(any(), any(), any());
     }
 
     @Test
@@ -94,6 +189,8 @@ class EksAccessEntryCfnProvisionerTest {
     void updateWithTheSameIdentifierReusesTheExistingEntry() throws Exception {
         when(eks.describeCluster("prod")).thenReturn(cluster);
         when(entries.describe(cluster, PRINCIPAL)).thenReturn(entry());
+        when(entries.listAssociatedPolicies(cluster, PRINCIPAL, null, null))
+                .thenReturn(new PaginatedResult<>(List.of(), null));
 
         StackResource r = resource("Ops");
         r.setPhysicalId(PRINCIPAL + "|prod");
@@ -149,6 +246,10 @@ class EksAccessEntryCfnProvisionerTest {
         cluster.setName(name);
         cluster.setArn("arn:aws:eks:us-east-1:000000000000:cluster/" + name);
         return cluster;
+    }
+
+    private static AssociatedAccessPolicy associated(String policyArn, AccessScope scope) {
+        return new AssociatedAccessPolicy(policyArn, scope, 1, 1);
     }
 
     private static AccessEntry entry() {

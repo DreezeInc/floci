@@ -2,16 +2,23 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eks.EksAccessEntryService;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.eks.model.AccessEntry;
+import io.github.hectorvent.floci.services.eks.model.AccessScope;
+import io.github.hectorvent.floci.services.eks.model.AssociateAccessPolicyRequest;
+import io.github.hectorvent.floci.services.eks.model.AssociatedAccessPolicy;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.CreateAccessEntryRequest;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -23,9 +30,10 @@ import java.util.Set;
  * AWS.
  *
  * <p>PrincipalArn, ClusterName and Type are createOnly: an update that keeps the identifier reuses
- * the entry it already has (its mutable properties are not reconciled), and a change to the
- * identifier is refused as a replacement. {@code AccessPolicies} is accepted and not associated,
- * because the EKS API has no access-policy association yet; the omission is logged once per entry.
+ * the entry it already has, and a change to the identifier is refused as a replacement.
+ * {@code AccessPolicies} are associated on create and reconciled on update: each listed policy is
+ * associated with its scope and every other associated policy is disassociated. The entry's other
+ * mutable properties are not reconciled.
  */
 @ApplicationScoped
 public class EksAccessEntryCfnProvisioner implements CfnResourceProvisioner {
@@ -55,7 +63,7 @@ public class EksAccessEntryCfnProvisioner implements CfnResourceProvisioner {
         String principalArn = ctx.resolveRequired(props, "PrincipalArn", TYPE);
         String id = principalArn + ID_SEPARATOR + clusterName;
         Cluster cluster = EksClusterReadiness.awaitActive(eksService, clusterName);
-        warnOnAccessPolicies(r, props, ctx);
+        List<AssociateAccessPolicyRequest> policies = accessPolicies(props, ctx);
 
         if (ctx.isUpdate()) {
             if (!ctx.reusesPriorEntity(id)) {
@@ -64,6 +72,7 @@ public class EksAccessEntryCfnProvisioner implements CfnResourceProvisioner {
             AccessEntry existing = findEntry(cluster, principalArn);
             if (existing != null) {
                 record(r, id, existing);
+                reconcileAccessPolicies(cluster, principalArn, policies);
                 return;
             }
         }
@@ -81,16 +90,51 @@ public class EksAccessEntryCfnProvisioner implements CfnResourceProvisioner {
                 tags.isEmpty() ? null : tags,
                 null);
         record(r, id, accessEntryService.create(cluster, request));
+        r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+        for (AssociateAccessPolicyRequest policy : policies) {
+            accessEntryService.associatePolicy(cluster, principalArn, policy);
+        }
+        r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
     }
 
-    private static void warnOnAccessPolicies(StackResource r, JsonNode props, ProvisionContext ctx) {
+    private static List<AssociateAccessPolicyRequest> accessPolicies(JsonNode props, ProvisionContext ctx) {
         if (props == null || !props.hasNonNull("AccessPolicies")) {
-            return;
+            return List.of();
         }
         JsonNode policies = ctx.engine().resolveNode(props.get("AccessPolicies"));
-        if (policies != null && policies.isArray() && !policies.isEmpty()) {
-            LOG.warnv("{0} {1}: AccessPolicies accepted but not associated; "
-                    + "EKS access-policy association is not implemented", TYPE, r.getLogicalId());
+        if (policies == null || !policies.isArray()) {
+            return List.of();
+        }
+        Map<String, AssociateAccessPolicyRequest> byArn = new LinkedHashMap<>();
+        for (JsonNode policy : policies) {
+            String policyArn = ctx.engine().resolve(policy.path("PolicyArn"));
+            JsonNode scope = policy.path("AccessScope");
+            String type = scope.hasNonNull("Type") ? ctx.engine().resolve(scope.get("Type")) : null;
+            byArn.put(policyArn, new AssociateAccessPolicyRequest(policyArn,
+                    new AccessScope(type, ctx.engine().resolveStringList(scope.path("Namespaces")))));
+        }
+        return List.copyOf(byArn.values());
+    }
+
+    private void reconcileAccessPolicies(Cluster cluster, String principalArn,
+                                         List<AssociateAccessPolicyRequest> desired) {
+        Map<String, AccessScope> current = new HashMap<>();
+        String token = null;
+        do {
+            PaginatedResult<AssociatedAccessPolicy> page =
+                    accessEntryService.listAssociatedPolicies(cluster, principalArn, null, token);
+            page.items().forEach(association -> current.put(association.policyArn(), association.accessScope()));
+            token = page.nextToken();
+        } while (token != null);
+        List<String> stale = new ArrayList<>(current.keySet());
+        for (AssociateAccessPolicyRequest policy : desired) {
+            stale.remove(policy.policyArn());
+            if (!policy.accessScope().equals(current.get(policy.policyArn()))) {
+                accessEntryService.associatePolicy(cluster, principalArn, policy);
+            }
+        }
+        for (String policyArn : stale) {
+            accessEntryService.disassociatePolicy(cluster, principalArn, policyArn);
         }
     }
 

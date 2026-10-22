@@ -1,19 +1,27 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.eks.model.AccessConfig;
 import io.github.hectorvent.floci.services.eks.model.AccessEntry;
+import io.github.hectorvent.floci.services.eks.model.AccessPolicy;
+import io.github.hectorvent.floci.services.eks.model.AccessScope;
+import io.github.hectorvent.floci.services.eks.model.AssociateAccessPolicyRequest;
+import io.github.hectorvent.floci.services.eks.model.AssociatedAccessPolicy;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateAccessEntryRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateAccessEntryRequest;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -23,6 +31,9 @@ import static org.mockito.Mockito.*;
 
 class EksAccessEntryServiceTest {
     private static final String PRINCIPAL = "arn:aws:iam::123456789012:role/path/worker";
+    private static final String NODE = "arn:aws:iam::123456789012:role/node";
+    private static final String VIEW = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy";
+    private static final String ADMIN = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy";
 
     @Test
     void nodeEntryUsesGeneratedIdentityAndCapturesStablePrincipalId() throws Exception {
@@ -136,6 +147,184 @@ class EksAccessEntryServiceTest {
         fixture.cluster.setStatus(ClusterStatus.CREATING);
         assertThrows(AwsException.class, () -> fixture.service.create(fixture.cluster,
                 request(PRINCIPAL, "EC2_LINUX", null)));
+    }
+
+    @Test
+    void reassociatingReplacesTheScopeAndKeepsTheAssociationTime() {
+        Fixture fixture = fixture();
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, null, null));
+        AssociatedAccessPolicy first = fixture.service.associatePolicy(fixture.cluster, PRINCIPAL,
+                association(VIEW, "namespace", List.of("dev-*", "team")));
+        assertEquals(new AccessScope("namespace", List.of("dev-*", "team")), first.accessScope());
+        assertTrue(first.associatedAt() > 0);
+        assertEquals(first.associatedAt(), first.modifiedAt());
+        AssociatedAccessPolicy second = fixture.service.associatePolicy(fixture.cluster, PRINCIPAL,
+                association(VIEW, "cluster", null));
+        assertEquals(new AccessScope("cluster", List.of()), second.accessScope());
+        assertEquals(first.associatedAt(), second.associatedAt());
+        assertTrue(second.modifiedAt() >= first.modifiedAt());
+        assertEquals(List.of(second),
+                fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null).items());
+    }
+
+    @Test
+    void associationsPageByPolicyArnAndDisassociateRemovesOnlyTheNamedPolicy() {
+        Fixture fixture = fixture();
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, null, null));
+        fixture.service.associatePolicy(fixture.cluster, PRINCIPAL, association(VIEW, "cluster", List.of()));
+        fixture.service.associatePolicy(fixture.cluster, PRINCIPAL, association(ADMIN, "cluster", List.of()));
+        PaginatedResult<AssociatedAccessPolicy> first =
+                fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, 1, null);
+        assertEquals(List.of(ADMIN), first.items().stream().map(AssociatedAccessPolicy::policyArn).toList());
+        PaginatedResult<AssociatedAccessPolicy> second =
+                fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, 1, first.nextToken());
+        assertEquals(List.of(VIEW), second.items().stream().map(AssociatedAccessPolicy::policyArn).toList());
+        assertNull(second.nextToken());
+        assertEquals("InvalidParameterException", assertThrows(AwsException.class,
+                () -> fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, 101, null)).getErrorCode());
+
+        fixture.service.disassociatePolicy(fixture.cluster, PRINCIPAL, ADMIN);
+        assertEquals(List.of(VIEW), fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null)
+                .items().stream().map(AssociatedAccessPolicy::policyArn).toList());
+        assertEquals(404, assertThrows(AwsException.class,
+                () -> fixture.service.disassociatePolicy(fixture.cluster, PRINCIPAL, ADMIN)).getHttpStatus());
+    }
+
+    @Test
+    void associationRejectsUnknownPoliciesInvalidScopesAndNodeEntries() {
+        Fixture fixture = fixture();
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, null, null));
+        for (AssociateAccessPolicyRequest invalid : List.of(
+                association("arn:aws:eks::aws:cluster-access-policy/AmazonEKSUnknownPolicy", "cluster", null),
+                association(VIEW.replace("arn:aws:", "arn:aws-cn:"), "cluster", null),
+                association(null, "cluster", null),
+                new AssociateAccessPolicyRequest(VIEW, null),
+                association(VIEW, null, List.of("default")),
+                association(VIEW, "account", null),
+                association(VIEW, "namespace", null),
+                association(VIEW, "namespace", List.of(" ")),
+                association(VIEW, "cluster", List.of("default")))) {
+            assertEquals("InvalidParameterException", assertThrows(AwsException.class,
+                    () -> fixture.service.associatePolicy(fixture.cluster, PRINCIPAL, invalid)).getErrorCode(),
+                    invalid.toString());
+        }
+        assertTrue(fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null).items().isEmpty());
+
+        AwsException missing = assertThrows(AwsException.class, () -> fixture.service.associatePolicy(
+                fixture.cluster, PRINCIPAL + "2", association(VIEW, "cluster", null)));
+        assertEquals(404, missing.getHttpStatus());
+        assertEquals("The specified principalArn could not be found.", missing.getMessage());
+        assertEquals(404, assertThrows(AwsException.class, () -> fixture.service.listAssociatedPolicies(
+                fixture.cluster, PRINCIPAL + "2", null, null)).getHttpStatus());
+
+        when(fixture.iam.findRole("123456789012", "node")).thenReturn(Optional.of(
+                new IamRole("AROA-node", "node", "/", NODE, "{}")));
+        fixture.service.create(fixture.cluster, request(NODE, "EC2_LINUX", null));
+        assertEquals("InvalidRequestException", assertThrows(AwsException.class, () -> fixture.service
+                .associatePolicy(fixture.cluster, NODE, association(VIEW, "cluster", null))).getErrorCode());
+    }
+
+    @Test
+    void deletingTheEntryOrTheClusterDropsItsAssociations() {
+        Fixture fixture = fixture();
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, null, null));
+        fixture.service.associatePolicy(fixture.cluster, PRINCIPAL, association(VIEW, "cluster", null));
+        fixture.service.delete(fixture.cluster, PRINCIPAL);
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, null, null));
+        assertTrue(fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null).items().isEmpty());
+
+        fixture.service.associatePolicy(fixture.cluster, PRINCIPAL, association(VIEW, "cluster", null));
+        fixture.service.deleteClusterEntries(fixture.cluster);
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, null, null));
+        assertTrue(fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null).items().isEmpty());
+    }
+
+    @Test
+    void entriesStoredWithoutAssociationsReadAsHavingNone() throws Exception {
+        Fixture fixture = fixture();
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, null, null));
+        String key = fixture.storage.keys().iterator().next();
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode legacy = mapper.valueToTree(fixture.storage.get(key).orElseThrow());
+        legacy.remove("accessPolicies");
+        fixture.storage.put(key, mapper.treeToValue(legacy, EksAccessEntryService.StoredEntry.class));
+        assertTrue(fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null).items().isEmpty());
+        fixture.service.associatePolicy(fixture.cluster, PRINCIPAL, association(VIEW, "cluster", null));
+        assertEquals(1, fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null).items().size());
+    }
+
+    @Test
+    void updateReplacesOnlyTheGivenFieldsAndKeepsAssociations() {
+        Fixture fixture = fixture();
+        AccessEntry created = fixture.service.create(fixture.cluster,
+                new CreateAccessEntryRequest(PRINCIPAL, null, null, List.of("readers"), null, null));
+        fixture.service.associatePolicy(fixture.cluster, PRINCIPAL, association(VIEW, "cluster", null));
+
+        AccessEntry renamed = fixture.service.update(fixture.cluster, PRINCIPAL,
+                new UpdateAccessEntryRequest(null, "token", "ops:{{SessionName}}"));
+        assertEquals("ops:{{SessionName}}", renamed.username());
+        assertEquals(List.of("readers"), renamed.kubernetesGroups());
+        assertEquals(created.accessEntryArn(), renamed.accessEntryArn());
+        assertEquals(created.createdAt(), renamed.createdAt());
+        assertTrue(renamed.modifiedAt() >= created.modifiedAt());
+
+        AccessEntry cleared = fixture.service.update(fixture.cluster, PRINCIPAL,
+                new UpdateAccessEntryRequest(List.of(), null, null));
+        assertEquals(List.of(), cleared.kubernetesGroups());
+        assertEquals("ops:{{SessionName}}", cleared.username());
+        assertEquals(cleared, fixture.service.describe(fixture.cluster, PRINCIPAL));
+        assertEquals(1, fixture.service.listAssociatedPolicies(fixture.cluster, PRINCIPAL, null, null).items().size());
+
+        for (UpdateAccessEntryRequest invalid : List.of(new UpdateAccessEntryRequest(null, null, "system:admin"),
+                new UpdateAccessEntryRequest(null, null, "{{SessionName}}"),
+                new UpdateAccessEntryRequest(List.of(""), null, null))) {
+            assertEquals("InvalidParameterException", assertThrows(AwsException.class,
+                    () -> fixture.service.update(fixture.cluster, PRINCIPAL, invalid)).getErrorCode());
+        }
+        assertEquals(404, assertThrows(AwsException.class, () -> fixture.service.update(fixture.cluster,
+                PRINCIPAL + "2", new UpdateAccessEntryRequest(List.of("readers"), null, null))).getHttpStatus());
+    }
+
+    @Test
+    void nodeEntriesRejectUsernameAndGroupUpdates() {
+        Fixture fixture = fixture();
+        fixture.service.create(fixture.cluster, request(PRINCIPAL, "EC2_LINUX", null));
+        assertThrows(AwsException.class, () -> fixture.service.update(fixture.cluster, PRINCIPAL,
+                new UpdateAccessEntryRequest(List.of("admins"), null, null)));
+        assertThrows(AwsException.class, () -> fixture.service.update(fixture.cluster, PRINCIPAL,
+                new UpdateAccessEntryRequest(null, null, "custom")));
+        AccessEntry unchanged = fixture.service.update(fixture.cluster, PRINCIPAL, null);
+        assertEquals("system:node:{{EC2PrivateDNSName}}", unchanged.username());
+        assertEquals(List.of("system:nodes"), unchanged.kubernetesGroups());
+    }
+
+    @Test
+    void accessPolicyCatalogUsesTheRequestedPartitionAndPages() {
+        Fixture fixture = fixture();
+        PaginatedResult<AccessPolicy> all = fixture.service.listAccessPolicies("aws", null, null);
+        assertNull(all.nextToken());
+        for (String name : List.of("AmazonEKSClusterAdminPolicy", "AmazonEKSAdminPolicy", "AmazonEKSEditPolicy",
+                "AmazonEKSViewPolicy", "AmazonEKSAdminViewPolicy")) {
+            assertTrue(all.items().contains(
+                    new AccessPolicy(name, "arn:aws:eks::aws:cluster-access-policy/" + name)), name);
+        }
+        List<String> paged = new ArrayList<>();
+        String token = null;
+        do {
+            PaginatedResult<AccessPolicy> page = fixture.service.listAccessPolicies("aws-cn", 5, token);
+            assertTrue(page.items().size() <= 5);
+            for (AccessPolicy policy : page.items()) {
+                assertEquals("arn:aws-cn:eks::aws:cluster-access-policy/" + policy.name(), policy.arn());
+                paged.add(policy.name());
+            }
+            token = page.nextToken();
+        } while (token != null);
+        assertEquals(all.items().stream().map(AccessPolicy::name).toList(), paged);
+        assertThrows(AwsException.class, () -> fixture.service.listAccessPolicies("aws", 0, null));
+    }
+
+    private static AssociateAccessPolicyRequest association(String policyArn, String type, List<String> namespaces) {
+        return new AssociateAccessPolicyRequest(policyArn, new AccessScope(type, namespaces));
     }
 
     private static CreateAccessEntryRequest request(String principal, String type, String token) {

@@ -19,9 +19,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * The resource types an EKS workload stack declares around its cluster, provisioned for real through
- * CloudFormation: EKS addon, access entry, pod identity association and OIDC identity provider config,
- * the IAM OIDC provider for the cluster issuer, the EFS file system with its access point and mount
- * target, and an EBS volume.
+ * CloudFormation: EKS addon, access entry with its access policy, pod identity association and OIDC
+ * identity provider config, the IAM OIDC provider for the cluster issuer, the EFS file system with
+ * its access point and mount target, and an EBS volume.
  * EKS runs in mock mode under test, so no cluster container starts.
  */
 @QuarkusTest
@@ -93,6 +93,12 @@ class CloudFormationEksSubResourcesIntegrationTest {
                 .body("accessEntry.accessEntryArn", equalTo(outputs.get("AccessEntryArn")))
                 .body("accessEntry.type", equalTo("STANDARD"))
                 .body("accessEntry.kubernetesGroups", equalTo(List.of("viewers")));
+        given().urlEncodingEnabled(false)
+                .get("/clusters/" + clusterName + "/access-entries/" + roleArn + "/access-policies").then()
+                .statusCode(200)
+                .body("associatedAccessPolicies.policyArn",
+                        equalTo(List.of("arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy")))
+                .body("associatedAccessPolicies[0].accessScope.type", equalTo("cluster"));
         given().get("/clusters/" + clusterName + "/pod-identity-associations/" + outputs.get("AssociationId")).then()
                 .statusCode(200)
                 .body("association.associationArn", equalTo(outputs.get("AssociationArn")))
