@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service.SubnetMapping;
 import io.github.hectorvent.floci.services.elbv2.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -123,18 +124,12 @@ public class ElbV2QueryHandler {
         String scheme = p.getFirst("Scheme");
         String type = p.getFirst("Type");
         String ipAddressType = p.getFirst("IpAddressType");
-        List<String> subnets = memberList(p, "Subnets");
-        List<String> subnetMappings = subnetMappingSubnetIds(p);
-        if (!subnets.isEmpty() && !subnetMappings.isEmpty()) {
-            throw new AwsException("ValidationError",
-                    "You can specify either subnets or subnet mappings, not both", 400);
-        }
-        List<String> effectiveSubnets = subnetMappings.isEmpty() ? subnets : subnetMappings;
+        List<SubnetMapping> subnetMappings = subnetsOrSubnetMappings(p);
         List<String> securityGroups = memberList(p, "SecurityGroups");
         Map<String, String> tags = parseTags(p);
 
-        LoadBalancer lb = service.createLoadBalancer(region, name, scheme, type, ipAddressType,
-                effectiveSubnets, securityGroups, tags);
+        LoadBalancer lb = service.createLoadBalancerWithSubnetMappings(region, name, scheme, type,
+                ipAddressType, subnetMappings, securityGroups, tags);
 
         // return provisioning state in create response only
         LoadBalancer provisioning = shallowCopy(lb);
@@ -261,13 +256,7 @@ public class ElbV2QueryHandler {
 
     private Response handleSetSubnets(MultivaluedMap<String, String> p, String region) {
         String arn = p.getFirst("LoadBalancerArn");
-        List<String> subnets = memberList(p, "Subnets");
-        List<String> subnetMappings = subnetMappingSubnetIds(p);
-        if (!subnets.isEmpty() && !subnetMappings.isEmpty()) {
-            throw new AwsException("ValidationError",
-                    "You can specify either subnets or subnet mappings, not both", 400);
-        }
-        service.setSubnets(region, arn, subnetMappings.isEmpty() ? subnets : subnetMappings);
+        service.setSubnets(region, arn, subnetsOrSubnetMappings(p));
         return voidResponse("SetSubnetsResponse");
     }
 
@@ -849,8 +838,19 @@ public class ElbV2QueryHandler {
         for (AvailabilityZone az : lb.getAvailabilityZones()) {
             xml.start("member")
                     .elem("SubnetId", safe(az.getSubnetId()))
-                    .elem("ZoneName", safe(az.getZoneName()))
-                    .end("member");
+                    .elem("ZoneName", safe(az.getZoneName()));
+            if (!az.getLoadBalancerAddresses().isEmpty()) {
+                xml.start("LoadBalancerAddresses");
+                for (LoadBalancerAddress address : az.getLoadBalancerAddresses()) {
+                    xml.start("member")
+                            .elem("IpAddress", address.getIpAddress())
+                            .elem("AllocationId", address.getAllocationId())
+                            .elem("PrivateIPv4Address", address.getPrivateIPv4Address())
+                            .end("member");
+                }
+                xml.end("LoadBalancerAddresses");
+            }
+            xml.end("member");
         }
         xml.end("AvailabilityZones");
         xml.start("SecurityGroups");
@@ -1092,13 +1092,24 @@ public class ElbV2QueryHandler {
         return result;
     }
 
-    private List<String> subnetMappingSubnetIds(MultivaluedMap<String, String> p) {
-        List<String> result = new ArrayList<>();
+    private List<SubnetMapping> subnetsOrSubnetMappings(MultivaluedMap<String, String> p) {
+        List<String> subnets = memberList(p, "Subnets");
+        List<SubnetMapping> subnetMappings = subnetMappings(p);
+        if (!subnets.isEmpty() && !subnetMappings.isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "You can specify either subnets or subnet mappings, not both", 400);
+        }
+        return subnetMappings.isEmpty() ? SubnetMapping.ofSubnetIds(subnets) : subnetMappings;
+    }
+
+    private List<SubnetMapping> subnetMappings(MultivaluedMap<String, String> p) {
+        List<SubnetMapping> result = new ArrayList<>();
         int i = 1;
         while (true) {
+            String prefix = "SubnetMappings.member." + i + ".";
             boolean memberPresent = false;
             for (String key : p.keySet()) {
-                if (key.startsWith("SubnetMappings.member." + i + ".")) {
+                if (key.startsWith(prefix)) {
                     memberPresent = true;
                     break;
                 }
@@ -1106,12 +1117,13 @@ public class ElbV2QueryHandler {
             if (!memberPresent) {
                 break;
             }
-            String subnetId = p.getFirst("SubnetMappings.member." + i + ".SubnetId");
+            String subnetId = p.getFirst(prefix + "SubnetId");
             if (subnetId == null) {
                 throw new AwsException("ValidationError",
                         "You must specify a subnet ID for each subnet mapping.", 400);
             }
-            result.add(subnetId);
+            result.add(new SubnetMapping(subnetId, p.getFirst(prefix + "AllocationId"),
+                    p.getFirst(prefix + "PrivateIPv4Address")));
             i++;
         }
         return result;

@@ -86,6 +86,7 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 
 - Load balancer, target group, listener, rule, and tag state is persisted through Floci storage and rebuilt on service startup.
 - Load balancers are created in `active` state.
+- `CreateLoadBalancer` and `SetSubnets` keep the `AllocationId` and `PrivateIPv4Address` of each `SubnetMappings` entry. `DescribeLoadBalancers` returns them under the zone's `LoadBalancerAddresses`, with the Elastic IP's public address as `IpAddress`. An allocation ID that does not exist is rejected with `AllocationIdNotFound`. The Elastic IP is not shown as associated in EC2 `DescribeAddresses`.
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Instance targets are resolved through EC2 instance private addresses so local load balancer traffic can reach containers.
 - An `ip` target that is a pod address of a running EKS cluster in the target group's VPC is reached through a port that Floci forwards on the cluster's node container. See [EKS](eks.md#load-balancer-targets). Every other `ip` target is reached at its own address.

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -264,7 +265,7 @@ class ElbV2IntegrationTest {
     @Order(17)
     void createAndSetSubnetMappingsDriveSubnetsAndVpcId() {
         // The AWS Load Balancer Controller sends SubnetMappings rather than Subnets; both actions
-        // must treat the mappings' SubnetId values as the subnet list (address pinning is not modelled).
+        // must treat the mappings' SubnetId values as the subnet list.
         String subnetMappedArn = given()
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "nlb-with-subnet-mappings")
@@ -343,6 +344,99 @@ class ElbV2IntegrationTest {
                 .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
                 .body("ErrorResponse.Error.Message",
                         equalTo("You must specify a subnet ID for each subnet mapping."));
+    }
+
+    @Test
+    @Order(19)
+    void subnetMappingsKeepEachSubnetsElasticIp() {
+        String subnetA = Ec2Service.defaultSubnetId("us-east-1", "a");
+        String subnetB = Ec2Service.defaultSubnetId("us-east-1", "b");
+        Response allocation = given()
+                .formParam("Action", "AllocateAddress")
+                .formParam("Domain", "vpc")
+                .header("Authorization", EC2_AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .extract()
+                .response();
+        String allocationId = allocation.path("AllocateAddressResponse.allocationId");
+        String publicIp = allocation.path("AllocateAddressResponse.publicIp");
+        String zoneA = "LoadBalancers.member.AvailabilityZones.member.find { it.SubnetId == '" + subnetA + "' }";
+        String zoneB = "LoadBalancers.member.AvailabilityZones.member.find { it.SubnetId == '" + subnetB + "' }";
+
+        String arn = given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "nlb-with-elastic-ip")
+                .formParam("Type", "network")
+                .formParam("Scheme", "internet-facing")
+                .formParam("SubnetMappings.member.1.SubnetId", subnetA)
+                .formParam("SubnetMappings.member.1.AllocationId", allocationId)
+                .formParam("SubnetMappings.member.2.SubnetId", subnetB)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult." + zoneA
+                        + ".LoadBalancerAddresses.member.AllocationId", equalTo(allocationId))
+                .extract()
+                .path("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn");
+
+        given()
+                .formParam("Action", "DescribeLoadBalancers")
+                .formParam("LoadBalancerArns.member.1", arn)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult." + zoneA
+                        + ".LoadBalancerAddresses.member.AllocationId", equalTo(allocationId))
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult." + zoneA
+                        + ".LoadBalancerAddresses.member.IpAddress", equalTo(publicIp))
+                .body("DescribeLoadBalancersResponse.DescribeLoadBalancersResult." + zoneB
+                        + ".LoadBalancerAddresses.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(19)
+    void subnetMappingsKeepEachSubnetsPrivateIpv4Address() {
+        String subnetA = Ec2Service.defaultSubnetId("us-east-1", "a");
+        given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "nlb-with-private-ip")
+                .formParam("Type", "network")
+                .formParam("Scheme", "internal")
+                .formParam("SubnetMappings.member.1.SubnetId", subnetA)
+                .formParam("SubnetMappings.member.1.PrivateIPv4Address", "172.31.0.10")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.AvailabilityZones"
+                        + ".member.LoadBalancerAddresses.member.PrivateIPv4Address", equalTo("172.31.0.10"))
+                .body("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.AvailabilityZones"
+                        + ".member.LoadBalancerAddresses.member.IpAddress.size()", equalTo(0));
+    }
+
+    @Test
+    @Order(19)
+    void subnetMappingWithUnknownAllocationReturnsAllocationIdNotFound() {
+        given()
+                .formParam("Action", "CreateLoadBalancer")
+                .formParam("Name", "nlb-with-missing-eip")
+                .formParam("Type", "network")
+                .formParam("SubnetMappings.member.1.SubnetId", Ec2Service.defaultSubnetId("us-east-1", "a"))
+                .formParam("SubnetMappings.member.1.AllocationId", "eipalloc-0123456789abcdef0")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("AllocationIdNotFound"));
     }
 
     // ── Target Groups ─────────────────────────────────────────────────────────

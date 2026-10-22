@@ -8,12 +8,17 @@ import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service.SubnetMapping;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
+import io.github.hectorvent.floci.services.elbv2.model.AvailabilityZone;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
+import io.github.hectorvent.floci.services.elbv2.model.LoadBalancerAddress;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
 import io.github.hectorvent.floci.services.elbv2.model.RuleCondition;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
@@ -22,12 +27,14 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -41,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -521,6 +529,90 @@ class ElbV2ServiceTest {
     }
 
     @Test
+    void aNetworkLoadBalancerKeepsTheElasticIpOfEachSubnetMapping() {
+        stubElasticIp(ec2Service, "eipalloc-a", "54.0.0.10");
+        stubElasticIp(ec2Service, "eipalloc-b", "54.0.0.11");
+
+        List<AvailabilityZone> zones = service.createLoadBalancerWithSubnetMappings(
+                REGION, "eip-nlb", "internet-facing", "network", "ipv4",
+                List.of(new SubnetMapping("subnet-a", "eipalloc-a", null),
+                        new SubnetMapping("subnet-b", "eipalloc-b", null)),
+                List.of(), Map.of()).getAvailabilityZones();
+
+        assertElasticIp(zones.get(0), "subnet-a", "eipalloc-a", "54.0.0.10");
+        assertElasticIp(zones.get(1), "subnet-b", "eipalloc-b", "54.0.0.11");
+    }
+
+    @Test
+    void anInternalNetworkLoadBalancerKeepsThePrivateAddressOfEachSubnetMapping() {
+        List<AvailabilityZone> zones = service.createLoadBalancerWithSubnetMappings(
+                REGION, "private-ip-nlb", "internal", "network", "ipv4",
+                List.of(new SubnetMapping("subnet-a", null, "10.0.1.10"),
+                        new SubnetMapping("subnet-b", null, null)),
+                List.of(), Map.of()).getAvailabilityZones();
+
+        LoadBalancerAddress address = zones.get(0).getLoadBalancerAddresses().getFirst();
+        assertEquals("10.0.1.10", address.getPrivateIPv4Address());
+        assertNull(address.getAllocationId());
+        assertNull(address.getIpAddress());
+        assertTrue(zones.get(1).getLoadBalancerAddresses().isEmpty());
+    }
+
+    @Test
+    void aSubnetMappingWithAnUnknownAllocationIsRejected() {
+        AwsException ex = assertThrows(AwsException.class, () -> service.createLoadBalancerWithSubnetMappings(
+                REGION, "missing-eip-nlb", "internet-facing", "network", "ipv4",
+                List.of(new SubnetMapping("subnet-a", "eipalloc-missing", null),
+                        new SubnetMapping("subnet-b", null, null)),
+                List.of(), Map.of()));
+
+        assertEquals("AllocationIdNotFound", ex.getErrorCode());
+        assertEquals(400, ex.getHttpStatus());
+        assertTrue(service.describeLoadBalancers(REGION, null, null, null, null).isEmpty());
+    }
+
+    @Test
+    void setSubnetsReplacesTheElasticIpsWithThoseOfTheNewMappings() {
+        stubElasticIp(ec2Service, "eipalloc-a", "54.0.0.10");
+        stubElasticIp(ec2Service, "eipalloc-b", "54.0.0.11");
+        String lbArn = service.createLoadBalancerWithSubnetMappings(
+                REGION, "reset-eip-nlb", "internet-facing", "network", "ipv4",
+                List.of(new SubnetMapping("subnet-a", "eipalloc-a", null),
+                        new SubnetMapping("subnet-b", null, null)),
+                List.of(), Map.of()).getLoadBalancerArn();
+
+        service.setSubnets(REGION, lbArn, List.of(new SubnetMapping("subnet-a", null, null),
+                new SubnetMapping("subnet-b", "eipalloc-b", null)));
+
+        List<AvailabilityZone> zones = service.describeLoadBalancers(REGION, List.of(lbArn), null, null, null)
+                .getFirst().getAvailabilityZones();
+        assertTrue(zones.get(0).getLoadBalancerAddresses().isEmpty());
+        assertElasticIp(zones.get(1), "subnet-b", "eipalloc-b", "54.0.0.11");
+    }
+
+    @Test
+    void aSubnetMappingsElasticIpSurvivesAReloadFromDisk(@TempDir Path storageDirectory) {
+        FileStorageFactory storageFactory = new FileStorageFactory(storageDirectory);
+        Ec2Service firstEc2Service = mock(Ec2Service.class);
+        stubAlbSubnets(firstEc2Service);
+        stubElasticIp(firstEc2Service, "eipalloc-a", "54.0.0.10");
+        ElbV2Service first = serviceWithStorage(storageFactory, mock(ElbV2DataPlane.class),
+                mock(ElbV2HealthChecker.class), firstEc2Service);
+        first.createLoadBalancerWithSubnetMappings(REGION, "stored-eip-nlb", "internet-facing", "network", "ipv4",
+                List.of(new SubnetMapping("subnet-a", "eipalloc-a", null),
+                        new SubnetMapping("subnet-b", null, "172.31.16.10")),
+                List.of(), Map.of());
+
+        ElbV2Service reloaded = serviceWithStorage(storageFactory, mock(ElbV2DataPlane.class),
+                mock(ElbV2HealthChecker.class), mock(Ec2Service.class));
+
+        List<AvailabilityZone> zones = reloaded.describeLoadBalancers(REGION, null, List.of("stored-eip-nlb"), null, null)
+                .getFirst().getAvailabilityZones();
+        assertElasticIp(zones.get(0), "subnet-a", "eipalloc-a", "54.0.0.10");
+        assertEquals("172.31.16.10", zones.get(1).getLoadBalancerAddresses().getFirst().getPrivateIPv4Address());
+    }
+
+    @Test
     void deleteListenerIsIgnoredForRegionWithNoListeners() {
         String emptyRegion = "eu-central-1";
 
@@ -645,6 +737,22 @@ class ElbV2ServiceTest {
                 .thenReturn(List.of(subnetA, subnetB));
     }
 
+    private static void stubElasticIp(Ec2Service ec2Service, String allocationId, String publicIp) {
+        Address address = new Address();
+        address.setAllocationId(allocationId);
+        address.setPublicIp(publicIp);
+        when(ec2Service.describeAddresses(REGION, List.of(allocationId), Map.of())).thenReturn(List.of(address));
+    }
+
+    private static void assertElasticIp(AvailabilityZone zone, String subnetId, String allocationId,
+                                        String publicIp) {
+        assertEquals(subnetId, zone.getSubnetId());
+        assertEquals(1, zone.getLoadBalancerAddresses().size());
+        LoadBalancerAddress address = zone.getLoadBalancerAddresses().getFirst();
+        assertEquals(allocationId, address.getAllocationId());
+        assertEquals(publicIp, address.getIpAddress());
+    }
+
     private static Subnet subnet(String subnetId, String availabilityZone) {
         Subnet subnet = new Subnet();
         subnet.setSubnetId(subnetId);
@@ -666,6 +774,24 @@ class ElbV2ServiceTest {
                                                      String fileName,
                                                      TypeReference<Map<String, V>> typeReference) {
             return (AccountAwareStorageBackend<V>) stores.computeIfAbsent(fileName, ignored -> AccountAwareStorageBackend.inMemory("000000000000"));
+        }
+    }
+
+    private static final class FileStorageFactory extends StorageFactory {
+        private final Path directory;
+
+        private FileStorageFactory(Path directory) {
+            super(null, null);
+            this.directory = directory;
+        }
+
+        @Override
+        public <V> AccountAwareStorageBackend<V> create(String serviceName,
+                                                     String fileName,
+                                                     TypeReference<Map<String, V>> typeReference) {
+            PersistentStorage<String, V> storage = new PersistentStorage<>(directory.resolve(fileName), typeReference);
+            storage.load();
+            return new AccountAwareStorageBackend<>(storage, null, "000000000000");
         }
     }
 

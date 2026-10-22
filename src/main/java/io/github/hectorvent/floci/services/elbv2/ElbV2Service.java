@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elbv2.model.*;
 import io.github.hectorvent.floci.services.iam.ServerCertificateReferenceProvider;
@@ -195,10 +196,26 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // ── Load Balancers ────────────────────────────────────────────────────────
 
+    public record SubnetMapping(String subnetId, String allocationId, String privateIPv4Address) {
+
+        public static List<SubnetMapping> ofSubnetIds(List<String> subnetIds) {
+            return subnetIds.stream().map(subnetId -> new SubnetMapping(subnetId, null, null)).toList();
+        }
+    }
+
     public LoadBalancer createLoadBalancer(String region, String name, String scheme,
                                            String type, String ipAddressType,
                                            List<String> subnets, List<String> securityGroups,
                                            Map<String, String> initialTags) {
+        return createLoadBalancerWithSubnetMappings(region, name, scheme, type, ipAddressType,
+                subnets != null ? SubnetMapping.ofSubnetIds(subnets) : null, securityGroups, initialTags);
+    }
+
+    public LoadBalancer createLoadBalancerWithSubnetMappings(String region, String name, String scheme,
+                                                             String type, String ipAddressType,
+                                                             List<SubnetMapping> subnetMappings,
+                                                             List<String> securityGroups,
+                                                             Map<String, String> initialTags) {
         validateName(name, "load balancer");
         Map<String, LoadBalancer> regionLbs = loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
         boolean duplicate = regionLbs.values().stream()
@@ -215,7 +232,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         String id = randomHex16();
         String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
         String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
-        String vpcId = resolveSubnetVpcId(region, lbType, subnets);
+        String vpcId = resolveSubnetVpcId(region, lbType, subnetIds(subnetMappings));
 
         LoadBalancer lb = new LoadBalancer();
         lb.setLoadBalancerArn(arn);
@@ -229,7 +246,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         lb.setType(lbType);
         lb.setIpAddressType(ipType);
         lb.setRegion(region);
-        if (subnets != null) lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
+        if (subnetMappings != null) lb.setAvailabilityZones(resolveAvailabilityZones(region, subnetMappings));
         if (securityGroups != null) lb.setSecurityGroups(new ArrayList<>(securityGroups));
 
         regionLbs.put(arn, lb);
@@ -338,14 +355,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         persistRegion(loadBalancers, region);
     }
 
-    public void setSubnets(String region, String arn, List<String> subnets) {
+    public void setSubnets(String region, String arn, List<SubnetMapping> subnetMappings) {
         LoadBalancer lb = requireLoadBalancer(region, arn);
-        String vpcId = resolveSubnetVpcId(region, lb.getType(), subnets);
+        String vpcId = resolveSubnetVpcId(region, lb.getType(), subnetIds(subnetMappings));
         if (vpcId != null && lb.getVpcId() != null && !lb.getVpcId().equals(vpcId)) {
             throw new AwsException("InvalidConfigurationRequest",
                     "All subnets must belong to the load balancer VPC.", 400);
         }
-        lb.setAvailabilityZones(resolveAvailabilityZones(region, subnets));
+        lb.setAvailabilityZones(resolveAvailabilityZones(region, subnetMappings));
         if (vpcId != null) {
             lb.setVpcId(vpcId);
         }
@@ -1057,21 +1074,49 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         return lb;
     }
 
-    private List<AvailabilityZone> resolveAvailabilityZones(String region, List<String> subnetIds) {
-        if (subnetIds == null || subnetIds.isEmpty()) {
+    private List<AvailabilityZone> resolveAvailabilityZones(String region, List<SubnetMapping> subnetMappings) {
+        if (subnetMappings == null || subnetMappings.isEmpty()) {
             return new ArrayList<>();
         }
 
-        Map<String, Subnet> subnetsById = resolveSubnetsById(region, subnetIds);
+        Map<String, Subnet> subnetsById = resolveSubnetsById(region, subnetIds(subnetMappings));
         List<AvailabilityZone> availabilityZones = new ArrayList<>();
-        for (String subnetId : subnetIds) {
-            Subnet subnet = subnetsById.get(subnetId);
+        for (SubnetMapping mapping : subnetMappings) {
+            Subnet subnet = subnetsById.get(mapping.subnetId());
             AvailabilityZone availabilityZone = new AvailabilityZone();
             availabilityZone.setSubnetId(subnet.getSubnetId());
             availabilityZone.setZoneName(subnet.getAvailabilityZone());
+            if (mapping.allocationId() != null || mapping.privateIPv4Address() != null) {
+                availabilityZone.getLoadBalancerAddresses().add(loadBalancerAddress(region, mapping));
+            }
             availabilityZones.add(availabilityZone);
         }
         return availabilityZones;
+    }
+
+    private LoadBalancerAddress loadBalancerAddress(String region, SubnetMapping mapping) {
+        LoadBalancerAddress address = new LoadBalancerAddress();
+        if (mapping.allocationId() != null) {
+            address.setAllocationId(mapping.allocationId());
+            address.setIpAddress(elasticIpPublicIp(region, mapping.allocationId()));
+        }
+        address.setPrivateIPv4Address(mapping.privateIPv4Address());
+        return address;
+    }
+
+    private String elasticIpPublicIp(String region, String allocationId) {
+        return ec2Service.describeAddresses(region, List.of(allocationId), Map.of()).stream()
+                .findFirst()
+                .map(Address::getPublicIp)
+                .orElseThrow(() -> new AwsException("AllocationIdNotFound",
+                        "The allocation ID '" + allocationId + "' does not exist.", 400));
+    }
+
+    private static List<String> subnetIds(List<SubnetMapping> subnetMappings) {
+        if (subnetMappings == null) {
+            return null;
+        }
+        return subnetMappings.stream().map(SubnetMapping::subnetId).toList();
     }
 
     private String resolveSubnetVpcId(String region, String lbType, List<String> subnetIds) {
