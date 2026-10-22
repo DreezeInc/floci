@@ -46,6 +46,9 @@ import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.Provider;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
+import io.github.hectorvent.floci.services.eks.model.Update;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterConfigRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterVersionRequest;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -83,7 +86,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     private record UserDataClaim(String userData, CompletableFuture<UserDataPipeline.ExecutionResult> future) {}
 
-    private static final List<String> ALL_LOG_TYPES = List.of(
+    static final List<String> ALL_LOG_TYPES = List.of(
             "api", "audit", "authenticator", "controllerManager", "scheduler"
     );
 
@@ -105,6 +108,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final EksClusterUpdateService clusterUpdates;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
     private final Map<String, UserDataClaim> appliedClusterUserData = new ConcurrentHashMap<>();
     private final Map<String, Object> nodeGroupCapacityLocks = new ConcurrentHashMap<>();
@@ -118,7 +122,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations,
-            EksAddonService addons) {
+            EksAddonService addons, EksClusterUpdateService clusterUpdates) {
         this.storage = storageFactory.create("eks", "eks-clusters.json",
                 new TypeReference<Map<String, Cluster>>() {
                 });
@@ -136,6 +140,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.clusterUpdates = clusterUpdates;
         if (this.clusterManager != null) {
             this.clusterManager.setEc2Service(this.ec2Service);
         }
@@ -144,16 +149,25 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
+            EksPodIdentityAssociationService podIdentityAssociations,
+            EksAddonService addons) {
+        this(storageFactory, config, regionResolver, clusterManager, ec2Service,
+                oidcService, accessEntries, podIdentityAssociations, addons, null);
+    }
+
+    public EksService(StorageFactory storageFactory, EmulatorConfig config,
+            RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
+            EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
-                oidcService, accessEntries, podIdentityAssociations, null);
+                oidcService, accessEntries, podIdentityAssociations, null, null);
     }
 
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
-                oidcService, accessEntries, null, null);
+                oidcService, accessEntries, null, null, null);
     }
 
     @PostConstruct
@@ -726,7 +740,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
      */
     private void markMetadataOnlyActive(Cluster cluster) {
         cluster.setStatus(ClusterStatus.ACTIVE);
-        cluster.setEndpoint("https://localhost:" + config.services().eks().apiServerBasePort());
+        String host = config.services().eks().endpointHost().filter(h -> !h.isBlank()).orElse("localhost");
+        cluster.setEndpoint("https://" + host + ":" + config.services().eks().apiServerBasePort());
     }
 
     public Optional<Cluster> findAuthenticationCluster(String accountId, String name) {
@@ -742,6 +757,20 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             cluster.setLogging(defaultLogging());
         }
         return cluster;
+    }
+
+    public Update updateClusterConfig(String name, UpdateClusterConfigRequest request) {
+        Cluster cluster = describeCluster(name);
+        Update update = clusterUpdates.updateClusterConfig(cluster, request);
+        storage.put(name, cluster);
+        return update;
+    }
+
+    public Update updateClusterVersion(String name, UpdateClusterVersionRequest request) {
+        Cluster cluster = describeCluster(name);
+        Update update = clusterUpdates.updateClusterVersion(cluster, request);
+        storage.put(name, cluster);
+        return update;
     }
 
     @Override
@@ -846,6 +875,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
             if (addons != null) {
                 addons.deleteClusterAddons(cluster);
+            }
+            if (clusterUpdates != null) {
+                clusterUpdates.deleteClusterUpdates(cluster);
             }
             synchronized (clustersBeingDeleted) {
                 storage.delete(name);

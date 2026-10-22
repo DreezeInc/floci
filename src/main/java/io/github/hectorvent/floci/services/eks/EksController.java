@@ -14,6 +14,8 @@ import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
 import io.github.hectorvent.floci.services.eks.model.Update;
 import io.github.hectorvent.floci.services.eks.model.UpdateAddonRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterConfigRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterVersionRequest;
 import io.github.hectorvent.floci.services.eks.model.UpdatePodIdentityAssociationRequest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -46,15 +48,17 @@ public class EksController {
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final EksClusterUpdateService clusterUpdates;
 
     @Inject
     public EksController(EksService eksService, EksAccessEntryService accessEntries,
                          EksPodIdentityAssociationService podIdentityAssociations,
-                         EksAddonService addons) {
+                         EksAddonService addons, EksClusterUpdateService clusterUpdates) {
         this.eksService = eksService;
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.clusterUpdates = clusterUpdates;
     }
 
     @POST
@@ -243,6 +247,35 @@ public class EksController {
         return Response.ok(Map.of("update", update)).build();
     }
 
+    @POST
+    @Path("/clusters/{name}/update-config")
+    public Response updateClusterConfig(@PathParam("name") String name, UpdateClusterConfigRequest request) {
+        Update update = eksService.updateClusterConfig(name, request);
+        return Response.ok(Map.of("update", update)).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/updates")
+    public Response updateClusterVersion(@PathParam("name") String name, UpdateClusterVersionRequest request) {
+        Update update = eksService.updateClusterVersion(name, request);
+        return Response.ok(Map.of("update", update)).build();
+    }
+
+    @GET
+    @Path("/clusters/{name}/updates")
+    public Response listUpdates(@PathParam("name") String name,
+                                @QueryParam("addonName") String addonName,
+                                @QueryParam("nodegroupName") String nodegroupName,
+                                @QueryParam("maxResults") String maxResults,
+                                @QueryParam("nextToken") String nextToken) {
+        Cluster cluster = eksService.describeCluster(name);
+        EksClusterUpdateService.Page page = clusterUpdates.listUpdates(cluster, addonName, nodegroupName,
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        return Response.ok(page.nextToken() == null
+                ? Map.of("updateIds", page.updateIds())
+                : Map.of("updateIds", page.updateIds(), "nextToken", page.nextToken())).build();
+    }
+
     @GET
     @Path("/clusters/{name}/updates/{updateId}")
     public Response describeUpdate(@PathParam("name") String name,
@@ -250,7 +283,7 @@ public class EksController {
                                    @QueryParam("addonName") String addonName,
                                    @QueryParam("nodegroupName") String nodegroupName) {
         Cluster cluster = eksService.describeCluster(name);
-        Update update = addons.describeUpdate(cluster, updateId, addonName);
+        Update update = clusterUpdates.describeUpdate(cluster, updateId, addonName, nodegroupName);
         return Response.ok(Map.of("update", update)).build();
     }
 

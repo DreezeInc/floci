@@ -572,7 +572,8 @@ public class EksClusterManager
                 config.services().eks().disableCni(),
                 defaultStorageClass,
                 serviceCidr,
-                clusterCidr);
+                clusterCidr,
+                config.services().eks().endpointHost());
 
         EksNodeCapacity.Limits nodeLimits = resolveNodeCapacity(cluster);
         if (nodeLimits != null) {
@@ -917,7 +918,7 @@ public class EksClusterManager
     private void applyEndpoints(Cluster cluster, String containerName, int hostPort, ContainerInfo info) {
         cluster.setEndpoint(resolvePublicEndpoint(
                 containerDetector.isRunningInContainer(), config.services().eks().endpointMode(),
-                containerName, hostPort));
+                containerName, hostPort, config.services().eks().endpointHost()));
 
         if (containerDetector.isRunningInContainer()) {
             ContainerLifecycleManager.EndpointInfo ep = info.getEndpoint(K3S_API_SERVER_PORT);
@@ -1434,9 +1435,15 @@ public class EksClusterManager
      */
     static List<String> buildServerArgs(boolean disableCni, boolean defaultStorageClass,
             String serviceCidr, String clusterCidr) {
+        return buildServerArgs(disableCni, defaultStorageClass, serviceCidr, clusterCidr, Optional.empty());
+    }
+
+    static List<String> buildServerArgs(boolean disableCni, boolean defaultStorageClass,
+            String serviceCidr, String clusterCidr, Optional<String> endpointHost) {
         List<String> serverArgs = new ArrayList<>(List.of("server",
                 "--disable=traefik",
                 "--tls-san=localhost"));
+        endpointHost.filter(host -> !host.isBlank()).ifPresent(host -> serverArgs.add("--tls-san=" + host));
         if (!defaultStorageClass) {
             serverArgs.add("--disable=local-storage");
         }
@@ -1516,6 +1523,15 @@ public class EksClusterManager
      */
     static String resolvePublicEndpoint(boolean inContainer, String endpointMode,
                                         String containerName, int hostPort) {
+        return resolvePublicEndpoint(inContainer, endpointMode, containerName, hostPort, Optional.empty());
+    }
+
+    static String resolvePublicEndpoint(boolean inContainer, String endpointMode,
+                                        String containerName, int hostPort, Optional<String> endpointHost) {
+        Optional<String> host = endpointHost.filter(h -> !h.isBlank());
+        if (host.isPresent()) {
+            return "https://" + host.get() + ":" + hostPort;
+        }
         if (inContainer && ENDPOINT_MODE_NETWORK.equalsIgnoreCase(endpointMode)) {
             return "https://" + containerName + ":" + K3S_API_SERVER_PORT;
         }
