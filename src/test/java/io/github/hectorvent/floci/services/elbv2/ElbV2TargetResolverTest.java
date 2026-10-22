@@ -62,6 +62,28 @@ class ElbV2TargetResolverTest {
     }
 
     @Test
+    void ipTargetConnectsWhereItsRouteNames() {
+        TargetGroup targetGroup = new TargetGroup();
+        targetGroup.setTargetType("ip");
+        ElbV2IpTargets ipTargets = (group, ip, port) -> new ElbV2IpTargets.Route("172.17.0.3", 20000);
+
+        assertEquals(new ElbV2IpTargets.Route("172.17.0.3", 20000),
+                ElbV2TargetResolver.route(ipTargets, targetGroup, "10.42.0.12", 8080));
+    }
+
+    @Test
+    void instanceTargetConnectsDirectlyWithoutAskingForARoute() {
+        TargetGroup targetGroup = new TargetGroup();
+        targetGroup.setTargetType("instance");
+        ElbV2IpTargets ipTargets = (group, ip, port) -> {
+            throw new AssertionError("an instance target has no route");
+        };
+
+        assertEquals(new ElbV2IpTargets.Route("172.18.0.42", 8080),
+                ElbV2TargetResolver.route(ipTargets, targetGroup, "172.18.0.42", 8080));
+    }
+
+    @Test
     void checkedAddressReturnsAnIpLiteralForLoopbackAndPrivateTargets() throws IOException {
         assertEquals("127.0.0.1", ElbV2TargetResolver.resolveCheckedAddress("127.0.0.1"));
         assertEquals("10.0.0.12", ElbV2TargetResolver.resolveCheckedAddress("10.0.0.12"));

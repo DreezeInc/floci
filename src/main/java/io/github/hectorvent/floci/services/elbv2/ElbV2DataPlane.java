@@ -86,6 +86,9 @@ public class ElbV2DataPlane {
     Ec2Service ec2Service;
 
     @Inject
+    ElbV2IpTargets ipTargets;
+
+    @Inject
     ObjectMapper objectMapper;
 
     private final Map<Integer, HttpServer> servers = new ConcurrentHashMap<>();
@@ -469,13 +472,25 @@ public class ElbV2DataPlane {
         TargetDescription target = candidates.get(idx);
         int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
         String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        if (!"ip".equals(tg.getTargetType())) {
+            forwardTo(req, new ElbV2IpTargets.Route(host, targetPort), host, targetPort, listenerArn, region);
+            return;
+        }
+        req.pause();
+        vertx.<ElbV2IpTargets.Route>executeBlocking(() -> ElbV2TargetResolver.route(ipTargets, tg, host, targetPort))
+                .onSuccess(route -> forwardTo(req, route, host, targetPort, listenerArn, region))
+                .onFailure(err -> rejectTarget(req, host, err));
+    }
+
+    private void forwardTo(HttpServerRequest req, ElbV2IpTargets.Route route, String host, int port,
+                           String listenerArn, String region) {
         boolean preserveHostHeader = Boolean.parseBoolean(
                 loadBalancerAttribute(listenerArn, region, PRESERVE_HOST_HEADER_ATTRIBUTE));
         if (isWebSocketUpgrade(req)) {
-            proxyUpgrade(req, host, targetPort, preserveHostHeader, idleTimeoutMillis(listenerArn, region));
+            proxyUpgrade(req, route, host, port, preserveHostHeader, idleTimeoutMillis(listenerArn, region));
             return;
         }
-        proxyRequest(req, host, targetPort, preserveHostHeader);
+        proxyRequest(req, route, host, port, preserveHostHeader);
     }
 
     private String loadBalancerAttribute(String listenerArn, String region, String key) {
@@ -694,19 +709,20 @@ public class ElbV2DataPlane {
         return tuples.get(tuples.size() - 1).getTargetGroupArn();
     }
 
-    private void proxyRequest(io.vertx.core.http.HttpServerRequest req, String host, int port,
-                              boolean preserveHostHeader) {
+    private void proxyRequest(io.vertx.core.http.HttpServerRequest req, ElbV2IpTargets.Route route,
+                              String host, int port, boolean preserveHostHeader) {
         req.pause();
-        if (ElbV2TargetResolver.isIpLiteral(host)) {
+        if (ElbV2TargetResolver.isIpLiteral(route.host())) {
             try {
-                proxyRequestTo(req, ElbV2TargetResolver.resolveCheckedAddress(host), host, port, preserveHostHeader);
+                proxyRequestTo(req, ElbV2TargetResolver.resolveCheckedAddress(route.host()), route.port(),
+                        host, port, preserveHostHeader);
             } catch (IOException e) {
                 rejectTarget(req, host, e);
             }
             return;
         }
-        vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
-                .onSuccess(address -> proxyRequestTo(req, address, host, port, preserveHostHeader))
+        vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(route.host()))
+                .onSuccess(address -> proxyRequestTo(req, address, route.port(), host, port, preserveHostHeader))
                 .onFailure(err -> rejectTarget(req, host, err));
     }
 
@@ -716,11 +732,11 @@ public class ElbV2DataPlane {
         req.response().setStatusCode(503).end("Service unavailable");
     }
 
-    private void proxyRequestTo(HttpServerRequest req, String address, String host, int port,
+    private void proxyRequestTo(HttpServerRequest req, String address, int addressPort, String host, int port,
                                 boolean preserveHostHeader) {
         RequestOptions opts = new RequestOptions()
                 .setHost(address)
-                .setPort(port)
+                .setPort(addressPort)
                 .setURI(req.uri())
                 .setMethod(req.method());
         proxyClient.request(opts)
@@ -804,20 +820,20 @@ public class ElbV2DataPlane {
         return false;
     }
 
-    private void proxyUpgrade(HttpServerRequest req, String host, int port, boolean preserveHostHeader,
-                              long idleTimeoutMillis) {
+    private void proxyUpgrade(HttpServerRequest req, ElbV2IpTargets.Route route, String host, int port,
+                              boolean preserveHostHeader, long idleTimeoutMillis) {
         req.pause();
-        if (ElbV2TargetResolver.isIpLiteral(host)) {
+        if (ElbV2TargetResolver.isIpLiteral(route.host())) {
             try {
-                proxyUpgradeTo(req, ElbV2TargetResolver.resolveCheckedAddress(host), host, port,
-                        preserveHostHeader, idleTimeoutMillis);
+                proxyUpgradeTo(req, ElbV2TargetResolver.resolveCheckedAddress(route.host()), route.port(),
+                        host, port, preserveHostHeader, idleTimeoutMillis);
             } catch (IOException e) {
                 rejectTarget(req, host, e);
             }
             return;
         }
-        vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
-                .onSuccess(address -> proxyUpgradeTo(req, address, host, port, preserveHostHeader,
+        vertx.<String>executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(route.host()))
+                .onSuccess(address -> proxyUpgradeTo(req, address, route.port(), host, port, preserveHostHeader,
                         idleTimeoutMillis))
                 .onFailure(err -> rejectTarget(req, host, err));
     }
@@ -827,11 +843,11 @@ public class ElbV2DataPlane {
      * relays that answer and joins the two connections into a byte tunnel. Any other answer means
      * the target refused the upgrade and is relayed as an ordinary response.
      */
-    private void proxyUpgradeTo(HttpServerRequest req, String address, String host, int port,
+    private void proxyUpgradeTo(HttpServerRequest req, String address, int addressPort, String host, int port,
                                 boolean preserveHostHeader, long idleTimeoutMillis) {
         RequestOptions opts = new RequestOptions()
                 .setHost(address)
-                .setPort(port)
+                .setPort(addressPort)
                 .setURI(req.uri())
                 .setMethod(req.method());
         proxyClient.request(opts)

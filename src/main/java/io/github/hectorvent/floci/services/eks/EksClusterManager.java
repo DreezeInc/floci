@@ -111,7 +111,7 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class EksClusterManager
         implements ClusterNodeInstanceProvider, VpcRouteTableListener, DnsClientVpcSource,
-        DnsRecordSource, DnsForwardingRuleSource, EbsCsiNodes {
+        DnsRecordSource, DnsForwardingRuleSource, EbsCsiNodes, EksPodNetworks {
 
     private static final Logger LOG = Logger.getLogger(EksClusterManager.class);
     private static final int K3S_API_SERVER_PORT = 6443;
@@ -251,6 +251,25 @@ public class EksClusterManager
             ebsCsiNode(clusterKey).ifPresent(nodes::add);
         }
         return nodes;
+    }
+
+    @Override
+    public List<EksPodNetwork> podNetworks() {
+        List<EksPodNetwork> networks = new ArrayList<>();
+        clusterNodeInstances.forEach((clusterKey, record) -> {
+            Cluster cluster = activeClusters.get(clusterKey);
+            Instance node = record.instance();
+            if (cluster == null || node == null || node.getDockerContainerId() == null
+                    || node.getDockerContainerId().isBlank()) {
+                return;
+            }
+            String podCidr = cluster.getPodCidr() != null && !cluster.getPodCidr().isBlank()
+                    ? cluster.getPodCidr()
+                    : DEFAULT_POD_CIDR;
+            networks.add(new EksPodNetwork(record.accountId(), record.region(), node.getVpcId(), podCidr,
+                    node.getDockerContainerId(), node.getPrivateIpAddress()));
+        });
+        return networks;
     }
 
     private Optional<EbsCsiNode> ebsCsiNode(String clusterKey) {

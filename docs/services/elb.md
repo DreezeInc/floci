@@ -88,6 +88,7 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 - Load balancers are created in `active` state.
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Instance targets are resolved through EC2 instance private addresses so local load balancer traffic can reach containers.
+- An `ip` target that is a pod address of a running EKS cluster in the target group's VPC is reached through a port that Floci forwards on the cluster's node container. See [EKS](eks.md#load-balancer-targets). Every other `ip` target is reached at its own address.
 - Target health starts in `initial` state with reason `Elb.RegistrationInProgress` and is updated by Floci's health checker when monitoring is active.
 - Health checks probe the target group's `HealthCheckPort` when it is a port number, and each target's own port when it is `traffic-port` (the default).
 - Each `CreateListener` automatically creates an immutable default rule (`priority=default`, `isDefault=true`). This rule cannot be deleted; use `ModifyListener` to change its action.

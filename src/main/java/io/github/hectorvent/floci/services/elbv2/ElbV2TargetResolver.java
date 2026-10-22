@@ -41,6 +41,17 @@ final class ElbV2TargetResolver {
         return targetId;
     }
 
+    /**
+     * Where to connect for a target whose host {@link #resolveHost} already resolved. Only an
+     * {@code ip} target can sit behind a forward, so every other target type connects directly.
+     */
+    static ElbV2IpTargets.Route route(ElbV2IpTargets ipTargets, TargetGroup targetGroup, String host, int port) {
+        if (targetGroup != null && "ip".equals(targetGroup.getTargetType()) && ipTargets != null) {
+            return ipTargets.reach(targetGroup, host, port);
+        }
+        return new ElbV2IpTargets.Route(host, port);
+    }
+
     /** Resolves once, rejects metadata addresses, and returns the address to connect to instead of the name. */
     static String resolveCheckedAddress(String host) throws IOException {
         InetAddress[] addresses = SsrfProtection.rejectMetadataAddresses(InetAddress.getAllByName(host), host);

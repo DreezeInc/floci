@@ -641,6 +641,10 @@ For workloads written for EBS, set `floci.services.eks.emulate-ebs-storage: true
 
 The gp2 StorageClass names the CSI driver rather than the in-tree `kubernetes.io/aws-ebs` EKS ships: CSI migration makes the controller manager annotate every in-tree EBS claim for `ebs.csi.aws.com`, and an external provisioner only serves classes that name it. Both `Immediate` and `WaitForFirstConsumer` binding work. Volumes carry no topology, so a PV does not pin its pods to a zone. Raw block volumes, multi-node access modes, volume expansion and CSI VolumeSnapshots are not supported.
 
+#### Load balancer targets
+
+The AWS Load Balancer Controller registers pod addresses as `ip` targets. Pod addresses exist only inside the cluster's k3s container, so the ELBv2 data plane cannot connect to them directly. When a request or a health check goes to an `ip` target, Floci looks for a running cluster in the target group's account, region and VPC whose pod CIDR holds the address. If it finds one, Floci adds an iptables DNAT rule in the `FLOCI-ELB-TARGETS` chain of the node container. The rule forwards one node port, from 20000 up, to the pod address and port. Floci then connects to that node port. Each pod address and port keeps its node port while Floci runs. Floci must be able to reach the node container's address, so it has to run in Docker or on a Linux host.
+
 ## Joining EC2 instances as cluster nodes
 
 Floci allows EC2 instances to join an EKS cluster as Kubernetes worker nodes. Launching an instance via `RunInstances` with user data targeting a cluster automatically registers a matching Kubernetes node.

@@ -194,6 +194,24 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
+    void ipTargetIsProbedAtTheAddressItsRouteNames() throws Exception {
+        HttpServer server = startServer(200);
+        try {
+            ElbV2HealthChecker checker = healthChecker(
+                    (group, ip, port) -> new ElbV2IpTargets.Route("127.0.0.1", server.actualPort()));
+            TargetGroup targetGroup = targetGroup(8080, "200", 1, 1);
+            TargetDescription target = target("10.42.0.9", 8080);
+
+            checker.addTargets(targetGroup.getTargetGroupArn(), List.of(target), targetGroup);
+
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getHealth(targetGroup.getTargetGroupArn(), target.getId(), target.getPort()).state()));
+        } finally {
+            close(server);
+        }
+    }
+
+    @Test
     void registrationStateCarriesAwsReasonUntilFirstProbeCompletes() {
         ElbV2HealthChecker checker = healthChecker();
 
@@ -208,9 +226,13 @@ class ElbV2HealthCheckerTest {
     }
 
     private ElbV2HealthChecker healthChecker() {
+        return healthChecker(new DirectElbV2IpTargets());
+    }
+
+    private ElbV2HealthChecker healthChecker(ElbV2IpTargets ipTargets) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().elbv2().mock()).thenReturn(false);
-        return new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class));
+        return new ElbV2HealthChecker(vertx, config, mock(Ec2Service.class), ipTargets);
     }
 
     private HttpServer startServer(int statusCode) throws Exception {

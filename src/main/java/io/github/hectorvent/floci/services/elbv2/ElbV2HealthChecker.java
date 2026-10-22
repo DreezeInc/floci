@@ -27,6 +27,7 @@ public class ElbV2HealthChecker implements Resettable {
     private final Vertx vertx;
     private final EmulatorConfig config;
     private final Ec2Service ec2Service;
+    private final ElbV2IpTargets ipTargets;
 
     // tgArn → (targetKey → TargetState)
     private final Map<String, Map<String, TargetState>> states = new ConcurrentHashMap<>();
@@ -34,10 +35,12 @@ public class ElbV2HealthChecker implements Resettable {
     private final Map<String, Long> timers = new ConcurrentHashMap<>();
 
     @Inject
-    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service) {
+    public ElbV2HealthChecker(Vertx vertx, EmulatorConfig config, Ec2Service ec2Service,
+                              ElbV2IpTargets ipTargets) {
         this.vertx = vertx;
         this.config = config;
         this.ec2Service = ec2Service;
+        this.ipTargets = ipTargets;
     }
 
     public static int effectivePort(TargetDescription target, TargetGroup tg) {
@@ -154,7 +157,8 @@ public class ElbV2HealthChecker implements Resettable {
             int probePort = healthCheckPort(tg, port);
 
             vertx.executeBlocking(() -> {
-                return probe(host, probePort, path, timeout);
+                ElbV2IpTargets.Route route = ElbV2TargetResolver.route(ipTargets, tg, host, probePort);
+                return probe(route.host(), route.port(), path, timeout);
             }).onSuccess(statusCode -> {
                 boolean success = matchesStatusCode(statusCode, matcher);
                 if (success) {
