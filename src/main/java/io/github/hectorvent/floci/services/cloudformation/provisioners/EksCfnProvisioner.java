@@ -1,18 +1,25 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.eks.model.AccessConfig;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
+import io.github.hectorvent.floci.services.eks.model.CreateNodeGroupRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
+import io.github.hectorvent.floci.services.eks.model.NodegroupScalingConfig;
+import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -154,18 +161,14 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
 
     private void provisionNodegroup(StackResource r, JsonNode props, ProvisionContext ctx) {
         String clusterName = ctx.resolveOptional(props, "ClusterName");
-        Nodegroup request = new Nodegroup();
+        CreateNodeGroupRequest request = nodegroupRequest(props, ctx);
         String nodegroupName = ctx.resolveOptional(props, "NodegroupName");
         if (nodegroupName == null || nodegroupName.isBlank()) {
             nodegroupName = ctx.generatePhysicalName(r.getLogicalId(), 100, false);
         }
         request.setNodegroupName(nodegroupName);
-        request.setNodeRole(ctx.resolveOptional(props, "NodeRole"));
-        request.setSubnets(ctx.resolveStringList(props, "Subnets"));
 
         Nodegroup nodegroup = eksService.createNodeGroup(clusterName, request);
-        // The first nodegroup may replace the k3s node for its instance type; the cluster is CREATING until it is back.
-        EksClusterReadiness.awaitActive(eksService, clusterName, clusterActiveTimeout, clusterActivePoll);
         // Ref (and the readOnly Id) is the composite the registry primary identifier declares,
         // clusterName/nodegroupName, matching AWS. The plain names stay as their own attributes:
         // ClusterName and NodegroupName back delete() and Fn::GetAtt.
@@ -176,6 +179,181 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("NodegroupName", nodegroup.getNodegroupName());
         if (nodegroup.getNodegroupArn() != null) {
             r.getAttributes().put("Arn", nodegroup.getNodegroupArn());
+        }
+        r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+        // The first nodegroup may replace the k3s node for its instance type; the cluster is CREATING until it is back.
+        EksClusterReadiness.awaitActive(eksService, clusterName, clusterActiveTimeout, clusterActivePoll);
+        if (nodegroup.getStatus() == NodegroupStatus.CREATE_FAILED) {
+            throw new AwsException("ResourceNotReady", "Nodegroup " + id + " did not become ACTIVE: "
+                    + nodegroup.getStatus() + " " + nodegroup.getHealth(), 400);
+        }
+        r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
+    }
+
+    /** ForceUpdateEnabled is left out: it only steers updates and CreateNodegroup has no counterpart. */
+    private static CreateNodeGroupRequest nodegroupRequest(JsonNode props, ProvisionContext ctx) {
+        CreateNodeGroupRequest request = new CreateNodeGroupRequest();
+        request.setNodeRole(ctx.resolveOptional(props, "NodeRole"));
+        request.setSubnets(ctx.resolveStringList(props, "Subnets"));
+        request.setVersion(optionalText(props, "Version", ctx));
+        request.setReleaseVersion(optionalText(props, "ReleaseVersion", ctx));
+        request.setAmiType(optionalText(props, "AmiType", ctx));
+        request.setCapacityType(optionalText(props, "CapacityType", ctx));
+        request.setDiskSize(optionalInteger(props, "DiskSize", ctx));
+        if (props != null && props.hasNonNull("InstanceTypes")) {
+            request.setInstanceTypes(ctx.resolveStringList(props, "InstanceTypes"));
+        }
+        request.setScalingConfig(scalingConfig(resolvedObject(props, "ScalingConfig", ctx), ctx));
+        request.setUpdateConfig(updateConfig(resolvedObject(props, "UpdateConfig", ctx), ctx));
+        request.setRemoteAccess(remoteAccess(resolvedObject(props, "RemoteAccess", ctx), ctx));
+        request.setTaints(taints(props, ctx));
+        request.setLaunchTemplate(launchTemplate(resolvedObject(props, "LaunchTemplate", ctx), ctx));
+        request.setNodeRepairConfig(nodeRepairConfig(resolvedObject(props, "NodeRepairConfig", ctx), ctx));
+        request.setWarmPoolConfig(warmPoolConfig(resolvedObject(props, "WarmPoolConfig", ctx), ctx));
+        if (props != null && props.hasNonNull("Labels")) {
+            request.setLabels(ctx.resolveTags(props, "Labels"));
+        }
+        request.setTags(ctx.resolveTags(props, "Tags"));
+        return request;
+    }
+
+    private static NodegroupScalingConfig scalingConfig(JsonNode node, ProvisionContext ctx) {
+        if (node == null) {
+            return null;
+        }
+        NodegroupScalingConfig config = new NodegroupScalingConfig();
+        config.setMinSize(optionalInteger(node, "MinSize", ctx));
+        config.setMaxSize(optionalInteger(node, "MaxSize", ctx));
+        config.setDesiredSize(optionalInteger(node, "DesiredSize", ctx));
+        return config;
+    }
+
+    private static Map<String, Object> updateConfig(JsonNode node, ProvisionContext ctx) {
+        if (node == null) {
+            return null;
+        }
+        Map<String, Object> config = new LinkedHashMap<>();
+        putIfPresent(config, "maxUnavailable", optionalInteger(node, "MaxUnavailable", ctx));
+        putIfPresent(config, "maxUnavailablePercentage", optionalInteger(node, "MaxUnavailablePercentage", ctx));
+        putIfPresent(config, "updateStrategy", optionalText(node, "UpdateStrategy", ctx));
+        return config;
+    }
+
+    private static Map<String, Object> remoteAccess(JsonNode node, ProvisionContext ctx) {
+        if (node == null) {
+            return null;
+        }
+        Map<String, Object> access = new LinkedHashMap<>();
+        putIfPresent(access, "ec2SshKey", optionalText(node, "Ec2SshKey", ctx));
+        if (node.hasNonNull("SourceSecurityGroups")) {
+            access.put("sourceSecurityGroups", ctx.resolveStringList(node, "SourceSecurityGroups"));
+        }
+        return access;
+    }
+
+    private static List<Object> taints(JsonNode props, ProvisionContext ctx) {
+        if (props == null || !props.hasNonNull("Taints")) {
+            return null;
+        }
+        JsonNode resolved = ctx.engine().resolveNode(props.get("Taints"));
+        if (resolved == null || !resolved.isArray()) {
+            return null;
+        }
+        List<Object> taints = new ArrayList<>();
+        for (JsonNode taint : resolved) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            putIfPresent(entry, "key", optionalText(taint, "Key", ctx));
+            putIfPresent(entry, "value", optionalText(taint, "Value", ctx));
+            putIfPresent(entry, "effect", optionalText(taint, "Effect", ctx));
+            taints.add(entry);
+        }
+        return taints;
+    }
+
+    private static Map<String, Object> launchTemplate(JsonNode node, ProvisionContext ctx) {
+        if (node == null) {
+            return null;
+        }
+        Map<String, Object> spec = new LinkedHashMap<>();
+        putIfPresent(spec, "id", optionalText(node, "Id", ctx));
+        putIfPresent(spec, "name", optionalText(node, "Name", ctx));
+        putIfPresent(spec, "version", optionalText(node, "Version", ctx));
+        return spec;
+    }
+
+    private static Map<String, Object> nodeRepairConfig(JsonNode node, ProvisionContext ctx) {
+        if (node == null) {
+            return null;
+        }
+        Map<String, Object> config = new LinkedHashMap<>();
+        putIfPresent(config, "enabled", optionalBoolean(optionalText(node, "Enabled", ctx)));
+        putIfPresent(config, "maxParallelNodesRepairedCount",
+                optionalInteger(node, "MaxParallelNodesRepairedCount", ctx));
+        putIfPresent(config, "maxParallelNodesRepairedPercentage",
+                optionalInteger(node, "MaxParallelNodesRepairedPercentage", ctx));
+        putIfPresent(config, "maxUnhealthyNodeThresholdCount",
+                optionalInteger(node, "MaxUnhealthyNodeThresholdCount", ctx));
+        putIfPresent(config, "maxUnhealthyNodeThresholdPercentage",
+                optionalInteger(node, "MaxUnhealthyNodeThresholdPercentage", ctx));
+        JsonNode overrides = node.get("NodeRepairConfigOverrides");
+        if (overrides != null && overrides.isArray()) {
+            List<Object> entries = new ArrayList<>();
+            for (JsonNode override : overrides) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                putIfPresent(entry, "minRepairWaitTimeMins", optionalInteger(override, "MinRepairWaitTimeMins", ctx));
+                putIfPresent(entry, "nodeMonitoringCondition", optionalText(override, "NodeMonitoringCondition", ctx));
+                putIfPresent(entry, "nodeUnhealthyReason", optionalText(override, "NodeUnhealthyReason", ctx));
+                putIfPresent(entry, "repairAction", optionalText(override, "RepairAction", ctx));
+                entries.add(entry);
+            }
+            config.put("nodeRepairConfigOverrides", entries);
+        }
+        return config;
+    }
+
+    private static Map<String, Object> warmPoolConfig(JsonNode node, ProvisionContext ctx) {
+        if (node == null) {
+            return null;
+        }
+        Map<String, Object> config = new LinkedHashMap<>();
+        putIfPresent(config, "enabled", optionalBoolean(optionalText(node, "Enabled", ctx)));
+        putIfPresent(config, "maxGroupPreparedCapacity", optionalInteger(node, "MaxGroupPreparedCapacity", ctx));
+        putIfPresent(config, "minSize", optionalInteger(node, "MinSize", ctx));
+        putIfPresent(config, "poolState", optionalText(node, "PoolState", ctx));
+        putIfPresent(config, "reuseOnScaleIn", optionalBoolean(optionalText(node, "ReuseOnScaleIn", ctx)));
+        return config;
+    }
+
+    private static JsonNode resolvedObject(JsonNode props, String name, ProvisionContext ctx) {
+        if (props == null || !props.hasNonNull(name)) {
+            return null;
+        }
+        JsonNode resolved = ctx.engine().resolveNode(props.get(name));
+        return resolved != null && resolved.isObject() ? resolved : null;
+    }
+
+    /** Blank is absent: an intrinsic that chose AWS::NoValue resolves to "". */
+    private static String optionalText(JsonNode node, String name, ProvisionContext ctx) {
+        String value = ctx.resolveOptional(node, name);
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    private static Integer optionalInteger(JsonNode node, String name, ProvisionContext ctx) {
+        String value = optionalText(node, name, ctx);
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError",
+                    NODEGROUP + " " + name + " must be an integer, got '" + value + "'", 400);
+        }
+    }
+
+    private static void putIfPresent(Map<String, Object> target, String key, Object value) {
+        if (value != null) {
+            target.put(key, value);
         }
     }
 

@@ -4,6 +4,11 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.List;
+import java.util.Map;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -95,6 +100,133 @@ class CloudFormationEksIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString(nodegroupName));
+    }
+
+    @Test
+    void nodegroupKeepsEverythingItsTemplateDeclaresIncludingItsLaunchTemplate() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String clusterName = "cfn-eks-lt-" + suffix;
+        String nodegroupName = "ng-lt-" + suffix;
+        String stackName = "cfn-eks-lt-stack-" + suffix;
+        String nodeadmOnlyUserData = """
+                MIME-Version: 1.0
+                Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+                --BOUNDARY
+                Content-Type: application/node.eks.aws
+
+                ---
+                apiVersion: node.eks.aws/v1alpha1
+                kind: NodeConfig
+                spec:
+                  kubelet:
+                    config:
+                      maxPods: 110
+
+                --BOUNDARY--
+                """;
+
+        String template = """
+                {
+                  "Resources": {
+                    "Cluster": {
+                      "Type": "AWS::EKS::Cluster",
+                      "Properties": {"Name": "%s", "RoleArn": "arn:aws:iam::000000000000:role/eks-cluster-role"}
+                    },
+                    "NodeLaunchTemplate": {
+                      "Type": "AWS::EC2::LaunchTemplate",
+                      "Properties": {
+                        "LaunchTemplateData": {
+                          "UserData": "%s",
+                          "SecurityGroupIds": ["sg-0123456789abcdef0"],
+                          "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 40, "VolumeType": "gp3"}}],
+                          "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 2}
+                        }
+                      }
+                    },
+                    "Nodes": {
+                      "Type": "AWS::EKS::Nodegroup",
+                      "Properties": {
+                        "ClusterName": {"Ref": "Cluster"},
+                        "NodegroupName": "%s",
+                        "NodeRole": "arn:aws:iam::000000000000:role/eks-node-role",
+                        "Subnets": ["subnet-aaaa1111", "subnet-bbbb2222"],
+                        "LaunchTemplate": {
+                          "Id": {"Ref": "NodeLaunchTemplate"},
+                          "Version": {"Fn::GetAtt": ["NodeLaunchTemplate", "LatestVersionNumber"]}
+                        },
+                        "InstanceTypes": ["t3.medium"],
+                        "AmiType": "AL2023_x86_64_STANDARD",
+                        "CapacityType": "ON_DEMAND",
+                        "ScalingConfig": {"MinSize": 1, "MaxSize": 3, "DesiredSize": 3},
+                        "Labels": {"role": "worker"},
+                        "Tags": {"team": "platform"}
+                      }
+                    }
+                  }
+                }
+                """.formatted(clusterName,
+                Base64.getEncoder().encodeToString(nodeadmOnlyUserData.getBytes(StandardCharsets.UTF_8)),
+                nodegroupName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+        String launchTemplateId = given()
+        .when()
+            .get("/clusters/" + clusterName + "/node-groups/" + nodegroupName)
+        .then()
+            .statusCode(200)
+            .body("nodegroup.status", equalTo("ACTIVE"))
+            .body("nodegroup.amiType", equalTo("AL2023_x86_64_STANDARD"))
+            .body("nodegroup.capacityType", equalTo("ON_DEMAND"))
+            .body("nodegroup.instanceTypes", equalTo(List.of("t3.medium")))
+            .body("nodegroup.scalingConfig.minSize", equalTo(1))
+            .body("nodegroup.scalingConfig.maxSize", equalTo(3))
+            .body("nodegroup.scalingConfig.desiredSize", equalTo(3))
+            .body("nodegroup.launchTemplate.id", startsWith("lt-"))
+            .body("nodegroup.launchTemplate.version", equalTo("1"))
+            .body("nodegroup.labels", equalTo(Map.of("role", "worker")))
+            .body("nodegroup.tags", equalTo(Map.of("team", "platform")))
+            .extract().path("nodegroup.launchTemplate.id");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStackResource")
+            .formParam("StackName", stackName)
+            .formParam("LogicalResourceId", "NodeLaunchTemplate")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<PhysicalResourceId>" + launchTemplateId + "</PhysicalResourceId>"));
+
+        given()
+        .when()
+            .get("/clusters/" + clusterName)
+        .then()
+            .statusCode(200)
+            .body("cluster.status", equalTo("ACTIVE"));
     }
 
     @Test

@@ -11,7 +11,9 @@ import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
+import io.github.hectorvent.floci.services.eks.model.CreateNodeGroupRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
+import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
 import org.junit.jupiter.api.Test;
@@ -140,7 +142,7 @@ class EksCfnProvisionerTest {
         created.setNodegroupName("workers");
         created.setClusterName("prod");
         created.setNodegroupArn("arn:aws:eks:us-east-1:000000000000:nodegroup/prod/workers/1");
-        when(eks.createNodeGroup(eq("prod"), any(Nodegroup.class))).thenReturn(created);
+        when(eks.createNodeGroup(eq("prod"), any(CreateNodeGroupRequest.class))).thenReturn(created);
         Cluster creating = new Cluster();
         creating.setName("prod");
         creating.setStatus(ClusterStatus.CREATING);
@@ -265,7 +267,7 @@ class EksCfnProvisionerTest {
         created.setNodegroupName("workers");
         created.setClusterName("prod");
         created.setNodegroupArn("arn:aws:eks:us-east-1:000000000000:nodegroup/prod/workers/uuid");
-        when(eks.createNodeGroup(eq("prod"), any(Nodegroup.class))).thenReturn(created);
+        when(eks.createNodeGroup(eq("prod"), any(CreateNodeGroupRequest.class))).thenReturn(created);
 
         StackResource r = resource("AWS::EKS::Nodegroup", "Workers");
         provisioner.provision(r, props("""
@@ -280,9 +282,148 @@ class EksCfnProvisionerTest {
         assertEquals("workers", r.getAttributes().get("NodegroupName"));
         assertEquals("arn:aws:eks:us-east-1:000000000000:nodegroup/prod/workers/uuid",
                 r.getAttributes().get("Arn"));
-        ArgumentCaptor<Nodegroup> request = ArgumentCaptor.forClass(Nodegroup.class);
+        assertNull(r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+        ArgumentCaptor<CreateNodeGroupRequest> request = ArgumentCaptor.forClass(CreateNodeGroupRequest.class);
         verify(eks).createNodeGroup(eq("prod"), request.capture());
+        assertEquals("workers", request.getValue().getNodegroupName());
+        assertEquals("arn:aws:iam::000000000000:role/nodes", request.getValue().getNodeRole());
         assertEquals(List.of("subnet-1", "subnet-2"), request.getValue().getSubnets());
+    }
+
+    @Test
+    void nodegroupPassesEveryDeclaredPropertyToCreateNodegroup() throws Exception {
+        when(eks.createNodeGroup(eq("demo-cluster"), any(CreateNodeGroupRequest.class)))
+                .thenReturn(nodegroup("demo-cluster", "workers", NodegroupStatus.ACTIVE));
+
+        provisioner.provision(resource("AWS::EKS::Nodegroup", "Workers"), props("""
+                {"ClusterName": "demo-cluster", "NodegroupName": "workers",
+                 "NodeRole": "arn:aws:iam::000000000000:role/nodes", "Subnets": ["subnet-1"],
+                 "Version": "1.31", "ReleaseVersion": "1.31.0-20250101", "AmiType": "AL2023_x86_64_STANDARD",
+                 "CapacityType": "SPOT", "DiskSize": 50, "InstanceTypes": ["t3.medium", "t3.large"],
+                 "ScalingConfig": {"MinSize": 1, "MaxSize": 3, "DesiredSize": "2"},
+                 "UpdateConfig": {"MaxUnavailablePercentage": 25, "UpdateStrategy": "MINIMAL"},
+                 "RemoteAccess": {"Ec2SshKey": "demo-key", "SourceSecurityGroups": ["sg-ssh"]},
+                 "Taints": [{"Key": "dedicated", "Value": "gpu", "Effect": "NO_SCHEDULE"},
+                            {"Key": "spot", "Effect": "PREFER_NO_SCHEDULE"}],
+                 "LaunchTemplate": {"Name": "demo-nodes", "Version": 3},
+                 "NodeRepairConfig": {"Enabled": true, "MaxUnhealthyNodeThresholdPercentage": 20,
+                                      "NodeRepairConfigOverrides": [{"MinRepairWaitTimeMins": 10,
+                                          "NodeMonitoringCondition": "AcceleratedHardwareReady",
+                                          "NodeUnhealthyReason": "NvidiaXID13Error", "RepairAction": "Reboot"}]},
+                 "WarmPoolConfig": {"Enabled": "true", "MinSize": 2, "PoolState": "STOPPED", "ReuseOnScaleIn": false},
+                 "ForceUpdateEnabled": true,
+                 "Labels": {"role": "worker", "tier": 1},
+                 "Tags": {"team": "platform"}}
+                """), ctx());
+
+        ArgumentCaptor<CreateNodeGroupRequest> captured = ArgumentCaptor.forClass(CreateNodeGroupRequest.class);
+        verify(eks).createNodeGroup(eq("demo-cluster"), captured.capture());
+        CreateNodeGroupRequest request = captured.getValue();
+        assertEquals("1.31", request.getVersion());
+        assertEquals("1.31.0-20250101", request.getReleaseVersion());
+        assertEquals("AL2023_x86_64_STANDARD", request.getAmiType());
+        assertEquals("SPOT", request.getCapacityType());
+        assertEquals(50, request.getDiskSize());
+        assertEquals(List.of("t3.medium", "t3.large"), request.getInstanceTypes());
+        assertEquals(1, request.getScalingConfig().getMinSize());
+        assertEquals(3, request.getScalingConfig().getMaxSize());
+        assertEquals(2, request.getScalingConfig().getDesiredSize());
+        assertEquals(Map.of("maxUnavailablePercentage", 25, "updateStrategy", "MINIMAL"), request.getUpdateConfig());
+        assertEquals(Map.of("ec2SshKey", "demo-key", "sourceSecurityGroups", List.of("sg-ssh")),
+                request.getRemoteAccess());
+        assertEquals(List.of(Map.of("key", "dedicated", "value", "gpu", "effect", "NO_SCHEDULE"),
+                Map.of("key", "spot", "effect", "PREFER_NO_SCHEDULE")), request.getTaints());
+        assertEquals(Map.of("name", "demo-nodes", "version", "3"), request.getLaunchTemplate());
+        assertEquals(Map.of("enabled", true, "maxUnhealthyNodeThresholdPercentage", 20,
+                "nodeRepairConfigOverrides", List.of(Map.of("minRepairWaitTimeMins", 10,
+                        "nodeMonitoringCondition", "AcceleratedHardwareReady",
+                        "nodeUnhealthyReason", "NvidiaXID13Error", "repairAction", "Reboot"))),
+                request.getNodeRepairConfig());
+        assertEquals(Map.of("enabled", true, "minSize", 2, "poolState", "STOPPED", "reuseOnScaleIn", false),
+                request.getWarmPoolConfig());
+        assertEquals(Map.of("role", "worker", "tier", "1"), request.getLabels());
+        assertEquals(Map.of("team", "platform"), request.getTags());
+    }
+
+    @Test
+    void nodegroupLaunchTemplateFromIntrinsicsIsPassedAsTheResolvedStrings() throws Exception {
+        when(eks.createNodeGroup(eq("demo-cluster"), any(CreateNodeGroupRequest.class)))
+                .thenReturn(nodegroup("demo-cluster", "workers", NodegroupStatus.ACTIVE));
+
+        provisioner.provision(resource("AWS::EKS::Nodegroup", "Workers"), props("""
+                {"ClusterName": "demo-cluster", "NodegroupName": "workers",
+                 "NodeRole": "arn:aws:iam::000000000000:role/nodes", "Subnets": ["subnet-1"],
+                 "LaunchTemplate": {"Id": {"Ref": "NodeTemplate"},
+                                    "Version": {"Fn::GetAtt": ["NodeTemplate", "LatestVersionNumber"]}}}
+                """), ctx(Map.of("NodeTemplate", "lt-0123456789abcdef0",
+                "NodeTemplate.LatestVersionNumber", "7")));
+
+        ArgumentCaptor<CreateNodeGroupRequest> captured = ArgumentCaptor.forClass(CreateNodeGroupRequest.class);
+        verify(eks).createNodeGroup(eq("demo-cluster"), captured.capture());
+        assertEquals(Map.of("id", "lt-0123456789abcdef0", "version", "7"), captured.getValue().getLaunchTemplate());
+    }
+
+    @Test
+    void nodegroupWithOnlyRequiredPropertiesLeavesTheRestToTheServiceDefaults() throws Exception {
+        when(eks.createNodeGroup(eq("demo-cluster"), any(CreateNodeGroupRequest.class)))
+                .thenReturn(nodegroup("demo-cluster", "workers", NodegroupStatus.ACTIVE));
+
+        provisioner.provision(resource("AWS::EKS::Nodegroup", "Workers"), props("""
+                {"ClusterName": "demo-cluster", "NodegroupName": "workers",
+                 "NodeRole": "arn:aws:iam::000000000000:role/nodes", "Subnets": ["subnet-1"]}
+                """), ctx());
+
+        ArgumentCaptor<CreateNodeGroupRequest> captured = ArgumentCaptor.forClass(CreateNodeGroupRequest.class);
+        verify(eks).createNodeGroup(eq("demo-cluster"), captured.capture());
+        CreateNodeGroupRequest request = captured.getValue();
+        assertNull(request.getVersion());
+        assertNull(request.getReleaseVersion());
+        assertNull(request.getAmiType());
+        assertNull(request.getCapacityType());
+        assertNull(request.getDiskSize());
+        assertNull(request.getInstanceTypes());
+        assertNull(request.getScalingConfig());
+        assertNull(request.getUpdateConfig());
+        assertNull(request.getRemoteAccess());
+        assertNull(request.getTaints());
+        assertNull(request.getLaunchTemplate());
+        assertNull(request.getNodeRepairConfig());
+        assertNull(request.getWarmPoolConfig());
+        assertNull(request.getLabels());
+        assertEquals(Map.of(), request.getTags());
+    }
+
+    @Test
+    void nodegroupWithANonIntegerSizeFailsBeforeCreatingAnything() throws Exception {
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(
+                resource("AWS::EKS::Nodegroup", "Workers"), props("""
+                        {"ClusterName": "demo-cluster", "NodegroupName": "workers",
+                         "NodeRole": "arn:aws:iam::000000000000:role/nodes", "Subnets": ["subnet-1"],
+                         "ScalingConfig": {"DesiredSize": "three"}}
+                        """), ctx()));
+
+        assertEquals("ValidationError", failure.getErrorCode());
+        verify(eks, never()).createNodeGroup(any(), any(CreateNodeGroupRequest.class));
+    }
+
+    @Test
+    void nodegroupThatFailedToCreateFailsTheResourceAndLeavesItRollbackOwned() throws Exception {
+        Nodegroup failed = nodegroup("demo-cluster", "workers", NodegroupStatus.CREATE_FAILED);
+        failed.setHealth(Map.of("issues", List.of(Map.of("code", "NodeCreationFailure"))));
+        when(eks.createNodeGroup(eq("demo-cluster"), any(CreateNodeGroupRequest.class))).thenReturn(failed);
+
+        StackResource r = resource("AWS::EKS::Nodegroup", "Workers");
+        AwsException failure = assertThrows(AwsException.class, () -> provisioner.provision(r, props("""
+                {"ClusterName": "demo-cluster", "NodegroupName": "workers",
+                 "NodeRole": "arn:aws:iam::000000000000:role/nodes", "Subnets": ["subnet-1"]}
+                """), ctx()));
+
+        assertEquals("ResourceNotReady", failure.getErrorCode());
+        assertTrue(failure.getMessage().contains("NodeCreationFailure"), failure.getMessage());
+        assertEquals("demo-cluster/workers", r.getPhysicalId());
+        assertEquals("true", r.getAttributes().get(CfnRollback.ROLLBACK_OWNED_ATTR));
+        assertEquals("demo-cluster", r.getAttributes().get("ClusterName"));
+        assertEquals("workers", r.getAttributes().get("NodegroupName"));
     }
 
     @Test
@@ -339,9 +480,21 @@ class EksCfnProvisionerTest {
     }
 
     private ProvisionContext ctx() {
+        return ctx(Map.of());
+    }
+
+    /** {@code intrinsics} maps a Ref target, or {@code Resource.Attribute} for a GetAtt, to its value. */
+    private ProvisionContext ctx(Map<String, String> intrinsics) {
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
         when(engine.resolve(any())).thenAnswer(inv -> {
             JsonNode node = inv.getArgument(0);
+            if (node != null && node.has("Ref")) {
+                return intrinsics.get(node.get("Ref").asText());
+            }
+            if (node != null && node.has("Fn::GetAtt")) {
+                return intrinsics.get(node.get("Fn::GetAtt").get(0).asText() + "."
+                        + node.get("Fn::GetAtt").get(1).asText());
+            }
             return node == null ? null : node.asText();
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -354,6 +507,14 @@ class EksCfnProvisionerTest {
             return out;
         });
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
+    }
+
+    private static Nodegroup nodegroup(String clusterName, String name, NodegroupStatus status) {
+        Nodegroup nodegroup = new Nodegroup();
+        nodegroup.setClusterName(clusterName);
+        nodegroup.setNodegroupName(name);
+        nodegroup.setStatus(status);
+        return nodegroup;
     }
 
     private JsonNode props(String json) throws Exception {
