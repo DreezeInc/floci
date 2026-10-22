@@ -24,6 +24,7 @@ below for what's simplified.
 | `AssociateResourceShare` | Adds resource ARNs and/or principals to an existing share (`POST /associateresourceshare`) |
 | `DisassociateResourceShare` | Removes resource ARNs and/or principals from a share (`POST /disassociateresourceshare`) |
 | `ListPrincipals` | Lists principals associated with visible shares (`POST /listprincipals`) |
+| `GetResourceShareAssociations` | Lists the principal or resource associations of the caller's own shares, filterable by `resourceShareArns`, `resourceArn`, `principal` and `associationStatus`, paginated with `maxResults`/`nextToken`. A directly invited account is `ASSOCIATING` until it accepts, `ASSOCIATED` after, and `FAILED` once it rejects; a deleted share reports `DISASSOCIATED` (`POST /getresourceshareassociations`) |
 | `ListResourceSharePermissions` | Lists the permissions associated with a share: one default AWS managed permission (`AWSRAMDefaultPermission<Type>`, `AWS_MANAGED`) per distinct resource type in the share; unknown share ARN is `UnknownResourceException` (`POST /listresourcesharepermissions`) |
 | `TagResource` | Adds/overwrites tags on a resource share (`POST /tagresource`) |
 | `UntagResource` | Removes tags by key from a resource share (`POST /untagresource`) |
@@ -92,8 +93,11 @@ aws --endpoint-url http://localhost:4566 ram accept-resource-share-invitation \
   unimplemented operation falls through to S3's `/{bucket}` route and comes back as an S3
   `NoSuchBucket` XML body where the SDK expects JSON, not a modeled `UnknownOperationException`.
   If a client reports an XML parse error against a RAM call, that is the cause, not credentials.
-  `GetResourceShareAssociations` is the one most likely to be hit: Terraform's
-  `aws_ram_resource_association` and `aws_ram_principal_association` read it on every refresh.
+- Other services consult RAM for cross-account access to a shared resource. Access is granted
+  only once the recipient has accepted its invitation (or reaches the share through organization
+  sharing), the share is `ACTIVE`, and the shared ARN belongs to the share's owning account; a
+  `PENDING` invitation makes the share discoverable but grants nothing. AWS Backup uses this for
+  logically air-gapped vaults shared with another account.
 - `AssociateResourceShare`/`DisassociateResourceShare` responses synthesize one
   `resourceShareAssociation` row per requested ARN/principal rather than tracking real
   per-association status transitions (e.g. no `ASSOCIATING`/`DISASSOCIATING` intermediate

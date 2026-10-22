@@ -14,6 +14,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasItems;
+import static org.hamcrest.Matchers.nullValue;
 
 /**
  * Verifies the RAM restJson1 organization-sharing opt-in:
@@ -764,5 +765,138 @@ class RamIntegrationTest {
         .then()
             .statusCode(400)
             .body("__type", equalTo("ResourceShareInvitationAlreadyAcceptedException"));
+    }
+
+    @Test
+    void getResourceShareAssociationsShowsTheOwnerItsPrincipalsAndResources() {
+        String owner = "111111111111";
+        String recipient = "222222222222";
+        String firstVault = "arn:aws:backup:us-east-1:" + owner + ":backup-vault:association-vault-1";
+        String secondVault = "arn:aws:backup:us-east-1:" + owner + ":backup-vault:association-vault-2";
+        String shareArn =
+            given()
+                .contentType("application/json")
+                .header("Authorization", authFor(owner))
+                .body("""
+                    {
+                        "name": "association-share",
+                        "allowExternalPrincipals": true,
+                        "resourceArns": ["%s", "%s"]
+                    }
+                    """.formatted(firstVault, secondVault))
+            .when()
+                .post("/createresourceshare")
+            .then()
+                .statusCode(200)
+            .extract().path("resourceShare.resourceShareArn");
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(owner))
+            .body("{ \"resourceShareArn\": \"%s\", \"principals\": [\"%s\"] }".formatted(shareArn, recipient))
+        .when()
+            .post("/associateresourceshare")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(owner))
+            .body("{ \"associationType\": \"PRINCIPAL\", \"resourceShareArns\": [\"%s\"] }".formatted(shareArn))
+        .when()
+            .post("/getresourceshareassociations")
+        .then()
+            .statusCode(200)
+            .body("resourceShareAssociations.size()", equalTo(1))
+            .body("resourceShareAssociations[0].associatedEntity", equalTo(recipient))
+            .body("resourceShareAssociations[0].associationType", equalTo("PRINCIPAL"))
+            .body("resourceShareAssociations[0].status", equalTo("ASSOCIATING"))
+            .body("resourceShareAssociations[0].resourceShareName", equalTo("association-share"));
+
+        String invitationArn =
+            given()
+                .contentType("application/json")
+                .header("Authorization", authFor(recipient))
+                .body("{ \"resourceShareArns\": [\"%s\"] }".formatted(shareArn))
+            .when()
+                .post("/getresourceshareinvitations")
+            .then()
+                .statusCode(200)
+            .extract().path("resourceShareInvitations[0].resourceShareInvitationArn");
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(recipient))
+            .body("{ \"resourceShareInvitationArn\": \"%s\" }".formatted(invitationArn))
+        .when()
+            .post("/acceptresourceshareinvitation")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(owner))
+            .body("{ \"associationType\": \"PRINCIPAL\", \"resourceShareArns\": [\"%s\"] }".formatted(shareArn))
+        .when()
+            .post("/getresourceshareassociations")
+        .then()
+            .statusCode(200)
+            .body("resourceShareAssociations[0].status", equalTo("ASSOCIATED"));
+
+        String nextToken =
+            given()
+                .contentType("application/json")
+                .header("Authorization", authFor(owner))
+                .body("{ \"associationType\": \"RESOURCE\", \"resourceShareArns\": [\"%s\"], \"maxResults\": 1 }"
+                        .formatted(shareArn))
+            .when()
+                .post("/getresourceshareassociations")
+            .then()
+                .statusCode(200)
+                .body("resourceShareAssociations.size()", equalTo(1))
+                .body("resourceShareAssociations[0].associatedEntity", equalTo(firstVault))
+                .body("resourceShareAssociations[0].status", equalTo("ASSOCIATED"))
+            .extract().path("nextToken");
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(owner))
+            .body("{ \"associationType\": \"RESOURCE\", \"resourceShareArns\": [\"%s\"], \"nextToken\": \"%s\" }"
+                    .formatted(shareArn, nextToken))
+        .when()
+            .post("/getresourceshareassociations")
+        .then()
+            .statusCode(200)
+            .body("resourceShareAssociations.size()", equalTo(1))
+            .body("resourceShareAssociations[0].associatedEntity", equalTo(secondVault))
+            .body("nextToken", nullValue());
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(recipient))
+            .body("{ \"associationType\": \"RESOURCE\", \"resourceShareArns\": [\"%s\"] }".formatted(shareArn))
+        .when()
+            .post("/getresourceshareassociations")
+        .then()
+            .statusCode(200)
+            .body("resourceShareAssociations.size()", equalTo(0));
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(owner))
+            .body("{}")
+        .when()
+            .post("/getresourceshareassociations")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterException"));
+
+        given()
+            .contentType("application/json")
+            .header("Authorization", authFor(owner))
+            .body("{ \"associationType\": \"RESOURCE\", \"nextToken\": \"not-a-token\" }")
+        .when()
+            .post("/getresourceshareassociations")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidNextTokenException"));
     }
 }

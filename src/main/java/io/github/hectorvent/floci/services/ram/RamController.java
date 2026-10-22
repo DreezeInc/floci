@@ -7,6 +7,8 @@ import com.fasterxml.jackson.databind.ObjectReader;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -14,6 +16,7 @@ import io.github.hectorvent.floci.services.iam.ServiceLinkedRoles;
 import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.ram.model.PrincipalAssociation;
 import io.github.hectorvent.floci.services.ram.model.ResourceShare;
+import io.github.hectorvent.floci.services.ram.model.ResourceShareAssociation;
 import io.github.hectorvent.floci.services.ram.model.ResourceShareInvitation;
 import io.github.hectorvent.floci.services.ram.model.SharePermission;
 import io.github.hectorvent.floci.services.ram.model.SharedResource;
@@ -48,6 +51,8 @@ import java.util.Map;
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class RamController {
+
+    private static final int MAX_RESULTS = 500;
 
     private final RamService service;
     private final ObjectMapper objectMapper;
@@ -195,6 +200,63 @@ public class RamController {
         response.set("resourceShareAssociations",
                 associationArray(updated, resourceArns, principals, "DISASSOCIATED"));
         return Response.ok(response).build();
+    }
+
+    @POST
+    @Path("/getresourceshareassociations")
+    @Consumes(MediaType.WILDCARD)
+    public Response getResourceShareAssociations(String body) {
+        JsonNode request = readTree(body);
+        List<ResourceShareAssociation> associations = service.getResourceShareAssociations(
+                regionResolver.getAccountId(),
+                textOrNull(request, "associationType"),
+                stringList(request.path("resourceShareArns")),
+                textOrNull(request, "resourceArn"),
+                textOrNull(request, "principal"),
+                textOrNull(request, "associationStatus"),
+                regionResolver.getRegion());
+        PaginatedResult<ResourceShareAssociation> page = Pagination.paginate(associations,
+                association -> association.resourceShareArn() + "\n" + association.associatedEntity(),
+                maxResults(request), textOrNull(request, "nextToken"), "resource-share-associations",
+                token -> new AwsException("InvalidNextTokenException",
+                        "The specified value for nextToken is not valid.", 400));
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode array = objectMapper.createArrayNode();
+        for (ResourceShareAssociation association : page.items()) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("resourceShareArn", association.resourceShareArn());
+            node.put("resourceShareName", association.resourceShareName());
+            node.put("associatedEntity", association.associatedEntity());
+            node.put("associationType", association.associationType());
+            node.put("status", association.status());
+            node.put("creationTime", association.creationTime().toEpochMilli() / 1000.0);
+            node.put("lastUpdatedTime", association.lastUpdatedTime().toEpochMilli() / 1000.0);
+            node.put("external", association.external());
+            array.add(node);
+        }
+        response.set("resourceShareAssociations", array);
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    private static int maxResults(JsonNode request) {
+        JsonNode node = request.path("maxResults");
+        if (node.isMissingNode() || node.isNull()) {
+            return MAX_RESULTS;
+        }
+        if (!node.canConvertToInt() || !node.isIntegralNumber()
+                || node.intValue() < 1 || node.intValue() > MAX_RESULTS) {
+            throw new AwsException("InvalidParameterException",
+                    "maxResults must be an integer between 1 and " + MAX_RESULTS + ".", 400);
+        }
+        return node.intValue();
+    }
+
+    private static String textOrNull(JsonNode request, String field) {
+        return request.hasNonNull(field) ? request.path(field).asText() : null;
     }
 
     @POST

@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.ram.model.ResourceShare;
+import io.github.hectorvent.floci.services.ram.model.ResourceShareAssociation;
 import io.github.hectorvent.floci.services.ram.model.ResourceShareInvitation;
 import io.github.hectorvent.floci.services.ram.model.SharedResource;
 import org.junit.jupiter.api.BeforeEach;
@@ -636,6 +637,115 @@ class RamServiceTest {
         }
 
         assertEquals(1, service.getResourceShareInvitations(ACCEPTER, List.of(), List.of(), "us-east-1").size());
+    }
+
+    @Test
+    void principalAssociationFollowsTheInvitationFromAssociatingToAssociated() {
+        ResourceShare share = service.createResourceShare(
+                "direct-share", List.of(ACCEPTER), List.of(TGW_ARN), true, "us-east-1", OWNER);
+
+        List<ResourceShareAssociation> pending = service.getResourceShareAssociations(
+                OWNER, "PRINCIPAL", List.of(share.getResourceShareArn()), null, null, null, "us-east-1");
+        assertEquals(1, pending.size());
+        assertEquals(ACCEPTER, pending.get(0).associatedEntity());
+        assertEquals("PRINCIPAL", pending.get(0).associationType());
+        assertEquals("ASSOCIATING", pending.get(0).status());
+
+        String invitationArn = service.getResourceShareInvitations(ACCEPTER, List.of(), List.of(), "us-east-1")
+                .get(0).resourceShareInvitationArn();
+        service.acceptResourceShareInvitation(invitationArn, ACCEPTER, "us-east-1");
+
+        List<ResourceShareAssociation> accepted = service.getResourceShareAssociations(
+                OWNER, "PRINCIPAL", List.of(), null, ACCEPTER, "ASSOCIATED", "us-east-1");
+        assertEquals(1, accepted.size());
+        assertEquals(share.getResourceShareArn(), accepted.get(0).resourceShareArn());
+    }
+
+    @Test
+    void rejectedPrincipalAssociationReportsFailed() {
+        service.createResourceShare(
+                "direct-share", List.of(ACCEPTER), List.of(TGW_ARN), false, "us-east-1", OWNER);
+        String invitationArn = service.getResourceShareInvitations(ACCEPTER, List.of(), List.of(), "us-east-1")
+                .get(0).resourceShareInvitationArn();
+        service.rejectResourceShareInvitation(invitationArn, ACCEPTER, "us-east-1");
+
+        assertEquals("FAILED", service.getResourceShareAssociations(
+                OWNER, "PRINCIPAL", List.of(), null, null, null, "us-east-1").get(0).status());
+    }
+
+    @Test
+    void resourceAssociationsAreOwnerOnlyAndFilterByResourceArn() {
+        String otherTgw = "arn:aws:ec2:us-east-1:111111111111:transit-gateway/tgw-0def";
+        service.createResourceShare(
+                "two-resources", List.of(ACCEPTER), List.of(TGW_ARN, otherTgw), false, "us-east-1", OWNER);
+
+        List<ResourceShareAssociation> filtered = service.getResourceShareAssociations(
+                OWNER, "RESOURCE", List.of(), otherTgw, null, null, "us-east-1");
+        assertEquals(1, filtered.size());
+        assertEquals(otherTgw, filtered.get(0).associatedEntity());
+        assertEquals("ASSOCIATED", filtered.get(0).status());
+
+        assertTrue(service.getResourceShareAssociations(
+                ACCEPTER, "RESOURCE", List.of(), null, null, null, "us-east-1").isEmpty());
+    }
+
+    @Test
+    void deletedShareReportsItsAssociationsDisassociated() {
+        ResourceShare share = service.createResourceShare(
+                "delete-me", List.of(ACCEPTER), List.of(TGW_ARN), false, "us-east-1", OWNER);
+        service.deleteResourceShare(share.getResourceShareArn(), OWNER, "us-east-1");
+
+        assertEquals("DISASSOCIATED", service.getResourceShareAssociations(
+                OWNER, "RESOURCE", List.of(), null, null, null, "us-east-1").get(0).status());
+        assertEquals("DISASSOCIATED", service.getResourceShareAssociations(
+                OWNER, "PRINCIPAL", List.of(), null, null, null, "us-east-1").get(0).status());
+    }
+
+    @Test
+    void associationFiltersThatDoNotMatchTheTypeAreRejected() {
+        assertInvalidParameter(() -> service.getResourceShareAssociations(
+                OWNER, null, List.of(), null, null, null, "us-east-1"));
+        assertInvalidParameter(() -> service.getResourceShareAssociations(
+                OWNER, "principal", List.of(), null, null, null, "us-east-1"));
+        assertInvalidParameter(() -> service.getResourceShareAssociations(
+                OWNER, "RESOURCE", List.of(), null, ACCEPTER, null, "us-east-1"));
+        assertInvalidParameter(() -> service.getResourceShareAssociations(
+                OWNER, "PRINCIPAL", List.of(), TGW_ARN, null, null, "us-east-1"));
+        assertInvalidParameter(() -> service.getResourceShareAssociations(
+                OWNER, "PRINCIPAL", List.of(), null, null, "DONE", "us-east-1"));
+    }
+
+    @Test
+    void sharedResourceIsGrantedOnlyAfterTheInvitationIsAccepted() {
+        ResourceShare share = service.createResourceShare(
+                "direct-share", List.of(ACCEPTER), List.of(TGW_ARN), false, "us-east-1", OWNER);
+        assertFalse(service.isResourceSharedWith(TGW_ARN, ACCEPTER));
+        assertTrue(service.resourceArnsSharedWith(ACCEPTER, "us-east-1").isEmpty());
+
+        String invitationArn = service.getResourceShareInvitations(ACCEPTER, List.of(), List.of(), "us-east-1")
+                .get(0).resourceShareInvitationArn();
+        service.acceptResourceShareInvitation(invitationArn, ACCEPTER, "us-east-1");
+
+        assertTrue(service.isResourceSharedWith(TGW_ARN, ACCEPTER));
+        assertEquals(List.of(TGW_ARN), service.resourceArnsSharedWith(ACCEPTER, "us-east-1"));
+        assertFalse(service.isResourceSharedWith(TGW_ARN, "123456789012"));
+        assertFalse(service.isResourceSharedWith(TGW_ARN, OWNER));
+        assertTrue(service.resourceArnsSharedWith(ACCEPTER, "eu-west-1").isEmpty());
+
+        service.deleteResourceShare(share.getResourceShareArn(), OWNER, "us-east-1");
+        assertFalse(service.isResourceSharedWith(TGW_ARN, ACCEPTER));
+    }
+
+    @Test
+    void aShareCannotGrantAResourceItsOwnerDoesNotOwn() {
+        String foreignTgw = "arn:aws:ec2:us-east-1:123456789012:transit-gateway/tgw-foreign";
+        service.createResourceShare(
+                "foreign-share", List.of(ACCEPTER), List.of(foreignTgw), false, "us-east-1", OWNER);
+        String invitationArn = service.getResourceShareInvitations(ACCEPTER, List.of(), List.of(), "us-east-1")
+                .get(0).resourceShareInvitationArn();
+        service.acceptResourceShareInvitation(invitationArn, ACCEPTER, "us-east-1");
+
+        assertFalse(service.isResourceSharedWith(foreignTgw, ACCEPTER));
     }
 
     private static void assertInvalidParameter(Executable read) {

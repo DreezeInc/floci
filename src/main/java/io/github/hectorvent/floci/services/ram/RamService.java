@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.organizations.model.Organization;
 import io.github.hectorvent.floci.services.ram.model.PrincipalAssociation;
 import io.github.hectorvent.floci.services.ram.model.ResourceShare;
+import io.github.hectorvent.floci.services.ram.model.ResourceShareAssociation;
 import io.github.hectorvent.floci.services.ram.model.ResourceShareInvitation;
 import io.github.hectorvent.floci.services.ram.model.SharePermission;
 import io.github.hectorvent.floci.services.ram.model.SharedResource;
@@ -64,6 +65,11 @@ public class RamService {
     private static final String RESOURCE_SHARE_PREFIX = "resource-share/";
     /** An AWS account id, as opposed to an organization/OU principal ARN. */
     private static final Pattern ACCOUNT_ID_PRINCIPAL = Pattern.compile("\\d{12}");
+    private static final List<String> ASSOCIATION_TYPES = List.of("PRINCIPAL", "RESOURCE", "SOURCE");
+    private static final List<String> ASSOCIATION_STATUSES = List.of("ASSOCIATING", "ASSOCIATED", "FAILED",
+            "DISASSOCIATING", "DISASSOCIATED", "SUSPENDED", "SUSPENDING", "RESTORING");
+    private static final Set<String> DISCOVERABLE_INVITATION_STATUSES = Set.of("PENDING", "ACCEPTED");
+    private static final Set<String> GRANTING_INVITATION_STATUSES = Set.of("ACCEPTED");
 
     private final StorageFactory storageFactory;
     private final OrganizationsService organizationsService;
@@ -391,6 +397,125 @@ public class RamService {
         return putForOwner(updated);
     }
 
+    /** A directly invited account is ASSOCIATING until it accepts and FAILED once it rejects. */
+    public List<ResourceShareAssociation> getResourceShareAssociations(String callerAccountId,
+                                                                       String associationType,
+                                                                       List<String> resourceShareArns,
+                                                                       String resourceArn, String principal,
+                                                                       String associationStatus, String region) {
+        if (associationType == null) {
+            throw new AwsException("InvalidParameterException", "associationType is required.", 400);
+        }
+        if (!ASSOCIATION_TYPES.contains(associationType)) {
+            throw new AwsException("InvalidParameterException",
+                    "associationType must be one of " + ASSOCIATION_TYPES + ".", 400);
+        }
+        if (associationStatus != null && !ASSOCIATION_STATUSES.contains(associationStatus)) {
+            throw new AwsException("InvalidParameterException",
+                    "associationStatus must be one of " + ASSOCIATION_STATUSES + ".", 400);
+        }
+        if (resourceArn != null && !"RESOURCE".equals(associationType)) {
+            throw new AwsException("InvalidParameterException",
+                    "resourceArn can be specified only when associationType is RESOURCE.", 400);
+        }
+        if (principal != null && !"PRINCIPAL".equals(associationType)) {
+            throw new AwsException("InvalidParameterException",
+                    "principal can be specified only when associationType is PRINCIPAL.", 400);
+        }
+        requireValidArns(resourceShareArns);
+        List<ResourceShareAssociation> result = new ArrayList<>();
+        for (ResourceShare share : sharesIn(region)) {
+            if (!share.getOwningAccountId().equals(callerAccountId)) {
+                continue;
+            }
+            if (!resourceShareArns.isEmpty() && !resourceShareArns.contains(share.getResourceShareArn())) {
+                continue;
+            }
+            boolean deleted = "DELETED".equals(share.getStatus());
+            if ("PRINCIPAL".equals(associationType)) {
+                for (String candidate : share.getPrincipals()) {
+                    if (principal == null || principal.equals(candidate)) {
+                        result.add(association(share, candidate, associationType,
+                                deleted ? "DISASSOCIATED" : principalAssociationStatus(share, candidate),
+                                isExternalPrincipal(share, candidate)));
+                    }
+                }
+            } else if ("RESOURCE".equals(associationType)) {
+                for (String candidate : share.getResourceArns()) {
+                    if (resourceArn == null || resourceArn.equals(candidate)) {
+                        result.add(association(share, candidate, associationType,
+                                deleted ? "DISASSOCIATED" : "ASSOCIATED", false));
+                    }
+                }
+            }
+        }
+        return result.stream()
+                .filter(association -> associationStatus == null || associationStatus.equals(association.status()))
+                .toList();
+    }
+
+    private static ResourceShareAssociation association(ResourceShare share, String entity, String type,
+                                                        String status, boolean external) {
+        return new ResourceShareAssociation(share.getResourceShareArn(), share.getName(), entity, type, status,
+                share.getCreationTime(), share.getLastUpdatedTime(), external);
+    }
+
+    private String principalAssociationStatus(ResourceShare share, String principal) {
+        if (!ACCOUNT_ID_PRINCIPAL.matcher(principal).matches()) {
+            return "ASSOCIATED";
+        }
+        Set<String> statuses = new LinkedHashSet<>();
+        for (ResourceShareInvitation invitation : allInvitations()) {
+            if (invitation.resourceShareArn().equals(share.getResourceShareArn())
+                    && invitation.receiverAccountId().equals(principal)) {
+                statuses.add(invitation.status());
+            }
+        }
+        if (statuses.isEmpty() || statuses.contains("ACCEPTED")) {
+            return "ASSOCIATED";
+        }
+        return statuses.contains("PENDING") ? "ASSOCIATING" : "FAILED";
+    }
+
+    private boolean isExternalPrincipal(ResourceShare share, String principal) {
+        return ACCOUNT_ID_PRINCIPAL.matcher(principal).matches()
+                && !isMemberOfSameOrganization(share.getOwningAccountId(), principal);
+    }
+
+    /** A pending invitation keeps a share discoverable but grants nothing until it is accepted. */
+    public boolean isResourceSharedWith(String resourceArn, String callerAccountId) {
+        if (!isValidArn(resourceArn)) {
+            return false;
+        }
+        String region = AwsArnUtils.parse(resourceArn).region();
+        return sharesIn(region).stream().anyMatch(share -> grants(share, resourceArn, callerAccountId));
+    }
+
+    /** Every resource ARN in {@code region} that RAM grants the caller access to. */
+    public List<String> resourceArnsSharedWith(String callerAccountId, String region) {
+        Set<String> arns = new LinkedHashSet<>();
+        for (ResourceShare share : sharesIn(region)) {
+            for (String resourceArn : share.getResourceArns()) {
+                if (grants(share, resourceArn, callerAccountId)) {
+                    arns.add(resourceArn);
+                }
+            }
+        }
+        return List.copyOf(arns);
+    }
+
+    private boolean grants(ResourceShare share, String resourceArn, String callerAccountId) {
+        if (!"ACTIVE".equals(share.getStatus())
+                || share.getOwningAccountId().equals(callerAccountId)
+                || !share.getResourceArns().contains(resourceArn)
+                || !isValidArn(resourceArn)
+                || !share.getOwningAccountId().equals(AwsArnUtils.parse(resourceArn).accountId())) {
+            return false;
+        }
+        return share.getPrincipals().stream().anyMatch(principal ->
+                isVisibleToPrincipal(share, principal, callerAccountId, GRANTING_INVITATION_STATUSES));
+    }
+
     /**
      * @param resourceOwner {@code SELF} or {@code OTHER-ACCOUNTS}, same visibility rule as
      *                      {@link #getResourceShares}
@@ -589,11 +714,12 @@ public class RamService {
         if (owned) {
             return false;
         }
-        return share.getPrincipals().stream()
-                .anyMatch(principal -> isVisibleToPrincipal(share, principal, callerAccountId));
+        return share.getPrincipals().stream().anyMatch(principal ->
+                isVisibleToPrincipal(share, principal, callerAccountId, DISCOVERABLE_INVITATION_STATUSES));
     }
 
-    private boolean isVisibleToPrincipal(ResourceShare share, String principal, String callerAccountId) {
+    private boolean isVisibleToPrincipal(ResourceShare share, String principal, String callerAccountId,
+                                         Set<String> liveInvitationStatuses) {
         if (ACCOUNT_ID_PRINCIPAL.matcher(principal).matches()) {
             if (!principal.equals(callerAccountId)) {
                 return false;
@@ -604,8 +730,7 @@ public class RamService {
             boolean hasLiveInvitation = allInvitations().stream()
                     .anyMatch(candidate -> candidate.resourceShareArn().equals(share.getResourceShareArn())
                             && candidate.receiverAccountId().equals(callerAccountId)
-                            && ("PENDING".equals(candidate.status())
-                            || "ACCEPTED".equals(candidate.status())));
+                            && liveInvitationStatuses.contains(candidate.status()));
             if (hasLiveInvitation) {
                 return true;
             }
