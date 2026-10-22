@@ -92,6 +92,7 @@ AWS::ECS::Cluster	EcsCfnProvisioner
 AWS::ECS::ClusterCapacityProviderAssociations	EcsCapacityCfnProvisioner
 AWS::ECS::Service	EcsCfnProvisioner
 AWS::ECS::TaskDefinition	EcsCfnProvisioner
+AWS::EKS::AccessEntry	EksAccessEntryCfnProvisioner
 AWS::EKS::Addon	EksAddonCfnProvisioner
 AWS::EKS::Cluster	EksCfnProvisioner
 AWS::EKS::Nodegroup	EksCfnProvisioner

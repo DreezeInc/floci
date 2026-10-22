@@ -62,6 +62,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcGat
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcrCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCapacityCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EksAccessEntryCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksAddonCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ElastiCacheCfnProvisioner;
@@ -125,6 +126,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.FlowLogService;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.eks.EksAccessEntryService;
 import io.github.hectorvent.floci.services.eks.EksAddonService;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.elasticache.ElastiCacheMemcachedService;
@@ -216,6 +218,7 @@ final class CfnProvisionerFixture {
         private RdsService rdsService;
         private EksService eksService;
         private EksAddonService eksAddonService;
+        private EksAccessEntryService eksAccessEntryService;
         private CloudWatchLogsService logsService;
         private KinesisService kinesisService;
         private CloudWatchMetricsService cloudWatchMetricsService;
@@ -368,6 +371,9 @@ final class CfnProvisionerFixture {
             // sub-service gets a provisioner that fails loudly rather than a silent stub.
             if (eksAddonService != null) {
                 discovered.add(new EksAddonCfnProvisioner(eksService, eksAddonService));
+            }
+            if (eksAccessEntryService != null) {
+                discovered.add(new EksAccessEntryCfnProvisioner(eksService, eksAccessEntryService));
             }
             if (elbV2Service != null) {
                 discovered.add(new ElbV2CfnProvisioner(elbV2Service));
@@ -659,6 +665,11 @@ final class CfnProvisionerFixture {
 
         public Builder eksAddons(EksAddonService v) {
             this.eksAddonService = v;
+            return this;
+        }
+
+        public Builder eksAccessEntries(EksAccessEntryService v) {
+            this.eksAccessEntryService = v;
             return this;
         }
 
