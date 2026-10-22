@@ -20,10 +20,32 @@ public class Snapshot {
     private Instant startTime;
     private String progress = "100%";
     private boolean encrypted;
+    private String kmsKeyId;
     private String region;
     private List<Tag> tags = new ArrayList<>();
+    private List<String> createVolumePermissionUserIds = new ArrayList<>();
+    private List<String> createVolumePermissionGroups = new ArrayList<>();
+    private String contentRef;
 
     public Snapshot() {}
+
+    public Snapshot(Snapshot other) {
+        this.snapshotId = other.snapshotId;
+        this.volumeId = other.volumeId;
+        this.volumeSize = other.volumeSize;
+        this.ownerId = other.ownerId;
+        this.state = other.state;
+        this.description = other.description;
+        this.startTime = other.startTime;
+        this.progress = other.progress;
+        this.encrypted = other.encrypted;
+        this.kmsKeyId = other.kmsKeyId;
+        this.region = other.region;
+        this.tags = new ArrayList<>(other.tags);
+        this.createVolumePermissionUserIds = new ArrayList<>(other.createVolumePermissionUserIds);
+        this.createVolumePermissionGroups = new ArrayList<>(other.createVolumePermissionGroups);
+        this.contentRef = other.contentRef;
+    }
 
     public String getSnapshotId() { return snapshotId; }
     public void setSnapshotId(String snapshotId) { this.snapshotId = snapshotId; }
@@ -52,9 +74,25 @@ public class Snapshot {
     public boolean isEncrypted() { return encrypted; }
     public void setEncrypted(boolean encrypted) { this.encrypted = encrypted; }
 
+    public String getKmsKeyId() { return kmsKeyId; }
+    public void setKmsKeyId(String kmsKeyId) { this.kmsKeyId = kmsKeyId; }
+
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
 
     public List<Tag> getTags() { return tags; }
     public void setTags(List<Tag> tags) { this.tags = tags; }
+
+    public List<String> getCreateVolumePermissionUserIds() { return createVolumePermissionUserIds; }
+    public void setCreateVolumePermissionUserIds(List<String> createVolumePermissionUserIds) {
+        this.createVolumePermissionUserIds = createVolumePermissionUserIds;
+    }
+
+    public List<String> getCreateVolumePermissionGroups() { return createVolumePermissionGroups; }
+    public void setCreateVolumePermissionGroups(List<String> createVolumePermissionGroups) {
+        this.createVolumePermissionGroups = createVolumePermissionGroups;
+    }
+
+    public String getContentRef() { return contentRef; }
+    public void setContentRef(String contentRef) { this.contentRef = contentRef; }
 }

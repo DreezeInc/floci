@@ -204,6 +204,13 @@ public class Ec2QueryHandler {
                 case "DeregisterImage" -> handleDeregisterImage(params, region);
                 case "CopyImage" -> handleCopyImage(params, region);
                 case "DescribeSnapshots" -> handleDescribeSnapshots(params, region);
+                case "CreateSnapshot" -> handleCreateSnapshot(params, region);
+                case "CreateSnapshots" -> handleCreateSnapshots(params, region);
+                case "CopySnapshot" -> handleCopySnapshot(params, region);
+                case "DeleteSnapshot" -> handleDeleteSnapshot(params, region);
+                case "ModifySnapshotAttribute" -> handleModifySnapshotAttribute(params, region);
+                case "DescribeSnapshotAttribute" -> handleDescribeSnapshotAttribute(params, region);
+                case "ResetSnapshotAttribute" -> handleResetSnapshotAttribute(params, region);
                 // Tags
                 case "CreateTags" -> handleCreateTags(params, region);
                 case "DeleteTags" -> handleDeleteTags(params, region);
@@ -3626,17 +3633,164 @@ public class Ec2QueryHandler {
     private Response handleDescribeSnapshots(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "SnapshotId");
         List<String> owners = getList(p, "Owner", "OwnerId", "OwnerIds");
+        List<String> restorableBy = getList(p, "RestorableBy");
         Map<String, List<String>> filters = getFilters(p);
-        List<Snapshot> snapshots = service.describeSnapshots(region, ids, owners, filters);
+        Integer maxResults = p.getFirst("MaxResults") != null ? parseIntParam(p, "MaxResults", 0) : null;
+        Ec2Service.SnapshotPage page = service.describeSnapshots(region, ids, owners, restorableBy, filters,
+                maxResults, p.getFirst("NextToken"));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeSnapshotsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("snapshotSet");
-        for (Snapshot snapshot : snapshots) {
+        for (Snapshot snapshot : page.snapshots()) {
             xml.start("item").raw(snapshotXml(snapshot)).end("item");
         }
-        xml.end("snapshotSet").end("DescribeSnapshotsResponse");
+        xml.end("snapshotSet")
+                .elem("nextToken", page.nextToken())
+                .end("DescribeSnapshotsResponse");
         return xmlResponse(xml.build());
+    }
+
+    private Response handleCreateSnapshot(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        Snapshot snapshot = service.createSnapshot(region, p.getFirst("VolumeId"), p.getFirst("Description"),
+                parseTagsForResource(p, "snapshot"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("CreateSnapshotResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .raw(snapshotXml(snapshot))
+                .end("CreateSnapshotResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleCreateSnapshots(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        String copyTagsFromSource = p.getFirst("CopyTagsFromSource");
+        if (copyTagsFromSource != null && !"volume".equals(copyTagsFromSource)) {
+            throw new AwsException("InvalidParameterValue", "Value (" + copyTagsFromSource
+                    + ") for parameter CopyTagsFromSource is invalid. Valid values: volume", 400);
+        }
+        List<Snapshot> snapshots = service.createSnapshots(region,
+                p.getFirst("InstanceSpecification.InstanceId"),
+                Boolean.parseBoolean(p.getFirst("InstanceSpecification.ExcludeBootVolume")),
+                getList(p, "InstanceSpecification.ExcludeDataVolumeId"),
+                p.getFirst("Description"), parseTagsForResource(p, "snapshot"),
+                copyTagsFromSource != null);
+        XmlBuilder xml = new XmlBuilder()
+                .start("CreateSnapshotsResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("snapshotSet");
+        for (Snapshot snapshot : snapshots) {
+            xml.start("item")
+                    .elem("snapshotId", snapshot.getSnapshotId())
+                    .elem("volumeId", snapshot.getVolumeId())
+                    .elem("state", snapshot.getState())
+                    .elem("progress", snapshot.getProgress())
+                    .elem("startTime", ISO_FMT.format(snapshot.getStartTime()))
+                    .elem("volumeSize", String.valueOf(snapshot.getVolumeSize()))
+                    .elem("ownerId", snapshot.getOwnerId())
+                    .elem("description", snapshot.getDescription())
+                    .elem("encrypted", String.valueOf(snapshot.isEncrypted()))
+                    .raw(tagSetXml(snapshot.getTags()))
+                    .end("item");
+        }
+        xml.end("snapshotSet").end("CreateSnapshotsResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleCopySnapshot(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        Snapshot copy = service.copySnapshot(region, p.getFirst("SourceRegion"), p.getFirst("SourceSnapshotId"),
+                p.getFirst("Description"), Boolean.parseBoolean(p.getFirst("Encrypted")), p.getFirst("KmsKeyId"),
+                parseTagsForResource(p, "snapshot"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("CopySnapshotResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("snapshotId", copy.getSnapshotId())
+                .raw(tagSetXml(copy.getTags()))
+                .end("CopySnapshotResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDeleteSnapshot(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        service.deleteSnapshot(region, p.getFirst("SnapshotId"));
+        return booleanResponse("DeleteSnapshot");
+    }
+
+    // Takes both request forms: OperationType with UserId.N/UserGroup.N, and CreateVolumePermission.Add/Remove.
+    private Response handleModifySnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        List<String> addUserIds = permissionMembers(p, "CreateVolumePermission.Add", "UserId");
+        List<String> addGroups = permissionMembers(p, "CreateVolumePermission.Add", "Group");
+        List<String> removeUserIds = permissionMembers(p, "CreateVolumePermission.Remove", "UserId");
+        List<String> removeGroups = permissionMembers(p, "CreateVolumePermission.Remove", "Group");
+        List<String> userIds = getList(p, "UserId");
+        List<String> groups = getList(p, "UserGroup");
+        if (!userIds.isEmpty() || !groups.isEmpty()) {
+            String operation = p.getFirst("OperationType");
+            if ("add".equals(operation)) {
+                addUserIds.addAll(userIds);
+                addGroups.addAll(groups);
+            } else if ("remove".equals(operation)) {
+                removeUserIds.addAll(userIds);
+                removeGroups.addAll(groups);
+            } else if (operation == null) {
+                throw new AwsException("MissingParameter",
+                        "The request must contain the parameter OperationType", 400);
+            } else {
+                throw new AwsException("InvalidParameterValue", "Value (" + operation
+                        + ") for parameter OperationType is invalid. Valid values: add, remove", 400);
+            }
+        }
+        boolean publicSharingBlocked = snapshotBlockPublicAccessService != null
+                && !Ec2SnapshotBlockPublicAccessService.UNBLOCKED.equals(
+                        snapshotBlockPublicAccessService.getSnapshotBlockPublicAccessState(region));
+        service.modifySnapshotAttribute(region, p.getFirst("SnapshotId"), p.getFirst("Attribute"),
+                addUserIds, addGroups, removeUserIds, removeGroups, publicSharingBlocked);
+        return booleanResponse("ModifySnapshotAttribute");
+    }
+
+    private List<String> permissionMembers(MultivaluedMap<String, String> p, String prefix, String member) {
+        List<String> values = new ArrayList<>();
+        for (int i = 1; p.getFirst(prefix + "." + i + ".UserId") != null
+                || p.getFirst(prefix + "." + i + ".Group") != null; i++) {
+            String value = p.getFirst(prefix + "." + i + "." + member);
+            if (value != null) {
+                values.add(value);
+            }
+        }
+        return values;
+    }
+
+    private Response handleDescribeSnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        String attribute = p.getFirst("Attribute");
+        Snapshot snapshot = service.describeSnapshotAttribute(region, p.getFirst("SnapshotId"), attribute);
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeSnapshotAttributeResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("snapshotId", snapshot.getSnapshotId());
+        if ("createVolumePermission".equals(attribute)) {
+            xml.start("createVolumePermission");
+            for (String group : snapshot.getCreateVolumePermissionGroups()) {
+                xml.start("item").elem("group", group).end("item");
+            }
+            for (String userId : snapshot.getCreateVolumePermissionUserIds()) {
+                xml.start("item").elem("userId", userId).end("item");
+            }
+            xml.end("createVolumePermission");
+        } else {
+            xml.raw("<productCodes/>");
+        }
+        xml.end("DescribeSnapshotAttributeResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleResetSnapshotAttribute(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        service.resetSnapshotAttribute(region, p.getFirst("SnapshotId"), p.getFirst("Attribute"));
+        return booleanResponse("ResetSnapshotAttribute");
     }
 
     // ─── Tag handlers ─────────────────────────────────────────────────────────
@@ -5976,7 +6130,9 @@ public class Ec2QueryHandler {
                 .elem("status", snapshot.getState())
                 .elem("progress", snapshot.getProgress())
                 .elem("encrypted", String.valueOf(snapshot.isEncrypted()))
-                .elem("description", snapshot.getDescription());
+                .elem("description", snapshot.getDescription())
+                .elem("kmsKeyId", snapshot.getKmsKeyId())
+                .elem("storageTier", "standard");
         if (snapshot.getVolumeId() != null) {
             xml.elem("volumeId", snapshot.getVolumeId());
         }
@@ -5996,7 +6152,7 @@ public class Ec2QueryHandler {
         String availabilityZone = p.getFirst("AvailabilityZone");
         String volumeType = p.getFirst("VolumeType");
         String sizeStr = p.getFirst("Size");
-        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 8;
+        int size = sizeStr != null ? Integer.parseInt(sizeStr) : 0;
         String encryptedStr = p.getFirst("Encrypted");
         boolean encrypted = "true".equalsIgnoreCase(encryptedStr);
         String iopsStr = p.getFirst("Iops");
@@ -6016,7 +6172,7 @@ public class Ec2QueryHandler {
         List<Tag> volumeTags = parseTagsForResource(p, "volume");
 
         Volume vol = service.createVolume(region, availabilityZone, volumeType, size,
-                encrypted, iops, throughput, snapshotId, volumeTags);
+                encrypted, p.getFirst("KmsKeyId"), iops, throughput, snapshotId, volumeTags);
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateVolumeResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -6176,7 +6332,8 @@ public class Ec2QueryHandler {
                 .elem("volumeType", vol.getVolumeType())
                 .elem("status", vol.getState())
                 .elem("availabilityZone", vol.getAvailabilityZone())
-                .elem("encrypted", String.valueOf(vol.isEncrypted()));
+                .elem("encrypted", String.valueOf(vol.isEncrypted()))
+                .elem("kmsKeyId", vol.getKmsKeyId());
         if (vol.getMultiAttachEnabled() != null) {
             xml.elem("multiAttachEnabled", String.valueOf(vol.getMultiAttachEnabled()));
         }

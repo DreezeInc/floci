@@ -97,6 +97,8 @@ import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
+import io.github.hectorvent.floci.services.kms.KmsService;
+import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.ContextNotActiveException;
@@ -165,6 +167,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     /** The accounts behind the two non-self owner aliases DescribeImages accepts. */
     private static final String AMAZON_OWNER_ID = "137112412989";
     private static final String AWS_MARKETPLACE_OWNER_ID = "679593333241";
+    // AWS reports this volume id on a snapshot copy, which no volume backs.
+    private static final String COPIED_SNAPSHOT_VOLUME_ID = "vol-ffffffff";
+    private static final String CREATE_VOLUME_PERMISSION = "createVolumePermission";
+    private static final String PUBLIC_SNAPSHOT_GROUP = "all";
+    private static final Pattern ACCOUNT_ID_PATTERN = Pattern.compile("\\d{12}");
     // The ASN AWS assigns when CreateTransitGateway omits Options.AmazonSideAsn.
     private static final long DEFAULT_AMAZON_SIDE_ASN = 64512L;
     private static final Pattern DEVICE_NAME_PATTERN = Pattern.compile("^(/dev/)?[a-zA-Z0-9/_-]+$");
@@ -303,6 +310,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // Only the CDI constructor receives it; null on the hand-built constructors, which reads as
     // "encryption by default is off".
     private Ec2EbsEncryptionService ebsEncryptionService;
+    // Only the CDI constructor receives these two; the hand-built constructors keep the defaults.
+    private EbsVolumeContent ebsVolumeContent = new DefaultEbsVolumeContent();
+    private KmsService kmsService;
     private jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance;
     private final List<VpcRouteTableListener> routeTableListeners = new CopyOnWriteArrayList<>();
     private jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance;
@@ -384,6 +394,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         instances.delete(key(region, instanceId));
     }
 
+    void setEbsVolumeContent(EbsVolumeContent ebsVolumeContent) {
+        this.ebsVolumeContent = ebsVolumeContent;
+    }
+
     void putVolumeForTest(Volume volume) {
         volumes.put(key(volume.getRegion(), volume.getVolumeId()), volume);
     }
@@ -438,7 +452,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                       Ec2VolumeBlockDeviceManager volumeBlockDeviceManager,
                       jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance,
                       jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance,
-                      Ec2EbsEncryptionService ebsEncryptionService) {
+                      Ec2EbsEncryptionService ebsEncryptionService,
+                      EbsVolumeContent ebsVolumeContent, KmsService kmsService) {
         this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
                 instanceTypeCatalog, storageFactory, requestContextInstance, iamService, volumeBlockDeviceManager);
         this.vpcNetworkManager = vpcNetworkManager;
@@ -446,6 +461,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this.routeTableListenersInstance = routeTableListenersInstance;
         this.instanceLaunchListenersInstance = instanceLaunchListenersInstance;
         this.ebsEncryptionService = ebsEncryptionService;
+        this.ebsVolumeContent = ebsVolumeContent;
+        this.kmsService = kmsService;
     }
 
     public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
@@ -1670,6 +1687,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * another region shares the layer with its source.
      */
     private final Object imageRegistryLock = new Object();
+
+    // Guards read-modify-write of snapshot records. Taken last: nothing is acquired while holding it.
+    private final Object snapshotLock = new Object();
 
     /**
      * The monitor guarding the AMI registry against a launch and a deregistration interleaving.
@@ -7113,7 +7133,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 results.add(new SnapshotDeletion(snapshotId, "skipped"));
                 continue;
             }
-            snapshots.delete(key(region, snapshotId));
+            synchronized (snapshotLock) {
+                snapshots.delete(key(region, snapshotId));
+            }
             results.add(new SnapshotDeletion(snapshotId, "success"));
         }
         return results;
@@ -7211,22 +7233,407 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    // ─── EBS Snapshots ─────────────────────────────────────────────────────────
+
+    public record SnapshotPage(List<Snapshot> snapshots, String nextToken) {}
+
+    private record StoredSnapshot(String account, Snapshot snapshot) {
+        String owner() {
+            return snapshot.getOwnerId() != null ? snapshot.getOwnerId() : account;
+        }
+    }
+
+    public Snapshot createSnapshot(String region, String volumeId, String description, List<Tag> snapshotTags) {
+        requireSnapshotParameter("VolumeId", volumeId);
+        Volume volume = getRequiredVolume(region, volumeId);
+        return pendingView(snapshotVolume(region, volume, description, orEmpty(snapshotTags)));
+    }
+
+    public List<Snapshot> createSnapshots(String region, String instanceId, boolean excludeBootVolume,
+                                          List<String> excludeDataVolumeIds, String description,
+                                          List<Tag> snapshotTags, boolean copyTagsFromVolume) {
+        requireSnapshotParameter("InstanceSpecification.InstanceId", instanceId);
+        Instance instance = getRequiredInstance(region, instanceId);
+        Set<String> excluded = excludeDataVolumeIds == null ? Set.of() : new HashSet<>(excludeDataVolumeIds);
+        List<Snapshot> created = new ArrayList<>();
+        for (Volume volume : volumesAttachedTo(region, instance)) {
+            boolean boot = volume.getVolumeId().equals(instance.getRootVolumeId());
+            if (boot ? excludeBootVolume : excluded.contains(volume.getVolumeId())) {
+                continue;
+            }
+            List<Tag> tagsForVolume = copyTagsFromVolume
+                    ? mergeTags(volumeUserTags(volume), orEmpty(snapshotTags)) : orEmpty(snapshotTags);
+            created.add(pendingView(snapshotVolume(region, volume, description, tagsForVolume)));
+        }
+        return created;
+    }
+
+    public Snapshot copySnapshot(String region, String sourceRegion, String sourceSnapshotId,
+                                 String description, boolean encrypted, String kmsKeyId,
+                                 List<Tag> snapshotTags) {
+        requireSnapshotParameter("SourceSnapshotId", sourceSnapshotId);
+        requireSnapshotParameter("SourceRegion", sourceRegion);
+        String caller = callerAccountId();
+        StoredSnapshot stored = visibleSnapshot(sourceRegion, sourceSnapshotId, caller);
+        Snapshot source = stored.snapshot();
+        boolean keyGiven = isSet(kmsKeyId);
+        Snapshot copy = new Snapshot();
+        copy.setSnapshotId("snap-" + randomHex(17));
+        copy.setVolumeId(COPIED_SNAPSHOT_VOLUME_ID);
+        copy.setVolumeSize(source.getVolumeSize());
+        copy.setEncrypted(source.isEncrypted() || encrypted || keyGiven || ebsEncryptionByDefault(region));
+        if (copy.isEncrypted()) {
+            boolean keepsSourceKey = source.isEncrypted() && source.getKmsKeyId() != null
+                    && region.equals(sourceRegion) && caller.equals(stored.owner());
+            copy.setKmsKeyId(keyGiven ? resolveEbsKmsKeyArn(region, kmsKeyId)
+                    : keepsSourceKey ? source.getKmsKeyId() : defaultEbsKmsKeyArn(region));
+        }
+        copy.setContentRef(source.getContentRef());
+        String copyDescription = description != null ? description
+                : "[Copied " + sourceSnapshotId + " from " + sourceRegion + "]";
+        return pendingView(storeNewSnapshot(region, copy, caller, copyDescription, orEmpty(snapshotTags)));
+    }
+
     public List<Snapshot> describeSnapshots(String region, List<String> snapshotIds,
                                             List<String> ownerIds, Map<String, List<String>> filters) {
-        if (snapshotIds != null && !snapshotIds.isEmpty()) {
-            for (String id : snapshotIds) {
-                if (snapshots.get(key(region, id)).isEmpty()) {
-                    throw new AwsException("InvalidSnapshot.NotFound",
-                            "The snapshot '" + id + "' does not exist.", 400);
-                }
+        return describeSnapshots(region, snapshotIds, ownerIds, List.of(), filters, null, null).snapshots();
+    }
+
+    // With no ids, owners or restorable-by users AWS returns every snapshot the caller can restore.
+    public SnapshotPage describeSnapshots(String region, List<String> snapshotIds, List<String> ownerIds,
+                                          List<String> restorableBy, Map<String, List<String>> filters,
+                                          Integer maxResults, String nextToken) {
+        boolean byId = snapshotIds != null && !snapshotIds.isEmpty();
+        if (byId && maxResults != null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The parameter snapshotSet cannot be used with the parameter maxResults", 400);
+        }
+        if (maxResults != null && maxResults < 5) {
+            throw new AwsException("InvalidParameterValue", "Value ( " + maxResults
+                    + " ) for parameter maxResults is invalid. Parameter must be between 5 and 1000.", 400);
+        }
+        String caller = callerAccountId();
+        List<StoredSnapshot> visible = snapshotsIn(region).stream()
+                .filter(stored -> canCreateVolumeFrom(stored, caller))
+                .toList();
+        if (byId) {
+            Set<String> visibleIds = visible.stream()
+                    .map(stored -> stored.snapshot().getSnapshotId())
+                    .collect(Collectors.toSet());
+            snapshotIds.stream()
+                    .filter(id -> !visibleIds.contains(id))
+                    .findFirst()
+                    .ifPresent(id -> { throw snapshotNotFound(id); });
+        }
+        List<Snapshot> matched = visible.stream()
+                .filter(stored -> !byId || snapshotIds.contains(stored.snapshot().getSnapshotId()))
+                .filter(stored -> matchesSnapshotOwners(stored, ownerIds, caller))
+                .filter(stored -> matchesRestorableBy(stored, restorableBy, caller))
+                .map(stored -> snapshotViewFor(stored, caller))
+                .filter(snapshot -> matchesSnapshotFilters(snapshot, filters))
+                .sorted(Comparator.comparing(Snapshot::getSnapshotId))
+                .toList();
+        int pageSize = maxResults == null ? Integer.MAX_VALUE : Math.min(maxResults, 1000);
+        int offset = Math.min(decodeToken(nextToken), matched.size());
+        int end = (int) Math.min((long) offset + pageSize, matched.size());
+        return new SnapshotPage(matched.subList(offset, end), end < matched.size() ? encodeToken(end) : null);
+    }
+
+    public void deleteSnapshot(String region, String snapshotId) {
+        requireSnapshotParameter("SnapshotId", snapshotId);
+        String caller = callerAccountId();
+        synchronized (imageRegistryLock) {
+            synchronized (snapshotLock) {
+                requireOwnedSnapshot(region, snapshotId, caller);
+                registeredImages.scan(k -> true).stream()
+                        .filter(image -> region.equals(image.getRegion()))
+                        .filter(image -> !DEREGISTERED_STATE.equals(image.getState()))
+                        .filter(image -> image.getBlockDeviceMappings().stream()
+                                .map(BlockDeviceMapping::getEbs)
+                                .anyMatch(ebs -> ebs != null && snapshotId.equals(ebs.getSnapshotId())))
+                        .findFirst()
+                        .ifPresent(image -> {
+                            throw new AwsException("InvalidSnapshot.InUse", "The snapshot " + snapshotId
+                                    + " is currently in use by " + image.getImageId(), 400);
+                        });
+                snapshots.delete(key(region, snapshotId));
+                tags.delete(snapshotId);
             }
         }
-        return snapshots.scan(k -> true).stream()
-                .filter(snapshot -> region.equals(snapshot.getRegion()))
-                .filter(snapshot -> snapshotIds == null || snapshotIds.isEmpty() || snapshotIds.contains(snapshot.getSnapshotId()))
-                .filter(snapshot -> matchesSnapshotOwners(snapshot, ownerIds))
-                .filter(snapshot -> matchesSnapshotFilters(snapshot, filters))
-                .collect(Collectors.toList());
+    }
+
+    public void modifySnapshotAttribute(String region, String snapshotId, String attribute,
+                                        List<String> addUserIds, List<String> addGroups,
+                                        List<String> removeUserIds, List<String> removeGroups,
+                                        boolean publicSharingBlocked) {
+        requireSnapshotParameter("SnapshotId", snapshotId);
+        if (attribute != null) {
+            requireSnapshotAttribute(attribute, CREATE_VOLUME_PERMISSION);
+        }
+        Stream.of(addUserIds, removeUserIds).flatMap(List::stream).forEach(Ec2Service::requireAccountUserId);
+        Stream.of(addGroups, removeGroups).flatMap(List::stream).forEach(Ec2Service::requireSnapshotGroup);
+        String caller = callerAccountId();
+        Snapshot current = requireOwnedSnapshot(region, snapshotId, caller);
+        if (addGroups.contains(PUBLIC_SNAPSHOT_GROUP)) {
+            if (current.isEncrypted()) {
+                throw new AwsException("InvalidParameter", "Encrypted snapshots cannot be made public.", 400);
+            }
+            if (publicSharingBlocked) {
+                throw new AwsException("OperationNotPermitted",
+                        "Snapshot block public access is enabled in this Region.", 400);
+            }
+        }
+        if (!addUserIds.isEmpty() && current.isEncrypted() && isAwsManagedEbsKey(region, current.getKmsKeyId())) {
+            throw new AwsException("InvalidParameter",
+                    "Snapshots encrypted with the AWS Managed CMK can't be shared. Specify another snapshot.", 400);
+        }
+        synchronized (snapshotLock) {
+            Snapshot snapshot = requireOwnedSnapshot(region, snapshotId, caller);
+            List<String> userIds = new ArrayList<>(snapshot.getCreateVolumePermissionUserIds());
+            userIds.removeAll(removeUserIds);
+            addUserIds.stream().filter(id -> !userIds.contains(id)).forEach(userIds::add);
+            List<String> groups = new ArrayList<>(snapshot.getCreateVolumePermissionGroups());
+            groups.removeAll(removeGroups);
+            addGroups.stream().filter(group -> !groups.contains(group)).forEach(groups::add);
+            snapshot.setCreateVolumePermissionUserIds(userIds);
+            snapshot.setCreateVolumePermissionGroups(groups);
+            snapshots.put(key(region, snapshotId), snapshot);
+        }
+    }
+
+    public Snapshot describeSnapshotAttribute(String region, String snapshotId, String attribute) {
+        requireSnapshotParameter("SnapshotId", snapshotId);
+        requireSnapshotAttribute(attribute, CREATE_VOLUME_PERMISSION, "productCodes");
+        return new Snapshot(requireOwnedSnapshot(region, snapshotId, callerAccountId()));
+    }
+
+    public void resetSnapshotAttribute(String region, String snapshotId, String attribute) {
+        requireSnapshotParameter("SnapshotId", snapshotId);
+        requireSnapshotAttribute(attribute, CREATE_VOLUME_PERMISSION);
+        String caller = callerAccountId();
+        synchronized (snapshotLock) {
+            Snapshot snapshot = requireOwnedSnapshot(region, snapshotId, caller);
+            snapshot.setCreateVolumePermissionUserIds(new ArrayList<>());
+            snapshot.setCreateVolumePermissionGroups(new ArrayList<>());
+            snapshots.put(key(region, snapshotId), snapshot);
+        }
+    }
+
+    private Snapshot snapshotVolume(String region, Volume volume, String description, List<Tag> snapshotTags) {
+        String owner = callerAccountId();
+        Snapshot snapshot = new Snapshot();
+        snapshot.setSnapshotId("snap-" + randomHex(17));
+        snapshot.setVolumeId(volume.getVolumeId());
+        snapshot.setVolumeSize(volume.getSize());
+        snapshot.setEncrypted(volume.isEncrypted());
+        if (volume.isEncrypted()) {
+            snapshot.setKmsKeyId(volume.getKmsKeyId() != null ? volume.getKmsKeyId() : defaultEbsKmsKeyArn(region));
+        }
+        snapshot.setContentRef(ebsVolumeContent.capture(owner, region, volume, snapshot.getSnapshotId()));
+        return storeNewSnapshot(region, snapshot, owner, description != null ? description : "", snapshotTags);
+    }
+
+    private Snapshot storeNewSnapshot(String region, Snapshot snapshot, String owner, String description,
+                                      List<Tag> snapshotTags) {
+        snapshot.setOwnerId(owner);
+        snapshot.setDescription(description);
+        snapshot.setStartTime(Instant.now());
+        snapshot.setRegion(region);
+        snapshot.setTags(new ArrayList<>(snapshotTags));
+        snapshots.put(key(region, snapshot.getSnapshotId()), snapshot);
+        if (!snapshotTags.isEmpty()) {
+            tags.put(snapshot.getSnapshotId(), new ArrayList<>(snapshotTags));
+        }
+        return snapshot;
+    }
+
+    // Snapshots complete as soon as they are stored; only the creating call reports them pending.
+    private static Snapshot pendingView(Snapshot stored) {
+        Snapshot view = new Snapshot(stored);
+        view.setState("pending");
+        view.setProgress("0%");
+        return view;
+    }
+
+    private Snapshot snapshotViewFor(StoredSnapshot stored, String caller) {
+        Snapshot view = new Snapshot(stored.snapshot());
+        boolean owned = caller.equals(stored.owner());
+        view.setTags(new ArrayList<>(tags.get(view.getSnapshotId())
+                .orElseGet(() -> owned ? orEmpty(stored.snapshot().getTags()) : List.of())));
+        return view;
+    }
+
+    private List<StoredSnapshot> snapshotsIn(String region) {
+        List<StoredSnapshot> stored = snapshots instanceof AccountAwareStorageBackend<Snapshot> aware
+                ? aware.scanAllAccountEntries(k -> true).stream()
+                        .map(entry -> new StoredSnapshot(entry.accountId(), entry.value()))
+                        .toList()
+                : snapshots.scan(k -> true).stream()
+                        .map(snapshot -> new StoredSnapshot(snapshot.getOwnerId(), snapshot))
+                        .toList();
+        return stored.stream().filter(s -> region.equals(s.snapshot().getRegion())).toList();
+    }
+
+    private StoredSnapshot visibleSnapshot(String region, String snapshotId, String caller) {
+        String storeKey = key(region, snapshotId);
+        StoredSnapshot stored = snapshots instanceof AccountAwareStorageBackend<Snapshot> aware
+                ? aware.findAnyAccountEntry(storeKey)
+                        .map(entry -> new StoredSnapshot(entry.account(), entry.value()))
+                        .orElse(null)
+                : snapshots.get(storeKey)
+                        .map(snapshot -> new StoredSnapshot(snapshot.getOwnerId(), snapshot))
+                        .orElse(null);
+        if (stored == null || !canCreateVolumeFrom(stored, caller)) {
+            throw snapshotNotFound(snapshotId);
+        }
+        return stored;
+    }
+
+    private Snapshot requireOwnedSnapshot(String region, String snapshotId, String caller) {
+        return snapshots.get(key(region, snapshotId))
+                .filter(snapshot -> snapshot.getOwnerId() == null || caller.equals(snapshot.getOwnerId()))
+                .orElseThrow(() -> snapshotNotFound(snapshotId));
+    }
+
+    private static boolean canCreateVolumeFrom(StoredSnapshot stored, String caller) {
+        Snapshot snapshot = stored.snapshot();
+        return caller.equals(stored.owner())
+                || orEmpty(snapshot.getCreateVolumePermissionUserIds()).contains(caller)
+                || orEmpty(snapshot.getCreateVolumePermissionGroups()).contains(PUBLIC_SNAPSHOT_GROUP);
+    }
+
+    private static boolean matchesSnapshotOwners(StoredSnapshot stored, List<String> ownerIds, String caller) {
+        if (ownerIds == null || ownerIds.isEmpty()) {
+            return true;
+        }
+        String owner = stored.owner();
+        return ownerIds.stream().anyMatch(id -> switch (id) {
+            case "self" -> caller.equals(owner);
+            case "amazon" -> AMAZON_OWNER_ID.equals(owner);
+            default -> id.equals(owner);
+        });
+    }
+
+    private static boolean matchesRestorableBy(StoredSnapshot stored, List<String> restorableBy, String caller) {
+        if (restorableBy == null || restorableBy.isEmpty()) {
+            return true;
+        }
+        Snapshot snapshot = stored.snapshot();
+        List<String> userIds = orEmpty(snapshot.getCreateVolumePermissionUserIds());
+        boolean owned = caller.equals(stored.owner());
+        return restorableBy.stream().anyMatch(id -> switch (id) {
+            case PUBLIC_SNAPSHOT_GROUP ->
+                    orEmpty(snapshot.getCreateVolumePermissionGroups()).contains(PUBLIC_SNAPSHOT_GROUP);
+            case "self" -> owned || userIds.contains(caller);
+            default -> owned && (id.equals(caller) || userIds.contains(id));
+        });
+    }
+
+    private List<Volume> volumesAttachedTo(String region, Instance instance) {
+        String rootVolumeId = instance.getRootVolumeId();
+        return volumes.scan(k -> true).stream()
+                .filter(volume -> region.equals(volume.getRegion()))
+                .filter(volume -> volume.getAttachments().stream()
+                        .anyMatch(attachment -> instance.getInstanceId().equals(attachment.getInstanceId())))
+                .sorted(Comparator.comparing((Volume volume) -> !volume.getVolumeId().equals(rootVolumeId))
+                        .thenComparing(Volume::getVolumeId))
+                .toList();
+    }
+
+    private List<Tag> volumeUserTags(Volume volume) {
+        return tags.get(volume.getVolumeId()).orElseGet(() -> orEmpty(volume.getTags())).stream()
+                .filter(tag -> !isAwsTagKey(tag.getKey()))
+                .toList();
+    }
+
+    private static List<Tag> mergeTags(List<Tag> base, List<Tag> overrides) {
+        Map<String, Tag> merged = new LinkedHashMap<>();
+        base.forEach(tag -> merged.put(tag.getKey(), tag));
+        overrides.forEach(tag -> merged.put(tag.getKey(), tag));
+        return new ArrayList<>(merged.values());
+    }
+
+    private static <T> List<T> orEmpty(List<T> values) {
+        return values == null ? List.of() : values;
+    }
+
+    private String defaultEbsKmsKeyArn(String region) {
+        return resolveEbsKmsKeyArn(region, ebsEncryptionService != null
+                ? ebsEncryptionService.getEbsDefaultKmsKeyId(region)
+                : Ec2EbsEncryptionService.AWS_MANAGED_KEY_ALIAS);
+    }
+
+    // A key in another account is used through its key policy, which is not modelled here.
+    private String resolveEbsKmsKeyArn(String region, String kmsKeyId) {
+        if (kmsService == null || isOtherAccountKmsArn(kmsKeyId)) {
+            return kmsKeyId;
+        }
+        KmsKey key;
+        try {
+            key = kmsService.describeKey(kmsKeyId, region);
+        } catch (AwsException e) {
+            throw invalidEbsKmsKey(kmsKeyId);
+        }
+        if (!key.isEnabled() || "PendingDeletion".equals(key.getKeyState())) {
+            throw invalidEbsKmsKey(kmsKeyId);
+        }
+        return key.getArn();
+    }
+
+    private boolean isAwsManagedEbsKey(String region, String kmsKeyId) {
+        if (kmsKeyId == null || kmsKeyId.endsWith(Ec2EbsEncryptionService.AWS_MANAGED_KEY_ALIAS)) {
+            return true;
+        }
+        if (kmsService == null || isOtherAccountKmsArn(kmsKeyId)) {
+            return false;
+        }
+        try {
+            return "AWS".equals(kmsService.describeKey(kmsKeyId, region).getKeyManager());
+        } catch (AwsException e) {
+            return false;
+        }
+    }
+
+    private boolean isOtherAccountKmsArn(String kmsKeyId) {
+        return AwsArnUtils.isArnFor(kmsKeyId, "kms")
+                && !callerAccountId().equals(AwsArnUtils.parse(kmsKeyId).accountId());
+    }
+
+    private static AwsException invalidEbsKmsKey(String kmsKeyId) {
+        return new AwsException("InvalidParameterValue", "Value (" + kmsKeyId
+                + ") for parameter kmsKeyId is invalid. The KMS key does not exist, is not enabled"
+                + " or is not accessible.", 400);
+    }
+
+    private static AwsException snapshotNotFound(String snapshotId) {
+        return new AwsException("InvalidSnapshot.NotFound", "The snapshot '" + snapshotId + "' does not exist.", 400);
+    }
+
+    private static void requireSnapshotParameter(String name, String value) {
+        if (!isSet(value)) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter " + name, 400);
+        }
+    }
+
+    private static void requireSnapshotAttribute(String attribute, String... supported) {
+        requireSnapshotParameter("Attribute", attribute);
+        if (!Arrays.asList(supported).contains(attribute)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + attribute + ") for parameter attribute is invalid. Unknown attribute.", 400);
+        }
+    }
+
+    private static void requireAccountUserId(String userId) {
+        if (userId == null || !ACCOUNT_ID_PATTERN.matcher(userId).matches()) {
+            throw new AwsException("InvalidUserID.Malformed", "Invalid user id: \"" + userId + "\"", 400);
+        }
+    }
+
+    private static void requireSnapshotGroup(String group) {
+        if (!PUBLIC_SNAPSHOT_GROUP.equals(group)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + group + ") for parameter group is invalid. Valid values: all", 400);
+        }
     }
 
     // ─── Launch Templates ─────────────────────────────────────────────────────
@@ -7815,15 +8222,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return true;
     }
 
-    private boolean matchesSnapshotOwners(Snapshot snapshot, List<String> ownerIds) {
-        String caller = callerAccountId();
-        if (ownerIds == null || ownerIds.isEmpty()) {
-            return caller.equals(snapshot.getOwnerId());
-        }
-        return ownerIds.contains(snapshot.getOwnerId())
-                || ownerIds.contains("self") && caller.equals(snapshot.getOwnerId());
-    }
-
     private boolean matchesSnapshotFilter(Snapshot snapshot, String name, List<String> values) {
         return switch (name) {
             case "description" -> matchesFilterValue(values, snapshot.getDescription());
@@ -7834,7 +8232,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             case "volume-id" -> matchesFilterValue(values, snapshot.getVolumeId());
             case "volume-size" -> matchesFilterValue(values,
                     snapshot.getVolumeSize() != null ? String.valueOf(snapshot.getVolumeSize()) : null);
-            default -> true;
+            case "encrypted" -> matchesFilterValue(values, String.valueOf(snapshot.isEncrypted()));
+            case "owner-alias" -> matchesFilterValue(values,
+                    AMAZON_OWNER_ID.equals(snapshot.getOwnerId()) ? "amazon" : null);
+            case "start-time" -> matchesFilterValue(values,
+                    snapshot.getStartTime() != null ? ISO_FMT.format(snapshot.getStartTime()) : null);
+            case "storage-tier" -> matchesFilterValue(values, "standard");
+            case "tag-value" -> snapshot.getTags().stream().anyMatch(tag -> matchesFilterValue(values, tag.getValue()));
+            default -> !isImageTagFilter(name)
+                    || matchesTagFilter(snapshot.getTags(), name, values, this::matchesFilterValue);
         };
     }
 
@@ -8002,6 +8408,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             managedPrefixLists.put(storeKey, prefixList);
             return;
         }
+        if (resourceId.startsWith("snap-")) {
+            synchronized (snapshotLock) {
+                Snapshot snapshot = snapshots.get(storeKey).orElse(null);
+                if (snapshot != null) {
+                    snapshot.setTags(new ArrayList<>(tagList));
+                    snapshots.put(storeKey, snapshot);
+                }
+            }
+            return;
+        }
         // Reached with the topology lock already held for tgw- resources, so the read-modify-write
         // below cannot put back something a concurrent delete has just removed.
         {
@@ -8143,6 +8559,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (resourceId.startsWith("pl-")) {
             return "prefix-list";
+        }
+        if (resourceId.startsWith("snap-")) {
+            return "snapshot";
+        }
+        if (resourceId.startsWith("vol-")) {
+            return "volume";
+        }
+        if (resourceId.startsWith("ami-")) {
+            return "image";
         }
         // Both checked before the gateway prefix, which they start with.
         if (resourceId.startsWith("tgw-attach-")) {
@@ -10164,6 +10589,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (resource instanceof KeyPair kp) return kp.getTags();
         if (resource instanceof Address addr) return addr.getTags();
         if (resource instanceof Volume vol) return vol.getTags();
+        if (resource instanceof Snapshot snapshot) return snapshot.getTags();
         if (resource instanceof NetworkInterface ni) return ni.getTagSet();
         if (resource instanceof ManagedPrefixList prefixList) return prefixList.getTags();
         if (resource instanceof LaunchTemplate lt) return lt.getTags();
@@ -10191,17 +10617,32 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public Volume createVolume(String region, String availabilityZone, String volumeType,
                                int size, boolean encrypted, int iops, Integer throughput,
                                String snapshotId, List<Tag> volumeTags) {
+        return createVolume(region, availabilityZone, volumeType, size, encrypted, null, iops, throughput,
+                snapshotId, volumeTags);
+    }
+
+    public Volume createVolume(String region, String availabilityZone, String volumeType,
+                               int size, boolean encrypted, String kmsKeyId, int iops, Integer throughput,
+                               String snapshotId, List<Tag> volumeTags) {
         ensureDefaultResources(region);
+        Snapshot source = isSet(snapshotId) ? visibleSnapshot(region, snapshotId, callerAccountId()).snapshot() : null;
         String volumeId = "vol-" + randomHex(17);
         String effectiveType = volumeType != null ? volumeType : "gp2";
         Volume vol = new Volume();
         vol.setVolumeId(volumeId);
         vol.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
         vol.setVolumeType(effectiveType);
-        vol.setSize(size > 0 ? size : 8);
+        vol.setSize(volumeSize(size, source));
+        boolean keyGiven = isSet(kmsKeyId);
+        boolean sourceEncrypted = source != null && source.isEncrypted();
         // With encryption by default on, AWS encrypts every new volume and the Encrypted parameter
         // cannot opt out of it.
-        vol.setEncrypted(encrypted || ebsEncryptionByDefault(region));
+        vol.setEncrypted(encrypted || keyGiven || sourceEncrypted || ebsEncryptionByDefault(region));
+        if (vol.isEncrypted()) {
+            vol.setKmsKeyId(keyGiven ? resolveEbsKmsKeyArn(region, kmsKeyId)
+                    : sourceEncrypted && source.getKmsKeyId() != null ? source.getKmsKeyId()
+                    : defaultEbsKmsKeyArn(region));
+        }
         vol.setIops(iops > 0 ? iops : (volumeType != null && volumeType.startsWith("io") ? iops : 0));
         // Throughput is a gp3-only attribute; AWS reports 125 MiB/s by default for gp3.
         if ("gp3".equals(effectiveType)) {
@@ -10209,16 +10650,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         } else {
             vol.setThroughput(throughput);
         }
-        vol.setSnapshotId(snapshotId);
+        if (source != null) {
+            vol.setSnapshotId(snapshotId);
+            vol.setSeedContentRef(source.getContentRef());
+        }
         vol.setCreateTime(Instant.now());
         vol.setState("available");
         vol.setRegion(region);
         if (volumeTags != null) vol.setTags(new ArrayList<>(volumeTags));
         volumes.put(key(region, volumeId), vol);
+        if (volumeTags != null && !volumeTags.isEmpty()) {
+            tags.put(volumeId, new ArrayList<>(volumeTags));
+        }
         if (volumeBlockDeviceManager != null) {
             volumeBlockDeviceManager.createVolume(volumeId, vol.getSize());
         }
         return vol;
+    }
+
+    private static int volumeSize(int requested, Snapshot source) {
+        int snapshotSize = source != null && source.getVolumeSize() != null ? source.getVolumeSize() : 0;
+        if (requested <= 0) {
+            return snapshotSize > 0 ? snapshotSize : 8;
+        }
+        if (requested < snapshotSize) {
+            throw new AwsException("InvalidParameterValue", "Volume of size " + requested
+                    + "GiB is smaller than snapshot '" + source.getSnapshotId()
+                    + "', expect size >= " + snapshotSize + "GiB", 400);
+        }
+        return requested;
     }
 
     public List<Volume> describeVolumes(String region, List<String> volumeIds,
