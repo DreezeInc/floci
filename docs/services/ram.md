@@ -23,8 +23,8 @@ below for what's simplified.
 | `UpdateResourceShare` | Renames a share and/or toggles `allowExternalPrincipals` (`POST /updateresourceshare`) |
 | `AssociateResourceShare` | Adds resource ARNs and/or principals to an existing share (`POST /associateresourceshare`) |
 | `DisassociateResourceShare` | Removes resource ARNs and/or principals from a share (`POST /disassociateresourceshare`) |
-| `ListPrincipals` | Lists principals associated with visible shares (`POST /listprincipals`) |
 | `GetResourceShareAssociations` | Lists the principal or resource associations of the caller's own shares, filterable by `resourceShareArns`, `resourceArn`, `principal` and `associationStatus`, paginated with `maxResults`/`nextToken`. A directly invited account is `ASSOCIATING` until it accepts, `ASSOCIATED` after, and `FAILED` once it rejects; a deleted share reports `DISASSOCIATED` (`POST /getresourceshareassociations`) |
+| `ListPrincipals` | Lists principals associated with visible shares (`POST /listprincipals`) |
 | `ListResourceSharePermissions` | Lists the permissions associated with a share: one default AWS managed permission (`AWSRAMDefaultPermission<Type>`, `AWS_MANAGED`) per distinct resource type in the share; unknown share ARN is `UnknownResourceException` (`POST /listresourcesharepermissions`) |
 | `TagResource` | Adds/overwrites tags on a resource share (`POST /tagresource`) |
 | `UntagResource` | Removes tags by key from a resource share (`POST /untagresource`) |
