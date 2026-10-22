@@ -3425,6 +3425,14 @@ public interface EmulatorConfig {
         boolean podIdentityWebhook();
 
         /**
+         * When true, every container the pod identity webhook mutates also gets
+         * {@code AWS_ENDPOINT_URL} pointing at Floci, so the SDKs inside the cluster call the
+         * emulator without each workload being configured for it.
+         */
+        @WithDefault("false")
+        boolean injectEndpointUrl();
+
+        /**
          * When true, configures cluster containers with Floci's embedded DNS server so that
          * Route 53 private hosted zone records resolve from inside cluster pods.
          */
@@ -3532,6 +3540,13 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean selfSigned();
+
+        /**
+         * Extra hostnames or IP addresses the generated server certificate covers, comma-separated:
+         * for clients that reach Floci on an address nothing else configures, such as its pod IP.
+         * Env: FLOCI_TLS_EXTRA_SANS
+         */
+        Optional<List<String>> extraSans();
 
         /**
          * Additional port the TLS proxy binds for AWS-style HTTPS traffic, alongside the

@@ -354,6 +354,7 @@ class EventBridgeSchedulerIntegrationTest {
                     @Override public Optional<String> certPath() { return Optional.empty(); }
                     @Override public Optional<String> keyPath() { return Optional.empty(); }
                     @Override public boolean selfSigned() { return true; }
+                    @Override public Optional<List<String>> extraSans() { return Optional.empty(); }
                     @Override public int awsHttpsPort() { return 443; }
                 };
             }

@@ -49,6 +49,7 @@ Disabling verification (`--no-verify-ssl`, `verify=False`, `NODE_TLS_REJECT_UNAU
 | `FLOCI_TLS_CERT_PATH` | *(unset)* | Path to PEM certificate file |
 | `FLOCI_TLS_KEY_PATH` | *(unset)* | Path to PEM private key file |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate a server certificate signed by Floci's local CA when no cert/key paths provided |
+| `FLOCI_TLS_EXTRA_SANS` | *(unset)* | Comma-separated hostnames or IPs added to the generated certificate's SANs, for addresses clients reach Floci on that it cannot discover itself (a Kubernetes pod IP, for example) |
 
 With TLS enabled, the proxy that accepts HTTP and HTTPS on Floci's ports listens on `QUARKUS_HTTP_HOST` (`127.0.0.1` by default). As without TLS, any address outside loopback also needs `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`; see [Network Exposure](./environment-variables.md#network-exposure).
 
@@ -88,6 +89,8 @@ services:
 ```
 
 The generated certificate will include `floci` in its SANs, so TLS validation succeeds when `app` connects to `https://floci:4566`. Fetch `ca.pem` from Floci into `app` (an entrypoint `curl`, or a shared volume mounted from `{persistent-path}/tls/`) so the bundle path above exists.
+
+Addresses nothing in the configuration names, such as the IP a container or pod is given at start, go in `FLOCI_TLS_EXTRA_SANS` (comma-separated). An IP there becomes an IP SAN.
 
 ### Custom Domains Learned at Runtime
 

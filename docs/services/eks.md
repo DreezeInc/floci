@@ -178,7 +178,7 @@ The credentials endpoint performs the following validations:
 
 Kubernetes only accepts an `https` `clientConfig.url` on a `MutatingWebhookConfiguration`, together with a `caBundle` the API server trusts. Floci serves HTTP with the default `floci.tls.enabled=false`, so the webhook is skipped with a warning in that case and pods start unmutated. Set `FLOCI_TLS_ENABLED=true` to get injection; the `caBundle` is then Floci's local CA, the same one served at `GET /_floci/ca.pem`.
 
-The webhook URL uses the hostname containers reach Floci on. When Floci runs natively that is `host.docker.internal`, which the self-signed certificate covers. When Floci itself runs in a container the hostname is its container IP, and the self-signed certificate carries no SAN for it, so the API server rejects the handshake. Pods still start, unmutated. Point `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` at a name the certificate covers (add it with `FLOCI_HOSTNAME`) to make the webhook reachable from that setup.
+The webhook URL uses the hostname containers reach Floci on. When Floci runs natively that is `host.docker.internal`, which the self-signed certificate covers. When Floci itself runs in a container the hostname is its container IP, which the self-signed certificate does not cover by default, so the API server rejects the handshake. Pods still start, unmutated. Add that IP with `FLOCI_TLS_EXTRA_SANS` (for example from the pod IP through the downward API), or point `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` at a name the certificate covers (add it with `FLOCI_HOSTNAME`).
 
 The webhook carries `failurePolicy: Ignore`, and Floci admits the pod unchanged on any internal error, so a webhook that cannot be registered or cannot be reached never prevents a pod from being created. Registration failures log a warning and leave the cluster running.
 
@@ -647,7 +647,8 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_DISABLE_CNI` | `false` | Start k3s without bundled flannel, network policy, and kube-proxy so an external CNI can take over |
 | `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS` | `false` | Retain k3s bundled local-path provisioner and default StorageClass (default false matches EKS with no default class) |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
-| `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
+| `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
+| `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |
 | `FLOCI_SERVICES_EKS_IMDS` | `false` | Enable link-local IMDS (`169.254.169.254`) proxy in cluster containers |
 | `FLOCI_SERVICES_EKS_EMBEDDED_DNS` | `true` | Inject Floci's embedded DNS server into cluster containers for Route 53 private hosted zones and internal name resolution |
 | `FLOCI_SERVICES_EKS_VPC_ROUTE_PROGRAMMING` | `true` | Program emulated VPC route table entries into k3s cluster containers |
@@ -904,6 +905,20 @@ spec:
 ```
 
 Tokens projected with audience `sts.amazonaws.com` are signed by k3s using the cluster key and advertise the cluster issuer URL. When the AWS SDK inside the container calls `sts:AssumeRoleWithWebIdentity`, Floci verifies the signature against the cluster public key and checks the trust policy conditions. In-cluster components that do not specify an audience receive tokens with both the in-cluster audience and STS audience, allowing normal Kubernetes operation without disruption.
+
+#### Injection at admission (real mode)
+
+A real EKS cluster runs the pod identity webhook, which notices `eks.amazonaws.com/role-arn` on a pod's service account and gives the pod a projected service-account token plus the `AWS_ROLE_ARN` / `AWS_WEB_IDENTITY_TOKEN_FILE` environment the SDKs look for. k3s does not ship that webhook, so Floci registers its own mutating webhook in every real-mode cluster (`FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK`, on by default, needs `FLOCI_TLS_ENABLED=true`). At pod admission it reads the service account's annotations through the cluster and, when `eks.amazonaws.com/role-arn` is present, adds:
+
+- a projected volume `aws-iam-token` with a `serviceAccountToken` source (audience from `eks.amazonaws.com/audience`, default `sts.amazonaws.com`; expiry from `eks.amazonaws.com/token-expiration`, default 86400 s, minimum 600 s)
+- a read-only mount at `/var/run/secrets/eks.amazonaws.com/serviceaccount` on every container and init container
+- `AWS_STS_REGIONAL_ENDPOINTS=regional`, `AWS_DEFAULT_REGION`, `AWS_REGION`, `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`
+
+Entries the pod already declares are left alone, so charts that set their own `AWS_REGION` keep it. Pods whose service account has an EKS Pod Identity association get that injection too, as before, and a pod that qualifies for both gets both.
+
+Controllers inside the cluster (Karpenter, cluster-autoscaler, the ALB controller, external-secrets, KEDA...) still default to the real AWS endpoints. Set `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL=true` and the same webhook also adds `AWS_ENDPOINT_URL=http://<floci host>:<port>` to every pod it mutates, where the host is the Docker host as the cluster sees it (`FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` when set). The webhook's own callback URL uses that host as well, so when Floci runs in a container that host must carry a TLS SAN: add it with `FLOCI_TLS_EXTRA_SANS`.
+
+`AWS_ENDPOINT_URL` does not reach everything: the SDKs' web-identity credential provider calls the STS endpoint it derives from the region (`https://sts.<region>.amazonaws.com`) and ignores the variable. Set `FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true` with `FLOCI_DNS_SPOOF_AWS_SERVICES=sts` so the cluster resolves those names, and only those, to Floci (public images that `registry.k8s.io` redirects to S3 must keep resolving to AWS), and the webhook also mounts the node's copy of Floci's CA bundle (`/etc/floci-ca-bundle.pem`, placed there when the cluster container started) into every mutated pod with `AWS_CA_BUNDLE` pointing at it, so the HTTPS handshake on port 443 succeeds.
 
 #### 2. Minting a service-account token via HTTP (mock mode & out-of-cluster testing)
 
