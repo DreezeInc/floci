@@ -461,6 +461,33 @@ class EmbeddedDnsServerTest {
     }
 
     @Test
+    void spoofAwsServices_narrowsTheSpoofToTheListedServices() {
+        // Catches: a service filter that still hijacks S3-hosted public content (registry redirects)
+        EmbeddedDnsServer spoofing = new EmbeddedDnsServer(List.of(), true, List.of("sts"));
+        assertEquals(List.of("172.19.0.2"), spoofing.resolveARecord("sts.amazonaws.com", "172.19.0.2"));
+        assertEquals(List.of("172.19.0.2"), spoofing.resolveARecord("sts.us-east-2.amazonaws.com", "172.19.0.2"));
+        assertEquals(List.of("172.19.0.2"), spoofing.resolveARecord("STS.us-east-2.api.aws", "172.19.0.2"));
+        assertTrue(spoofing.resolveARecord("prod-registry-k8s-io-us-east-2.s3.dualstack.us-east-2.amazonaws.com", "172.19.0.2").isEmpty());
+        assertTrue(spoofing.resolveARecord("organizations.us-east-1.amazonaws.com", "172.19.0.2").isEmpty());
+        assertTrue(spoofing.resolveARecord("amazonaws.com", "172.19.0.2").isEmpty());
+    }
+
+    @Test
+    void spoofAwsServices_ignoresNamesThatOnlyContainTheServiceLabel() {
+        // Catches: a substring match treating my-sts.s3.amazonaws.com or sts-fips as the STS endpoint
+        EmbeddedDnsServer spoofing = new EmbeddedDnsServer(List.of(), true, List.of(" sts "));
+        assertTrue(spoofing.resolveARecord("my-sts.s3.amazonaws.com", "172.19.0.2").isEmpty());
+        assertTrue(spoofing.resolveARecord("sts-fips.us-east-2.amazonaws.com", "172.19.0.2").isEmpty());
+        assertEquals(List.of("172.19.0.2"), spoofing.resolveARecord("sts.us-east-2.amazonaws.com", "172.19.0.2"));
+    }
+
+    @Test
+    void spoofAwsServices_withoutTheSpoofFlagDoesNothing() {
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.of(), false, List.of("sts"));
+        assertTrue(dns.resolveARecord("sts.us-east-2.amazonaws.com", "172.19.0.2").isEmpty());
+    }
+
+    @Test
     void spoofAwsEndpoints_flociDomainsStillResolve() {
         EmbeddedDnsServer spoofing = new EmbeddedDnsServer(List.of(), true);
         assertTrue(spoofing.matchesSuffix("my-bucket.s3.localhost.floci.io"));

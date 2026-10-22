@@ -102,6 +102,9 @@ floci:
     # Combine with tls.enabled for clients that hardcode https://.
     # Via env var: FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true
     spoof-aws-endpoints: false
+    # Narrow the spoof to these service ids (first hostname label); unset spoofs every AWS name.
+    # Via env var: FLOCI_DNS_SPOOF_AWS_SERVICES=sts
+    # spoof-aws-services: [sts]
 
   auth:
     validate-signatures: false               # Set to true to verify SigV4 signatures for every service (S3: header, presigned URL, presigned POST; others: header)
@@ -339,6 +342,7 @@ All keys in this table are declared on `EmulatorConfig` and accept environment v
 | `FLOCI_SERVICES_LAMBDA_ECR_BASE_URI`               | `public.ecr.aws` | Registry used when pulling Lambda runtime images (legacy: `FLOCI_ECR_BASE_URI`) |
 | `FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__PYTHON3_12__` | *(unset)* | Image reference for `python3.12`; double underscores quote the dotted runtime key |
 | `FLOCI_DNS_EXTRA_SUFFIXES`                         | *(unset)*        | Comma-separated extra hostname suffixes the embedded DNS server resolves to Floci's container IP. E.g. `localhost.localstack.cloud,localhost.example.internal` |
+| `FLOCI_DNS_SPOOF_AWS_SERVICES`                     | *(unset)*        | Comma-separated service ids that narrow `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` to names whose first label is one of them, e.g. `sts` |
 | `FLOCI_SERVICES_SSM_MAX_PARAMETER_HISTORY`         | `5`              | Max parameter versions kept                                   |
 | `FLOCI_SERVICES_SQS_DEFAULT_VISIBILITY_TIMEOUT`    | `30`             | Default visibility timeout (seconds)                          |
 | `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE`              | `1048576`        | Max message size (bytes)                                      |

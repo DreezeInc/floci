@@ -281,6 +281,9 @@ floci:
     # Combine with tls.enabled so clients that hardcode https:// are served on port 443
     # with a certificate covering those suffixes and their regional wildcards.
     spoof-aws-endpoints: false                    # FLOCI_DNS_SPOOF_AWS_ENDPOINTS
+    # Narrow the spoof to these service ids (first hostname label), so public content hosted on
+    # AWS stays reachable. Unset spoofs every AWS name.
+    # spoof-aws-services: [sts]                   # FLOCI_DNS_SPOOF_AWS_SERVICES=sts
 
   auth:
     validate-signatures: false
