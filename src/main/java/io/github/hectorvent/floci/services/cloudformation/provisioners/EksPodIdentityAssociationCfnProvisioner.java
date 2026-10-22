@@ -18,12 +18,13 @@ import java.util.Set;
 /**
  * CloudFormation provisioning for {@code AWS::EKS::PodIdentityAssociation}, backed by
  * {@link EksPodIdentityAssociationService}. {@code Ref} and {@code Fn::GetAtt AssociationArn} are the
- * association ARN and {@code Fn::GetAtt AssociationId} its id, matching AWS. The cluster name is
- * kept as an attribute because the delete needs it alongside the id.
+ * association ARN, {@code Fn::GetAtt AssociationId} its id and {@code Fn::GetAtt ExternalId} the id a
+ * target role's trust policy matches, as in AWS. The cluster name is kept as an attribute because the
+ * delete needs it alongside the id.
  *
  * <p>ClusterName, Namespace and ServiceAccount are createOnly: an update that keeps them reuses the
- * association it already has (RoleArn and Tags are not reconciled), and a change to any of them is
- * refused as a replacement.
+ * association it already has (RoleArn, TargetRoleArn, DisableSessionTags, Policy and Tags are not
+ * reconciled), and a change to any of them is refused as a replacement.
  */
 @ApplicationScoped
 public class EksPodIdentityAssociationCfnProvisioner implements CfnResourceProvisioner {
@@ -70,10 +71,20 @@ public class EksPodIdentityAssociationCfnProvisioner implements CfnResourceProvi
         }
 
         Map<String, String> tags = ctx.resolveTags(props, "Tags");
+        String disableSessionTags = optionalText(props, "DisableSessionTags", ctx);
         CreatePodIdentityAssociationRequest request = new CreatePodIdentityAssociationRequest(
                 clusterName, namespace, serviceAccount, roleArn, null,
-                tags.isEmpty() ? null : tags, null, null, null);
+                tags.isEmpty() ? null : tags,
+                optionalText(props, "TargetRoleArn", ctx),
+                disableSessionTags == null ? null : Boolean.parseBoolean(disableSessionTags),
+                optionalText(props, "Policy", ctx));
         record(r, associationService.create(cluster, request));
+    }
+
+    /** Blank is absent: an intrinsic that chose AWS::NoValue resolves to "". */
+    private static String optionalText(JsonNode props, String name, ProvisionContext ctx) {
+        String value = ctx.resolveOptional(props, name);
+        return value == null || value.isBlank() ? null : value;
     }
 
     private PodIdentityAssociation findAssociation(Cluster cluster, String associationId) {
@@ -97,6 +108,9 @@ public class EksPodIdentityAssociationCfnProvisioner implements CfnResourceProvi
         r.getAttributes().put("AssociationArn", association.associationArn());
         r.getAttributes().put("AssociationId", association.associationId());
         r.getAttributes().put("ClusterName", association.clusterName());
+        if (association.externalId() != null) {
+            r.getAttributes().put("ExternalId", association.externalId());
+        }
     }
 
     @Override

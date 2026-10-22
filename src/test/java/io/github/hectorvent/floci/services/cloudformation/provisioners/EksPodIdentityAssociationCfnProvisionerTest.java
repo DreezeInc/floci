@@ -19,6 +19,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -29,13 +30,16 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * {@code AWS::EKS::PodIdentityAssociation} in isolation: the ARN Ref, the AssociationArn and
- * AssociationId attributes (plus the cluster name kept for delete), the update path and the delete.
+ * {@code AWS::EKS::PodIdentityAssociation} in isolation: the ARN Ref, the AssociationArn, AssociationId
+ * and ExternalId attributes (plus the cluster name kept for delete), the update path and the delete.
  */
 class EksPodIdentityAssociationCfnProvisionerTest {
 
     private static final String ROLE = "arn:aws:iam::000000000000:role/pod";
     private static final String ARN = "arn:aws:eks:us-east-1:000000000000:podidentityassociation/prod/a-1234567890abcdef0";
+    private static final String TARGET_ROLE = "arn:aws:iam::000000000000:role/target";
+    private static final String POLICY =
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Action\":\"s3:*\",\"Resource\":\"*\"}]}";
 
     private final EksService eks = mock(EksService.class);
     private final EksPodIdentityAssociationService associations = mock(EksPodIdentityAssociationService.class);
@@ -45,7 +49,7 @@ class EksPodIdentityAssociationCfnProvisionerTest {
     private final Cluster cluster = cluster("prod");
 
     @Test
-    void refIsTheArnAndItPublishesTheArnIdAndClusterName() throws Exception {
+    void refIsTheArnAndItPublishesTheArnIdExternalIdAndClusterName() throws Exception {
         when(eks.describeCluster("prod")).thenReturn(cluster);
         when(associations.create(eq(cluster), any(CreatePodIdentityAssociationRequest.class)))
                 .thenReturn(association("default", "app-sa"));
@@ -57,10 +61,12 @@ class EksPodIdentityAssociationCfnProvisionerTest {
                 """.formatted(ROLE)), ctx());
 
         assertEquals(ARN, r.getPhysicalId());
-        assertEquals(Set.of("AssociationArn", "AssociationId", "ClusterName"), r.getAttributes().keySet());
+        assertEquals(Set.of("AssociationArn", "AssociationId", "ClusterName", "ExternalId"),
+                r.getAttributes().keySet());
         assertEquals(ARN, r.getAttributes().get("AssociationArn"));
         assertEquals("a-1234567890abcdef0", r.getAttributes().get("AssociationId"));
         assertEquals("prod", r.getAttributes().get("ClusterName"));
+        assertEquals("external", r.getAttributes().get("ExternalId"));
         ArgumentCaptor<CreatePodIdentityAssociationRequest> request =
                 ArgumentCaptor.forClass(CreatePodIdentityAssociationRequest.class);
         verify(associations).create(eq(cluster), request.capture());
@@ -69,6 +75,47 @@ class EksPodIdentityAssociationCfnProvisionerTest {
         assertEquals("app-sa", request.getValue().serviceAccount());
         assertEquals(ROLE, request.getValue().roleArn());
         assertEquals(Map.of("Name", "prod-pia"), request.getValue().tags());
+        assertNull(request.getValue().targetRoleArn());
+        assertNull(request.getValue().disableSessionTags());
+        assertNull(request.getValue().policy());
+    }
+
+    @Test
+    void targetRoleSessionTagsAndPolicyReachTheCreateRequest() throws Exception {
+        when(eks.describeCluster("prod")).thenReturn(cluster);
+        when(associations.create(eq(cluster), any(CreatePodIdentityAssociationRequest.class)))
+                .thenReturn(association("default", "app-sa"));
+
+        provisioner.provision(resource("Pia"), props("""
+                {"ClusterName": "prod", "Namespace": "default", "ServiceAccount": "app-sa", "RoleArn": "%s",
+                 "TargetRoleArn": "%s", "DisableSessionTags": true, "Policy": "%s"}
+                """.formatted(ROLE, TARGET_ROLE, POLICY.replace("\"", "\\\""))), ctx());
+
+        ArgumentCaptor<CreatePodIdentityAssociationRequest> request =
+                ArgumentCaptor.forClass(CreatePodIdentityAssociationRequest.class);
+        verify(associations).create(eq(cluster), request.capture());
+        assertEquals(TARGET_ROLE, request.getValue().targetRoleArn());
+        assertEquals(Boolean.TRUE, request.getValue().disableSessionTags());
+        assertEquals(POLICY, request.getValue().policy());
+    }
+
+    @Test
+    void sessionTagsLeftOnAndBlankOptionalsAreAbsent() throws Exception {
+        when(eks.describeCluster("prod")).thenReturn(cluster);
+        when(associations.create(eq(cluster), any(CreatePodIdentityAssociationRequest.class)))
+                .thenReturn(association("default", "app-sa"));
+
+        provisioner.provision(resource("Pia"), props("""
+                {"ClusterName": "prod", "Namespace": "default", "ServiceAccount": "app-sa", "RoleArn": "%s",
+                 "TargetRoleArn": "", "DisableSessionTags": "false", "Policy": ""}
+                """.formatted(ROLE)), ctx());
+
+        ArgumentCaptor<CreatePodIdentityAssociationRequest> request =
+                ArgumentCaptor.forClass(CreatePodIdentityAssociationRequest.class);
+        verify(associations).create(eq(cluster), request.capture());
+        assertNull(request.getValue().targetRoleArn());
+        assertEquals(Boolean.FALSE, request.getValue().disableSessionTags());
+        assertNull(request.getValue().policy());
     }
 
     @Test

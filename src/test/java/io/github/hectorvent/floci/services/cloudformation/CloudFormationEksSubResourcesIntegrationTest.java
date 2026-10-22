@@ -12,6 +12,7 @@ import java.util.Map;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
@@ -64,6 +65,7 @@ class CloudFormationEksSubResourcesIntegrationTest {
         assertThat(outputs.get("AssociationArn"), containsString(":podidentityassociation/" + clusterName + "/"));
         assertEquals(outputs.get("AssociationArn"), outputs.get("AssociationRef"));
         assertThat(outputs.get("AssociationId"), startsWith("a-"));
+        assertThat(outputs.get("AssociationExternalId"), not(equalTo("")));
         assertEquals(clusterName + "-oidc-idp|" + clusterName + "|oidc", outputs.get("IdpRef"));
         assertThat(outputs.get("IdpArn"), containsString(":identityproviderconfig/" + clusterName + "/oidc/"
                 + clusterName + "-oidc-idp/"));
@@ -104,7 +106,12 @@ class CloudFormationEksSubResourcesIntegrationTest {
                 .body("association.associationArn", equalTo(outputs.get("AssociationArn")))
                 .body("association.namespace", equalTo("default"))
                 .body("association.serviceAccount", equalTo("app"))
-                .body("association.roleArn", equalTo(roleArn));
+                .body("association.roleArn", equalTo(roleArn))
+                .body("association.targetRoleArn", endsWith(":role/" + clusterName + "-target"))
+                .body("association.disableSessionTags", equalTo(true))
+                .body("association.policy", equalTo("{\"Version\":\"2012-10-17\",\"Statement\":"
+                        + "[{\"Effect\":\"Deny\",\"Action\":\"s3:*\",\"Resource\":\"*\"}]}"))
+                .body("association.externalId", equalTo(outputs.get("AssociationExternalId")));
         given().contentType("application/json").body(idpHandle(clusterName))
                 .post("/clusters/" + clusterName + "/identity-provider-configs/describe").then()
                 .statusCode(200)
@@ -295,6 +302,9 @@ class CloudFormationEksSubResourcesIntegrationTest {
                         "Namespace": "default",
                         "ServiceAccount": "app",
                         "RoleArn": {"Fn::GetAtt": ["Role", "Arn"]},
+                        "TargetRoleArn": {"Fn::Sub": "arn:aws:iam::${AWS::AccountId}:role/%1$s-target"},
+                        "DisableSessionTags": true,
+                        "Policy": "{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[{\\"Effect\\":\\"Deny\\",\\"Action\\":\\"s3:*\\",\\"Resource\\":\\"*\\"}]}",
                         "Tags": [{"Key": "Name", "Value": "pia"}]
                       }
                     },
@@ -372,6 +382,7 @@ class CloudFormationEksSubResourcesIntegrationTest {
                     "AssociationRef": {"Value": {"Ref": "Pia"}},
                     "AssociationArn": {"Value": {"Fn::GetAtt": ["Pia", "AssociationArn"]}},
                     "AssociationId": {"Value": {"Fn::GetAtt": ["Pia", "AssociationId"]}},
+                    "AssociationExternalId": {"Value": {"Fn::GetAtt": ["Pia", "ExternalId"]}},
                     "IdpRef": {"Value": {"Ref": "Idp"}},
                     "IdpArn": {"Value": {"Fn::GetAtt": ["Idp", "IdentityProviderConfigArn"]}},
                     "OidcRef": {"Value": {"Ref": "Oidc"}},
