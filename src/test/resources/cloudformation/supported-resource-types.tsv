@@ -116,6 +116,7 @@ AWS::GuardDuty::MalwareProtectionPlan	GuardDutyMalwareProtectionPlanCfnProvision
 AWS::IAM::AccessKey	IamAccessKeyCfnProvisioner
 AWS::IAM::InstanceProfile	IamInstanceProfileCfnProvisioner
 AWS::IAM::ManagedPolicy	IamManagedPolicyCfnProvisioner
+AWS::IAM::OIDCProvider	IamOidcProviderCfnProvisioner
 AWS::IAM::Policy	IamPolicyCfnProvisioner
 AWS::IAM::Role	IamRoleCfnProvisioner
 AWS::IAM::User	IamUserCfnProvisioner

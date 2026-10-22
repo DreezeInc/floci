@@ -80,7 +80,7 @@ type_order:
   AWS::SNS: [Topic, Subscription]
   AWS::DynamoDB: [Table, GlobalTable]
   AWS::Lambda: [Function, LayerVersion, EventSourceMapping, Version, Alias, Permission]
-  AWS::IAM: [Role, User, AccessKey, Policy, ManagedPolicy, InstanceProfile]
+  AWS::IAM: [Role, User, AccessKey, Policy, ManagedPolicy, InstanceProfile, OIDCProvider]
   AWS::Organizations: [Organization, OrganizationalUnit, Account, Policy, ResourcePolicy]
   AWS::KMS: [Key, Alias]
   AWS::SecretsManager: [Secret, SecretTargetAttachment]
@@ -201,6 +201,7 @@ notes:
   AWS::EKS::AccessEntry: '`AccessPolicies` are accepted and not associated; a reused entry is not reconciled on update'
   AWS::EKS::PodIdentityAssociation: 'a reused association is not reconciled on update'
   AWS::EKS::IdentityProviderConfig: 'metadata only, the issuer is never contacted and the config is ACTIVE at once; a reused config is not reconciled on update'
+  AWS::IAM::OIDCProvider: 'a reused provider is not reconciled on update'
   AWS::CloudFront::Function: '`KeyValueStoreAssociations` is ignored'
   AWS::GuardDuty::MalwareProtectionPlan: 'management plane only: no scan runs, so the plan stays ACTIVE; Ref returns the plan id; a BucketName change is rejected'
   AWS::BedrockAgentCore::Runtime: 'Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored'
