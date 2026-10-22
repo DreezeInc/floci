@@ -313,6 +313,31 @@ class EksClusterManagerTest {
     }
 
     @Test
+    void serverArgsAddTheEndpointHostAsASecondTlsSan() {
+        List<String> args = EksClusterManager.buildServerArgs(false, false, null, null,
+                Optional.of("floci-service.floci-pr-1.svc.cluster.local"));
+
+        assertTrue(args.contains("--tls-san=localhost"));
+        assertTrue(args.contains("--tls-san=floci-service.floci-pr-1.svc.cluster.local"));
+    }
+
+    @Test
+    void serverArgsIgnoreABlankEndpointHost() {
+        List<String> args = EksClusterManager.buildServerArgs(false, false, null, null, Optional.of(" "));
+
+        assertEquals(1, args.stream().filter(a -> a.startsWith("--tls-san=")).count());
+    }
+
+    @Test
+    void publicEndpointUsesTheEndpointHostOverEveryMode() {
+        assertEquals("https://floci-service.floci-pr-1.svc.cluster.local:6512",
+                EksClusterManager.resolvePublicEndpoint(true, "network", "floci-eks-demo", 6512,
+                        Optional.of("floci-service.floci-pr-1.svc.cluster.local")));
+        assertEquals("https://localhost:6512",
+                EksClusterManager.resolvePublicEndpoint(false, "host", "floci-eks-demo", 6512, Optional.empty()));
+    }
+
+    @Test
     void serverArgsRetainLocalStorageWhenDefaultStorageClassEnabled() {
         List<String> args = EksClusterManager.buildServerArgs(false, true, null, null);
 
@@ -3119,6 +3144,7 @@ class EksClusterManagerTest {
         private ContainerLifecycleManager lifecycleManager;
         private CopyArchiveToContainerCmd copyCmd;
         private EksClusterManager manager;
+        private ContainerBuilder.Builder builder;
 
         @BeforeEach
         void setUp() {
@@ -3148,7 +3174,7 @@ class EksClusterManagerTest {
                     .thenReturn(new ContainerInfo("container-1", Map.of()));
 
             ContainerBuilder containerBuilder = Mockito.mock(ContainerBuilder.class);
-            ContainerBuilder.Builder builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
+            builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
             when(containerBuilder.newContainer(anyString())).thenReturn(builder);
             when(builder.build()).thenReturn(new ContainerSpec("test-image"));
 
@@ -3189,7 +3215,7 @@ class EksClusterManagerTest {
             assertTrue(manifest.contains("caBundle: \""
                     + Base64.getEncoder().encodeToString(CA_PEM.getBytes(StandardCharsets.UTF_8)) + "\""));
             assertTrue(manifest.contains("failurePolicy: Ignore"));
-            assertTrue(manifest.contains("timeoutSeconds: 3"));
+            assertTrue(manifest.contains("timeoutSeconds: 10"));
             assertTrue(manifest.contains("operations: [\"CREATE\"]"));
             assertTrue(manifest.contains("resources: [\"pods\"]"));
             assertFalse(manifest.contains("url: \"http://"), "Kubernetes rejects a non-https webhook URL");
@@ -3221,6 +3247,71 @@ class EksClusterManagerTest {
             when(eks.podIdentityWebhook()).thenReturn(false);
 
             manager.registerPodIdentityWebhook("container-1", cluster());
+
+            verify(lifecycleManager, never()).getDockerClient();
+        }
+
+        @Test
+        void startClusterAlwaysWrapsK3sInTheRshareEntrypoint() {
+            when(eks.disableCni()).thenReturn(false);
+
+            manager.startCluster(cluster());
+
+            verify(builder).withEntrypoint(EksClusterManager.RSHARE_ENTRYPOINT);
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<String>> cmdCaptor = ArgumentCaptor.forClass(List.class);
+            verify(builder).withCmd(cmdCaptor.capture());
+            // DaemonSets that mount the node root with mountPropagation (node-exporter) need
+            // the shared root as much as an external CNI does, so the wrap is not CNI-gated.
+            assertEquals("floci-k3s", cmdCaptor.getValue().get(0));
+            assertTrue(cmdCaptor.getValue().contains("server"));
+        }
+
+        @Test
+        void ebsStorageManifestServesGp2ThroughTheEbsCsiDriverName() {
+            String manifest = EksClusterManager.buildEbsStorageManifest(true);
+
+            assertTrue(manifest.contains("kind: StorageClass\nmetadata:\n  name: gp2\n"));
+            assertTrue(manifest.contains("storageclass.kubernetes.io/is-default-class: \"true\""));
+            // CSI migration annotates a kubernetes.io/aws-ebs claim for ebs.csi.aws.com, and an
+            // external provisioner only serves classes that name it, so gp2 names the driver.
+            assertTrue(manifest.contains("provisioner: ebs.csi.aws.com\n"));
+            assertFalse(manifest.contains("kubernetes.io/aws-ebs"));
+            assertTrue(manifest.contains("- --provisioner-name\n        - ebs.csi.aws.com\n"));
+            // Node-path mode refuses Immediate binding; shared mode serves both binding modes.
+            assertTrue(manifest.contains("\"sharedFileSystemPath\": \"/var/lib/rancher/k3s/storage/floci-ebs\""));
+            assertFalse(manifest.contains("nodePathMap"));
+            assertTrue(manifest.contains("kind: ClusterRoleBinding"), "k3s's local-storage RBAC is off, so it ships its own");
+        }
+
+        @Test
+        void gp2StaysNonDefaultWhenK3sKeepsItsOwnDefaultClass() {
+            String manifest = EksClusterManager.buildEbsStorageManifest(false);
+
+            assertFalse(manifest.contains("is-default-class"));
+            assertTrue(manifest.contains("  name: gp2\n"));
+        }
+
+        @Test
+        void writesTheEbsStorageManifestIntoTheK3sManifestsDirectory() throws Exception {
+            when(eks.emulateEbsStorage()).thenReturn(true);
+            Cluster cluster = cluster();
+            cluster.setDefaultStorageClass(false);
+
+            manager.registerEbsStorageEmulation("container-1", cluster);
+
+            verify(copyCmd).withRemotePath("/var/lib/rancher/k3s");
+            verify(copyCmd).exec();
+            String written = Files.readString(tempDir.resolve("storage").resolve("demo")
+                    .resolve("floci-eks-ebs-storage.yaml"));
+            assertTrue(written.contains("is-default-class"));
+        }
+
+        @Test
+        void skipsEbsStorageWhenTheKnobIsOff() {
+            when(eks.emulateEbsStorage()).thenReturn(false);
+
+            manager.registerEbsStorageEmulation("container-1", cluster());
 
             verify(lifecycleManager, never()).getDockerClient();
         }
@@ -3822,6 +3913,102 @@ class EksClusterManagerTest {
     }
 
     @Nested
+    class AwsAuthTest {
+
+        private static final String ROLE = "arn:aws:iam::000000000000:role/eks-node";
+        private EksClusterManager manager;
+        private Cluster cluster;
+        private ArgumentCaptor<String[]> commands;
+
+        @BeforeEach
+        void setUp() {
+            EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+            EmulatorConfig.ServicesConfig services = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+            when(config.services()).thenReturn(services);
+            when(services.eks()).thenReturn(Mockito.mock(EmulatorConfig.EksServiceConfig.class));
+            manager = Mockito.spy(new EksClusterManager(Mockito.mock(ContainerBuilder.class),
+                    Mockito.mock(ContainerLifecycleManager.class), Mockito.mock(ContainerDetector.class),
+                    Mockito.mock(PortAllocator.class), Mockito.mock(DockerHostResolver.class),
+                    Mockito.mock(EcrRegistryManager.class), config, new RegionResolver("us-east-1", "000000000000"),
+                    Mockito.mock(Ec2MetadataServer.class), Mockito.mock(EksOidcService.class),
+                    inlineMock(FlociCertificateAuthority.class), Mockito.mock(ContainerLogStreamer.class),
+                    new InMemoryStorage<>()));
+            cluster = new Cluster();
+            cluster.setName("auth-cluster");
+            cluster.setContainerId("auth-container");
+            commands = ArgumentCaptor.forClass(String[].class);
+        }
+
+        private void execReturns(ContainerExec.Result first, ContainerExec.Result... rest) {
+            doReturn(first, (Object[]) rest).when(manager)
+                    .execInContainerForResult(eq("auth-container"), commands.capture(), anyInt());
+        }
+
+        private static ContainerExec.Result ok(String stdout) {
+            return new ContainerExec.Result(0L, stdout, "", false);
+        }
+
+        @Test
+        void createsTheConfigMapWithTheNodeRoleWhenItIsAbsent() {
+            execReturns(ok(""), ok("configmap/aws-auth created"));
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+
+            String script = commands.getAllValues().get(1)[2];
+            assertTrue(script.endsWith("| kubectl create -f -"), script);
+            assertTrue(script.contains("\"name\":\"aws-auth\"") && script.contains("\"namespace\":\"kube-system\""));
+            assertTrue(script.contains("rolearn: \\\"" + ROLE + "\\\"")
+                    && script.contains("system:node:{{EC2PrivateDNSName}}")
+                    && script.contains("system:bootstrappers") && script.contains("system:nodes"), script);
+        }
+
+        @Test
+        void appendsTheMissingRoleAndKeepsEveryOtherEntry() {
+            String existing = "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"aws-auth\","
+                    + "\"namespace\":\"kube-system\",\"resourceVersion\":\"417\",\"managedFields\":[{}]},"
+                    + "\"data\":{\"mapRoles\":\"- rolearn: arn:aws:iam::000000000000:role/reader\\n"
+                    + "  username: reader\\n  groups:\\n  - readers\\n\",\"mapUsers\":\"[]\"}}";
+            execReturns(ok(existing), ok("configmap/aws-auth replaced"));
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+
+            String script = commands.getAllValues().get(1)[2];
+            assertTrue(script.endsWith("| kubectl replace -f -"), script);
+            assertTrue(script.contains("\"resourceVersion\":\"417\"") && !script.contains("managedFields"), script);
+            assertTrue(script.contains("role/reader") && script.contains("readers") && script.contains(ROLE), script);
+            assertTrue(script.contains("\"mapUsers\":\"[]\""), script);
+        }
+
+        @Test
+        void writesNothingWhenEveryRoleIsAlreadyMapped() {
+            String existing = "{\"metadata\":{\"name\":\"aws-auth\"},\"data\":{\"mapRoles\":\"- rolearn: "
+                    + ROLE + "\\n  username: node\\n\"}}";
+            execReturns(ok(existing));
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+
+            assertEquals(1, commands.getAllValues().size());
+        }
+
+        @Test
+        void reportsAFailedWriteSoTheCallerRetries() {
+            execReturns(ok(""), new ContainerExec.Result(1L, "Error from server (AlreadyExists)", "", false));
+
+            assertFalse(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+        }
+
+        @Test
+        void doesNothingWithoutAContainerOrRoles() {
+            Cluster stopped = new Cluster();
+            stopped.setName("stopped");
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(stopped, List.of(ROLE)));
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of()));
+            Mockito.verify(manager, Mockito.never()).execInContainerForResult(any(), any(), anyInt());
+        }
+    }
+
+    @Nested
     class JoinedInstancesTest {
 
         private EksClusterManager manager;
@@ -3985,6 +4172,45 @@ class EksClusterManagerTest {
             inst.setArchitecture(arch);
             inst.setPrivateIpAddress(ip);
             return inst;
+        }
+    }
+
+    @Nested
+    class ServiceAccountAnnotations {
+
+        @Test
+        void readsTheAnnotationsOffTheServiceAccountJson() {
+            Map<String, String> annotations = EksClusterManager.serviceAccountAnnotationsOf("""
+                    {"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":"karpenter",
+                     "annotations":{"eks.amazonaws.com/role-arn":"arn:aws:iam::123456789012:role/karpenter",
+                                    "meta.helm.sh/release-name":"karpenter"}}}""");
+
+            assertEquals(Map.of(
+                    "eks.amazonaws.com/role-arn", "arn:aws:iam::123456789012:role/karpenter",
+                    "meta.helm.sh/release-name", "karpenter"), annotations);
+        }
+
+        @Test
+        void serviceAccountWithoutAnnotationsReadsEmpty() {
+            assertEquals(Map.of(), EksClusterManager.serviceAccountAnnotationsOf(
+                    "{\"apiVersion\":\"v1\",\"kind\":\"ServiceAccount\",\"metadata\":{\"name\":\"default\"}}"));
+        }
+
+        @Test
+        void unreadableOutputReadsEmpty() {
+            assertEquals(Map.of(), EksClusterManager.serviceAccountAnnotationsOf("Error from server (NotFound)"));
+            assertEquals(Map.of(), EksClusterManager.serviceAccountAnnotationsOf(""));
+        }
+
+        @Test
+        void clusterWithoutAContainerIsNotAsked() {
+            EksClusterManager manager = new EksClusterManager(
+                    Mockito.mock(ContainerBuilder.class), Mockito.mock(ContainerLifecycleManager.class),
+                    Mockito.mock(ContainerDetector.class), Mockito.mock(PortAllocator.class),
+                    Mockito.mock(DockerHostResolver.class), Mockito.mock(EcrRegistryManager.class),
+                    Mockito.mock(EmulatorConfig.class), Mockito.mock(RegionResolver.class));
+
+            assertEquals(Map.of(), manager.serviceAccountAnnotations(new Cluster(), "karpenter", "karpenter"));
         }
     }
 }

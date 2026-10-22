@@ -243,6 +243,18 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean spoofAwsEndpoints();
+
+        /**
+         * Narrows {@link #spoofAwsEndpoints()} to the listed service ids: only AWS endpoint names
+         * whose first label is one of them ({@code sts} covers {@code sts.amazonaws.com} and
+         * {@code sts.<region>.amazonaws.com}) resolve to Floci; every other AWS name keeps the
+         * normal upstream resolution, so public content hosted on AWS (container registries
+         * redirecting to S3, package mirrors) stays reachable from spawned containers.
+         *
+         * <p>Unset means every AWS name is spoofed, as before.
+         * Env: {@code FLOCI_DNS_SPOOF_AWS_SERVICES} (comma-separated)
+         */
+        Optional<List<String>> spoofAwsServices();
     }
 
     interface SecurityConfig {
@@ -3330,6 +3342,15 @@ public interface EmulatorConfig {
         String endpointMode();
 
         /**
+         * A hostname that {@code describe-cluster} returns in place of {@code localhost}
+         * ({@code https://<host>:<hostPort>}) and that is added to the k3s serving certificate's
+         * SANs, so clients that reach the published port through that name verify the cluster CA.
+         * Overrides {@code endpointMode}. Meant for a Floci whose k3s ports are published behind a
+         * Kubernetes Service or another stable DNS name.
+         */
+        Optional<String> endpointHost();
+
+        /**
          * When true, wires a token-authentication webhook into k3s so that the bearer token
          * produced by {@code aws eks get-token} is validated by Floci and mapped to cluster-admin.
          * This makes the native {@code aws eks update-kubeconfig} + {@code kubectl} flow work.
@@ -3371,6 +3392,16 @@ public interface EmulatorConfig {
         boolean defaultStorageClass();
 
         /**
+         * When true, every new cluster gets the stock EKS {@code gp2} StorageClass and a provisioner
+         * that serves it, and any other StorageClass naming {@code ebs.csi.aws.com}, from the
+         * node's filesystem, so workloads written for EBS bind their claims without the EBS CSI
+         * driver. {@code gp2} is the cluster's default class unless {@link #defaultStorageClass()}
+         * keeps k3s's own.
+         */
+        @WithDefault("false")
+        boolean emulateEbsStorage();
+
+        /**
          * When true, exposes an IMDS link-local proxy (169.254.169.254:80) inside the cluster container's
          * network namespace that relays to Floci's EC2 metadata service.
          */
@@ -3402,6 +3433,14 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean podIdentityWebhook();
+
+        /**
+         * When true, every container the pod identity webhook mutates also gets
+         * {@code AWS_ENDPOINT_URL} pointing at Floci, so the SDKs inside the cluster call the
+         * emulator without each workload being configured for it.
+         */
+        @WithDefault("false")
+        boolean injectEndpointUrl();
 
         /**
          * When true, configures cluster containers with Floci's embedded DNS server so that
@@ -3511,6 +3550,13 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean selfSigned();
+
+        /**
+         * Extra hostnames or IP addresses the generated server certificate covers, comma-separated:
+         * for clients that reach Floci on an address nothing else configures, such as its pod IP.
+         * Env: FLOCI_TLS_EXTRA_SANS
+         */
+        Optional<List<String>> extraSans();
 
         /**
          * Additional port the TLS proxy binds for AWS-style HTTPS traffic, alongside the

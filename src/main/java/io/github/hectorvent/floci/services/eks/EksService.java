@@ -46,6 +46,9 @@ import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.Provider;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
+import io.github.hectorvent.floci.services.eks.model.Update;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterConfigRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterVersionRequest;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -64,6 +67,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -83,7 +87,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     private record UserDataClaim(String userData, CompletableFuture<UserDataPipeline.ExecutionResult> future) {}
 
-    private static final List<String> ALL_LOG_TYPES = List.of(
+    static final List<String> ALL_LOG_TYPES = List.of(
             "api", "audit", "authenticator", "controllerManager", "scheduler"
     );
 
@@ -105,6 +109,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final EksClusterUpdateService clusterUpdates;
+    private final EksIdentityProviderConfigService identityProviderConfigs;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
     private final Map<String, UserDataClaim> appliedClusterUserData = new ConcurrentHashMap<>();
     private final Map<String, Object> nodeGroupCapacityLocks = new ConcurrentHashMap<>();
@@ -112,13 +118,15 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     // Storage hands every caller the same live Cluster, and Cluster keeps identity equality.
     private final Set<Cluster> clustersBeingDeleted = ConcurrentHashMap.newKeySet();
     private final Set<String> restoringClusters = ConcurrentHashMap.newKeySet();
+    private final Map<String, Set<String>> awsAuthMappedRoles = new ConcurrentHashMap<>();
 
     @Inject
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations,
-            EksAddonService addons) {
+            EksAddonService addons, EksClusterUpdateService clusterUpdates,
+            EksIdentityProviderConfigService identityProviderConfigs) {
         this.storage = storageFactory.create("eks", "eks-clusters.json",
                 new TypeReference<Map<String, Cluster>>() {
                 });
@@ -136,6 +144,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.clusterUpdates = clusterUpdates;
+        this.identityProviderConfigs = identityProviderConfigs;
         if (this.clusterManager != null) {
             this.clusterManager.setEc2Service(this.ec2Service);
         }
@@ -144,16 +154,34 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
+            EksPodIdentityAssociationService podIdentityAssociations,
+            EksAddonService addons, EksClusterUpdateService clusterUpdates) {
+        this(storageFactory, config, regionResolver, clusterManager, ec2Service,
+                oidcService, accessEntries, podIdentityAssociations, addons, clusterUpdates, null);
+    }
+
+    public EksService(StorageFactory storageFactory, EmulatorConfig config,
+            RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
+            EksOidcService oidcService, EksAccessEntryService accessEntries,
+            EksPodIdentityAssociationService podIdentityAssociations,
+            EksAddonService addons) {
+        this(storageFactory, config, regionResolver, clusterManager, ec2Service,
+                oidcService, accessEntries, podIdentityAssociations, addons, null, null);
+    }
+
+    public EksService(StorageFactory storageFactory, EmulatorConfig config,
+            RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
+            EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
-                oidcService, accessEntries, podIdentityAssociations, null);
+                oidcService, accessEntries, podIdentityAssociations, null, null, null);
     }
 
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries) {
         this(storageFactory, config, regionResolver, clusterManager, ec2Service,
-                oidcService, accessEntries, null, null);
+                oidcService, accessEntries, null, null, null, null);
     }
 
     @PostConstruct
@@ -726,7 +754,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
      */
     private void markMetadataOnlyActive(Cluster cluster) {
         cluster.setStatus(ClusterStatus.ACTIVE);
-        cluster.setEndpoint("https://localhost:" + config.services().eks().apiServerBasePort());
+        String host = config.services().eks().endpointHost().filter(h -> !h.isBlank()).orElse("localhost");
+        cluster.setEndpoint("https://" + host + ":" + config.services().eks().apiServerBasePort());
     }
 
     public Optional<Cluster> findAuthenticationCluster(String accountId, String name) {
@@ -742,6 +771,20 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             cluster.setLogging(defaultLogging());
         }
         return cluster;
+    }
+
+    public Update updateClusterConfig(String name, UpdateClusterConfigRequest request) {
+        Cluster cluster = describeCluster(name);
+        Update update = clusterUpdates.updateClusterConfig(cluster, request);
+        storage.put(name, cluster);
+        return update;
+    }
+
+    public Update updateClusterVersion(String name, UpdateClusterVersionRequest request) {
+        Cluster cluster = describeCluster(name);
+        Update update = clusterUpdates.updateClusterVersion(cluster, request);
+        storage.put(name, cluster);
+        return update;
     }
 
     @Override
@@ -846,6 +889,12 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
             if (addons != null) {
                 addons.deleteClusterAddons(cluster);
+            }
+            if (clusterUpdates != null) {
+                clusterUpdates.deleteClusterUpdates(cluster);
+            }
+            if (identityProviderConfigs != null) {
+                identityProviderConfigs.deleteClusterConfigs(cluster);
             }
             synchronized (clustersBeingDeleted) {
                 storage.delete(name);
@@ -1618,11 +1667,39 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                     } else if (cluster.getStatus() == ClusterStatus.ACTIVE && hasPendingJoinedInstances(cluster)) {
                         restoreJoinedInstancesAsync(entry.accountId(), cluster);
                     }
+                    if (cluster.getStatus() == ClusterStatus.ACTIVE) {
+                        mapNodeGroupRolesInAwsAuth(entry.accountId(), cluster);
+                    }
                 }
             } catch (Exception e) {
                 LOG.error("Error in EKS readiness poller", e);
             }
         }, 2, 3, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Keeps the running cluster's {@code aws-auth} mapping every ACTIVE managed node group role.
+     * Roles are remembered per container, so a replaced container is mapped again and a failed
+     * attempt is retried on the next tick.
+     */
+    void mapNodeGroupRolesInAwsAuth(String accountId, Cluster cluster) {
+        String containerId = cluster.getContainerId();
+        AccessConfig access = cluster.getAccessConfig();
+        if (clusterManager == null || containerId == null
+                || (access != null && "API".equals(access.authenticationMode()))) {
+            return;
+        }
+        Set<String> roles = listNodeGroupsForCluster(cluster.getName(), accountId).stream()
+                .filter(group -> group.getStatus() == NodegroupStatus.ACTIVE && group.getNodeRole() != null)
+                .map(Nodegroup::getNodeRole)
+                .collect(Collectors.toCollection(TreeSet::new));
+        String key = accountId + "/" + cluster.getName() + "/" + containerId;
+        if (roles.isEmpty() || awsAuthMappedRoles.getOrDefault(key, Set.of()).containsAll(roles)) {
+            return;
+        }
+        if (clusterManager.ensureAwsAuthNodeRoles(cluster, roles)) {
+            awsAuthMappedRoles.put(key, roles);
+        }
     }
 
     private void restoreJoinedInstancesAsync(String accountId, Cluster cluster) {

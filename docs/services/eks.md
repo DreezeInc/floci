@@ -22,11 +22,18 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `ListPodIdentityAssociations` | List pod identity associations in a cluster with optional filtering and pagination |
 | `UpdatePodIdentityAssociation` | Update the IAM role, target role, or session tags for a pod identity association |
 | `DeletePodIdentityAssociation` | Delete a pod identity association |
+| `AssociateIdentityProviderConfig` | Associate an OIDC identity provider config with a cluster (metadata only) |
+| `DescribeIdentityProviderConfig` | Describe an OIDC identity provider config by type and name |
+| `ListIdentityProviderConfigs` | List identity provider config handles for a cluster with pagination |
+| `DisassociateIdentityProviderConfig` | Disassociate an identity provider config from a cluster |
 | `CreateAddon` | Create an addon for an EKS cluster |
 | `DescribeAddon` | Describe an addon by cluster and addon name |
 | `ListAddons` | List addon names installed in a cluster with pagination |
 | `UpdateAddon` | Update addon configuration, version, or service account role |
-| `DescribeUpdate` | Describe an update for an addon |
+| `UpdateClusterConfig` | Update endpoint access, control-plane logging, or the authentication mode of a cluster |
+| `UpdateClusterVersion` | Move a cluster to the next Kubernetes minor version (metadata only) |
+| `DescribeUpdate` | Describe a cluster or addon update by update ID |
+| `ListUpdates` | List update IDs for a cluster, optionally filtered by addon or node group name |
 | `DeleteAddon` | Delete an addon from a cluster |
 | `DescribeAddonVersions` | Describe supported addon versions by Kubernetes version or addon name |
 | `CreateNodegroup` | Create node group metadata for a cluster |
@@ -40,6 +47,54 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `TagResource` | Add tags to a cluster |
 | `UntagResource` | Remove tags from a cluster |
 | `ListTagsForResource` | List tags on a cluster |
+
+## Cluster updates
+
+`UpdateClusterConfig` (`POST /clusters/{name}/update-config`) changes exactly one of
+`resourcesVpcConfig`, `logging`, or `accessConfig` per request, as on AWS: a request that
+names none of them, or more than one, is an `InvalidParameterException`. The cluster must be
+`ACTIVE`. Updates complete synchronously and return an `Update` with status `Successful`:
+
+- `resourcesVpcConfig`: `endpointPublicAccess`, `endpointPrivateAccess` and `publicAccessCidrs`
+  are applied to the cluster (update type `VpcConfigUpdate`). Disabling both endpoints is
+  rejected. `subnetIds` and `securityGroupIds` cannot be changed in Floci.
+- `logging`: each `clusterLogging` entry enables or disables the listed types, leaving the
+  others as they were (`LoggingUpdate`). The cluster keeps the normalized enabled/disabled form
+  returned by `DescribeCluster`.
+- `accessConfig.authenticationMode`: moves forward only, `CONFIG_MAP` to `API_AND_CONFIG_MAP`
+  to `API` (`AccessConfigUpdate`). A no-op or backward change is rejected, as on AWS.
+
+`UpdateClusterVersion` (`POST /clusters/{name}/updates`) accepts the next minor version
+only and records it on the cluster (`VersionUpdate`). In real mode the running k3s control
+plane is not upgraded in place; the new version is used when the cluster is next started.
+
+`ListUpdates` (`GET /clusters/{name}/updates`) returns the IDs of cluster, identity provider
+config and addon updates, with `maxResults` and `nextToken` pagination; `addonName` narrows it to
+that addon's updates and `nodegroupName` yields an empty list because node group updates are not
+modeled. `DescribeUpdate` (`GET /clusters/{name}/updates/{updateId}`) resolves any of those kinds
+and returns `ResourceNotFoundException` when no store has it. Deleting a cluster drops its updates.
+
+## Identity provider configs
+
+`AssociateIdentityProviderConfig` (`POST /clusters/{name}/identity-provider-configs/associate`)
+records an OIDC identity provider config on an `ACTIVE` cluster and returns an `Update` of type
+`AssociateIdentityProviderConfig` with status `Successful` plus the request's `tags`. The config
+is metadata only: the issuer is never contacted, so it is `ACTIVE` at once. `oidc` must carry
+`identityProviderConfigName`, an `https://` `issuerUrl` and a `clientId`; `usernameClaim`,
+`usernamePrefix`, `groupsClaim`, `groupsPrefix` and `requiredClaims` are stored as given, and a
+prefix containing `system:` is rejected. As on AWS a cluster holds one OIDC config: a second
+association, or one reusing a name, is a `ResourceInUseException`. `clientRequestToken` replays
+return the original update. The ARN has the form
+`arn:<partition>:eks:<region>:<account>:identityproviderconfig/<cluster>/oidc/<name>/<uuid>`.
+
+`DescribeIdentityProviderConfig` (`POST .../identity-provider-configs/describe`) and
+`DisassociateIdentityProviderConfig` (`POST .../identity-provider-configs/disassociate`) take
+`identityProviderConfig: {type: "oidc", name}`; the former returns the stored config under
+`identityProviderConfig.oidc`, the latter removes it and returns a
+`DisassociateIdentityProviderConfig` update. `ListIdentityProviderConfigs`
+(`GET .../identity-provider-configs`) returns `{type, name}` handles with `maxResults` (1-100)
+and `nextToken` pagination. Both updates stay visible to `DescribeUpdate` and `ListUpdates` after
+a disassociation. Deleting a cluster drops its configs and their updates.
 
 ## Access-entry management
 
@@ -65,8 +120,17 @@ Recreate older local clusters before using worker authentication; a legacy unsco
 rejects instance credentials. Obtain fresh IMDS credentials after upgrading so the session
 includes the stable role ID.
 
+### aws-auth ConfigMap
+
+In real mode, a running cluster whose authentication mode is `CONFIG_MAP` or `API_AND_CONFIG_MAP` gets
+`kube-system/aws-auth`, as EKS creates it for managed node groups. Every ACTIVE node group's `nodeRole` is
+mapped as `system:node:{{EC2PrivateDNSName}}` with the `system:bootstrappers` and `system:nodes` groups.
+Floci creates the ConfigMap when it is absent and otherwise adds only the missing roles, so entries that
+other tools added stay. A replaced k3s container is mapped again. The token webhook does not read
+`aws-auth`; the ConfigMap exists for tools that read or edit it.
+
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, access-policy association, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, the aws-auth ConfigMap's mappings, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, access-policy association, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \
@@ -123,7 +187,7 @@ The credentials endpoint performs the following validations:
 
 Kubernetes only accepts an `https` `clientConfig.url` on a `MutatingWebhookConfiguration`, together with a `caBundle` the API server trusts. Floci serves HTTP with the default `floci.tls.enabled=false`, so the webhook is skipped with a warning in that case and pods start unmutated. Set `FLOCI_TLS_ENABLED=true` to get injection; the `caBundle` is then Floci's local CA, the same one served at `GET /_floci/ca.pem`.
 
-The webhook URL uses the hostname containers reach Floci on. When Floci runs natively that is `host.docker.internal`, which the self-signed certificate covers. When Floci itself runs in a container the hostname is its container IP, and the self-signed certificate carries no SAN for it, so the API server rejects the handshake. Pods still start, unmutated. Point `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` at a name the certificate covers (add it with `FLOCI_HOSTNAME`) to make the webhook reachable from that setup.
+The webhook URL uses the hostname containers reach Floci on. When Floci runs natively that is `host.docker.internal`, which the self-signed certificate covers. When Floci itself runs in a container the hostname is its container IP, which the self-signed certificate does not cover by default, so the API server rejects the handshake. Pods still start, unmutated. Add that IP with `FLOCI_TLS_EXTRA_SANS` (for example from the pod IP through the downward API), or point `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` at a name the certificate covers (add it with `FLOCI_HOSTNAME`).
 
 The webhook carries `failurePolicy: Ignore`, and Floci admits the pod unchanged on any internal error, so a webhook that cannot be registered or cannot be reached never prevents a pod from being created. Registration failures log a warning and leave the cluster running.
 
@@ -393,7 +457,7 @@ Cluster metadata is stored in-process. No Docker containers are started. The clu
 
 Floci starts a **k3s** (`rancher/k3s`) container for each cluster. The k3s API server is exposed on a host port from the configured range (`6500-6599`). Once `/readyz` responds, the cluster transitions to `ACTIVE` and the CA certificate is extracted from the kubeconfig.
 
-By default `describe-cluster` returns a **host-reachable** endpoint (`https://localhost:<hostPort>`); the k3s server certificate includes a `localhost` SAN, so it verifies against the CA in `cluster.certificateAuthority.data`. Set `endpoint-mode: network` to return the container DNS name (`https://floci-eks-<name>:6443`) instead: reachable from other containers on the Docker network (the pre-#1118 behaviour). In `network` mode the endpoint falls back to the host-reachable form when Floci runs natively, since there is no container DNS name a host client could use.
+By default `describe-cluster` returns a **host-reachable** endpoint (`https://localhost:<hostPort>`); the k3s server certificate includes a `localhost` SAN, so it verifies against the CA in `cluster.certificateAuthority.data`. Set `endpoint-mode: network` to return the container DNS name (`https://floci-eks-<name>:6443`) instead: reachable from other containers on the Docker network (the pre-#1118 behaviour). In `network` mode the endpoint falls back to the host-reachable form when Floci runs natively, since there is no container DNS name a host client could use. When the k3s ports are published behind a stable DNS name (a Kubernetes `Service` in front of Floci, for example), set `endpoint-host` to that name: `describe-cluster` returns `https://<host>:<hostPort>` and the name is added to the k3s serving certificate's SANs, so a client that reaches the port through it still verifies the cluster CA.
 
 #### Connecting with `kubectl` (native AWS workflow)
 
@@ -545,6 +609,8 @@ Callers requiring dynamic volume provisioning can install a driver (such as the 
 
 For local testing workflows that rely on automatic volume binding without a CSI driver, set `floci.services.eks.default-storage-class: true` (or `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS=true`) to retain k3s's bundled `local-path` provisioner and default StorageClass.
 
+For workloads written for EBS, set `floci.services.eks.emulate-ebs-storage: true` (or `FLOCI_SERVICES_EKS_EMULATE_EBS_STORAGE=true`). Every new cluster then gets the stock `gp2` StorageClass (`WaitForFirstConsumer`, the default class unless `default-storage-class` keeps k3s's own) and a `floci-ebs-provisioner` Deployment in `kube-system` that runs [local-path-provisioner](https://github.com/rancher/local-path-provisioner) under the name `ebs.csi.aws.com`. The emulated `gp2` names that CSI driver rather than the in-tree `kubernetes.io/aws-ebs` EKS ships: CSI migration makes the controller manager annotate every in-tree EBS claim for `ebs.csi.aws.com`, and an external provisioner only serves classes that name it. A PersistentVolumeClaim against `gp2`, or against any StorageClass a chart defines with that provisioner (`parameters` such as `type: gp3` are ignored), binds to a `hostPath` volume under `/var/lib/rancher/k3s/storage/floci-ebs` on the node, with both `Immediate` and `WaitForFirstConsumer` binding. The StorageClass objects themselves are left as created, so what a client reads back matches what it applied; only the volumes behind them are local. Nothing is created in EC2 for these volumes, and there is no snapshot or resize support.
+
 ## Joining EC2 instances as cluster nodes
 
 Floci allows EC2 instances to join an EKS cluster as Kubernetes worker nodes. Launching an instance via `RunInstances` with user data targeting a cluster automatically registers a matching Kubernetes node.
@@ -586,12 +652,15 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_DOCKER_NETWORK` | *(unset)* | Docker network for k3s containers (falls back to the global `FLOCI_SERVICES_DOCKER_NETWORK`, then Floci's own network) |
 | `FLOCI_SERVICES_EKS_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Leave k3s containers running after Floci stops |
 | `FLOCI_SERVICES_EKS_ENDPOINT_MODE` | `host` | `describe-cluster` endpoint: `host` (`localhost:<hostPort>`) or `network` (container DNS) |
+| `FLOCI_SERVICES_EKS_ENDPOINT_HOST` | *(unset)* | Hostname `describe-cluster` returns instead of `localhost` (`https://<host>:<hostPort>`), also added to the k3s certificate SANs; overrides `ENDPOINT_MODE` |
 | `FLOCI_SERVICES_EKS_IAM_AUTH_WEBHOOK` | `true` | Wire a token-auth webhook into k3s so `aws eks get-token` works |
 | `FLOCI_SERVICES_EKS_ECR_REGISTRY_MIRROR` | `true` | Inject a containerd `registries.yaml` so pods can pull images pushed to [Floci ECR](ecr.md) |
 | `FLOCI_SERVICES_EKS_DISABLE_CNI` | `false` | Start k3s without bundled flannel, network policy, and kube-proxy so an external CNI can take over |
 | `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS` | `false` | Retain k3s bundled local-path provisioner and default StorageClass (default false matches EKS with no default class) |
+| `FLOCI_SERVICES_EKS_EMULATE_EBS_STORAGE` | `false` | Define the stock `gp2` StorageClass and serve it, and every StorageClass naming `ebs.csi.aws.com`, from the node's filesystem |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
-| `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
+| `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
+| `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |
 | `FLOCI_SERVICES_EKS_IMDS` | `false` | Enable link-local IMDS (`169.254.169.254`) proxy in cluster containers |
 | `FLOCI_SERVICES_EKS_EMBEDDED_DNS` | `true` | Inject Floci's embedded DNS server into cluster containers for Route 53 private hosted zones and internal name resolution |
 | `FLOCI_SERVICES_EKS_VPC_ROUTE_PROGRAMMING` | `true` | Program emulated VPC route table entries into k3s cluster containers |
@@ -849,6 +918,20 @@ spec:
 
 Tokens projected with audience `sts.amazonaws.com` are signed by k3s using the cluster key and advertise the cluster issuer URL. When the AWS SDK inside the container calls `sts:AssumeRoleWithWebIdentity`, Floci verifies the signature against the cluster public key and checks the trust policy conditions. In-cluster components that do not specify an audience receive tokens with both the in-cluster audience and STS audience, allowing normal Kubernetes operation without disruption.
 
+#### Injection at admission (real mode)
+
+A real EKS cluster runs the pod identity webhook, which notices `eks.amazonaws.com/role-arn` on a pod's service account and gives the pod a projected service-account token plus the `AWS_ROLE_ARN` / `AWS_WEB_IDENTITY_TOKEN_FILE` environment the SDKs look for. k3s does not ship that webhook, so Floci registers its own mutating webhook in every real-mode cluster (`FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK`, on by default, needs `FLOCI_TLS_ENABLED=true`). At pod admission it reads the service account's annotations through the cluster and, when `eks.amazonaws.com/role-arn` is present, adds:
+
+- a projected volume `aws-iam-token` with a `serviceAccountToken` source (audience from `eks.amazonaws.com/audience`, default `sts.amazonaws.com`; expiry from `eks.amazonaws.com/token-expiration`, default 86400 s, minimum 600 s)
+- a read-only mount at `/var/run/secrets/eks.amazonaws.com/serviceaccount` on every container and init container
+- `AWS_STS_REGIONAL_ENDPOINTS=regional`, `AWS_DEFAULT_REGION`, `AWS_REGION`, `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`
+
+Entries the pod already declares are left alone, so charts that set their own `AWS_REGION` keep it. Pods whose service account has an EKS Pod Identity association get that injection too, as before, and a pod that qualifies for both gets both.
+
+Controllers inside the cluster (Karpenter, cluster-autoscaler, the ALB controller, external-secrets, KEDA...) still default to the real AWS endpoints. Set `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL=true` and the same webhook also adds `AWS_ENDPOINT_URL=http://<floci host>:<port>` to every pod it mutates, where the host is the Docker host as the cluster sees it (`FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` when set). The webhook's own callback URL uses that host as well, so when Floci runs in a container that host must carry a TLS SAN: add it with `FLOCI_TLS_EXTRA_SANS`.
+
+`AWS_ENDPOINT_URL` does not reach everything: the SDKs' web-identity credential provider calls the STS endpoint it derives from the region (`https://sts.<region>.amazonaws.com`) and ignores the variable. Set `FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true` with `FLOCI_DNS_SPOOF_AWS_SERVICES=sts` so the cluster resolves those names, and only those, to Floci (public images that `registry.k8s.io` redirects to S3 must keep resolving to AWS), and the webhook also mounts the node's copy of Floci's CA bundle (`/etc/floci-ca-bundle.pem`, placed there when the cluster container started) into every mutated pod with `AWS_CA_BUNDLE` pointing at it, so the HTTPS handshake on port 443 succeeds.
+
 #### 2. Minting a service-account token via HTTP (mock mode & out-of-cluster testing)
 
 For local development harnesses running outside Kubernetes or when using mock mode (`FLOCI_SERVICES_EKS_MOCK=true`), tokens can be requested directly from Floci via HTTP. Signing happens server-side, so the private key never leaves Floci:
@@ -1063,8 +1146,5 @@ eks.deleteCluster(r -> r.name("my-cluster"));
 
 The following EKS features are not yet supported:
 
-- `UpdateClusterConfig` / `UpdateClusterVersion`
 - `UpdateNodegroupConfig` / `UpdateNodegroupVersion`
-- Add-ons (`CreateAddon`, `DescribeAddon`, `ListAddons`)
-- Identity provider configs
 - Access policies

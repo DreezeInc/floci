@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.eks;
 
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.eks.model.Addon;
+import io.github.hectorvent.floci.services.eks.model.AssociateIdentityProviderConfigRequest;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.CreateAccessEntryRequest;
 import io.github.hectorvent.floci.services.eks.model.CreateAddonRequest;
@@ -10,10 +11,13 @@ import io.github.hectorvent.floci.services.eks.model.CreateFargateProfileRequest
 import io.github.hectorvent.floci.services.eks.model.CreateNodeGroupRequest;
 import io.github.hectorvent.floci.services.eks.model.CreatePodIdentityAssociationRequest;
 import io.github.hectorvent.floci.services.eks.model.FargateProfile;
+import io.github.hectorvent.floci.services.eks.model.IdentityProviderConfigRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
 import io.github.hectorvent.floci.services.eks.model.Update;
 import io.github.hectorvent.floci.services.eks.model.UpdateAddonRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterConfigRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterVersionRequest;
 import io.github.hectorvent.floci.services.eks.model.UpdatePodIdentityAssociationRequest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -46,15 +50,20 @@ public class EksController {
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final EksClusterUpdateService clusterUpdates;
+    private final EksIdentityProviderConfigService identityProviderConfigs;
 
     @Inject
     public EksController(EksService eksService, EksAccessEntryService accessEntries,
                          EksPodIdentityAssociationService podIdentityAssociations,
-                         EksAddonService addons) {
+                         EksAddonService addons, EksClusterUpdateService clusterUpdates,
+                         EksIdentityProviderConfigService identityProviderConfigs) {
         this.eksService = eksService;
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.clusterUpdates = clusterUpdates;
+        this.identityProviderConfigs = identityProviderConfigs;
     }
 
     @POST
@@ -243,6 +252,35 @@ public class EksController {
         return Response.ok(Map.of("update", update)).build();
     }
 
+    @POST
+    @Path("/clusters/{name}/update-config")
+    public Response updateClusterConfig(@PathParam("name") String name, UpdateClusterConfigRequest request) {
+        Update update = eksService.updateClusterConfig(name, request);
+        return Response.ok(Map.of("update", update)).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/updates")
+    public Response updateClusterVersion(@PathParam("name") String name, UpdateClusterVersionRequest request) {
+        Update update = eksService.updateClusterVersion(name, request);
+        return Response.ok(Map.of("update", update)).build();
+    }
+
+    @GET
+    @Path("/clusters/{name}/updates")
+    public Response listUpdates(@PathParam("name") String name,
+                                @QueryParam("addonName") String addonName,
+                                @QueryParam("nodegroupName") String nodegroupName,
+                                @QueryParam("maxResults") String maxResults,
+                                @QueryParam("nextToken") String nextToken) {
+        Cluster cluster = eksService.describeCluster(name);
+        EksClusterUpdateService.Page page = clusterUpdates.listUpdates(cluster, addonName, nodegroupName,
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        return Response.ok(page.nextToken() == null
+                ? Map.of("updateIds", page.updateIds())
+                : Map.of("updateIds", page.updateIds(), "nextToken", page.nextToken())).build();
+    }
+
     @GET
     @Path("/clusters/{name}/updates/{updateId}")
     public Response describeUpdate(@PathParam("name") String name,
@@ -250,7 +288,7 @@ public class EksController {
                                    @QueryParam("addonName") String addonName,
                                    @QueryParam("nodegroupName") String nodegroupName) {
         Cluster cluster = eksService.describeCluster(name);
-        Update update = addons.describeUpdate(cluster, updateId, addonName);
+        Update update = clusterUpdates.describeUpdate(cluster, updateId, addonName, nodegroupName);
         return Response.ok(Map.of("update", update)).build();
     }
 
@@ -287,11 +325,47 @@ public class EksController {
                 : Map.of("addons", page.addons(), "nextToken", page.nextToken())).build();
     }
 
+    @POST
+    @Path("/clusters/{name}/identity-provider-configs/associate")
+    public Response associateIdentityProviderConfig(@PathParam("name") String name,
+                                                    AssociateIdentityProviderConfigRequest request) {
+        Cluster cluster = eksService.describeCluster(name);
+        Update update = identityProviderConfigs.associate(cluster, request);
+        Map<String, String> tags = request.tags() == null ? Map.of() : request.tags();
+        return Response.ok(Map.of("update", update, "tags", tags)).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/identity-provider-configs/disassociate")
+    public Response disassociateIdentityProviderConfig(@PathParam("name") String name,
+                                                       IdentityProviderConfigRequest request) {
+        Cluster cluster = eksService.describeCluster(name);
+        Update update = identityProviderConfigs.disassociate(cluster,
+                request == null ? null : request.identityProviderConfig());
+        return Response.ok(Map.of("update", update)).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/identity-provider-configs/describe")
+    public Response describeIdentityProviderConfig(@PathParam("name") String name,
+                                                   IdentityProviderConfigRequest request) {
+        Cluster cluster = eksService.describeCluster(name);
+        return Response.ok(Map.of("identityProviderConfig", Map.of("oidc", identityProviderConfigs.describe(cluster,
+                request == null ? null : request.identityProviderConfig())))).build();
+    }
+
     @GET
     @Path("/clusters/{name}/identity-provider-configs")
-    public Response listIdentityProviderConfigs(@PathParam("name") String name) {
-        eksService.describeCluster(name);
-        return Response.ok(Map.of("identityProviderConfigs", List.of())).build();
+    public Response listIdentityProviderConfigs(@PathParam("name") String name,
+                                                @QueryParam("maxResults") String maxResults,
+                                                @QueryParam("nextToken") String nextToken) {
+        Cluster cluster = eksService.describeCluster(name);
+        EksIdentityProviderConfigService.Page page = identityProviderConfigs.list(cluster,
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        return Response.ok(page.nextToken() == null
+                ? Map.of("identityProviderConfigs", page.identityProviderConfigs())
+                : Map.of("identityProviderConfigs", page.identityProviderConfigs(), "nextToken", page.nextToken()))
+                .build();
     }
 
     @POST

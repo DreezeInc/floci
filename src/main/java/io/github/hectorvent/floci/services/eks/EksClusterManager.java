@@ -1,6 +1,11 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.fasterxml.jackson.dataformat.yaml.YAMLGenerator;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
@@ -81,6 +86,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -127,6 +133,20 @@ public class EksClusterManager
     static final String CONTAINERD_CERTS_LINK = "etc/containerd/certs.d";
     static final String POD_IDENTITY_MANIFEST_FILE = "floci-eks-pod-identity.yaml";
     static final String POD_IDENTITY_MANIFEST_TAR_ENTRY = "server/manifests/" + POD_IDENTITY_MANIFEST_FILE;
+    static final String EBS_STORAGE_MANIFEST_FILE = "floci-eks-ebs-storage.yaml";
+    static final String EBS_STORAGE_MANIFEST_TAR_ENTRY = "server/manifests/" + EBS_STORAGE_MANIFEST_FILE;
+    static final String EBS_CSI_PROVISIONER = "ebs.csi.aws.com";
+    static final String EBS_STORAGE_PATH = K3S_DATA_DIR + "/storage/floci-ebs";
+    static final String EBS_PROVISIONER_IMAGE = "rancher/local-path-provisioner:v0.0.37";
+    static final String EBS_HELPER_IMAGE = "rancher/mirrored-library-busybox:1.37.0";
+    /** The pod identity webhook reads service account annotations through the cluster's own kubectl. */
+    static final int SERVICE_ACCOUNT_LOOKUP_TIMEOUT_SECONDS = 10;
+    private static final ObjectMapper SERVICE_ACCOUNT_JSON = new ObjectMapper();
+    static final String AWS_AUTH_NODE_USERNAME = "system:node:{{EC2PrivateDNSName}}";
+    static final List<String> AWS_AUTH_NODE_GROUPS = List.of("system:bootstrappers", "system:nodes");
+    private static final ObjectMapper AWS_AUTH_YAML = new ObjectMapper(
+            new YAMLFactory().disable(YAMLGenerator.Feature.WRITE_DOC_START_MARKER));
+    private static final TypeReference<List<Map<String, Object>>> MAP_ROLES_TYPE = new TypeReference<>() { };
     private static final String ENDPOINT_MODE_NETWORK = "network";
     public static final String DEFAULT_POD_CIDR = "10.42.0.0/16";
 
@@ -572,7 +592,8 @@ public class EksClusterManager
                 config.services().eks().disableCni(),
                 defaultStorageClass,
                 serviceCidr,
-                clusterCidr);
+                clusterCidr,
+                config.services().eks().endpointHost());
 
         EksNodeCapacity.Limits nodeLimits = resolveNodeCapacity(cluster);
         if (nodeLimits != null) {
@@ -700,19 +721,16 @@ public class EksClusterManager
             serverArgs.addAll(callerArgs);
         }
 
-        if (config.services().eks().disableCni()) {
-            // A container's /sys mount defaults to private propagation, which breaks
-            // Cilium's BPF filesystem mount ("mounted on /sys but it is not a shared or
-            // slave mount") — real EKS/kubeadm nodes don't hit this since they're VMs,
-            // not nested containers. `mount --make-rshared /` before k3s starts fixes
-            // it; kind's own node image runs the same fix in its entrypoint for the
-            // same reason. RSHARE_ENTRYPOINT is POSIX sh-compatible (no bashisms) — the
-            // k3s image has no bash, only busybox sh.
-            specBuilder.withEntrypoint(RSHARE_ENTRYPOINT);
-            specBuilder.withCmd(buildRshareWrappedCmd(serverArgs));
-        } else {
-            specBuilder.withCmd(serverArgs);
-        }
+        // A container's mounts default to private propagation, which breaks anything that
+        // needs a shared or slave mount on the node: Cilium's BPF filesystem mount on /sys
+        // ("mounted on /sys but it is not a shared or slave mount"), and every DaemonSet
+        // that mounts the node root with mountPropagation (node-exporter, CSI drivers).
+        // Real EKS/kubeadm nodes don't hit this since they're VMs, not nested containers.
+        // `mount --make-rshared /` before k3s starts fixes it; kind's own node image runs
+        // the same fix in its entrypoint for the same reason. RSHARE_ENTRYPOINT is POSIX
+        // sh-compatible (no bashisms) — the k3s image has no bash, only busybox sh.
+        specBuilder.withEntrypoint(RSHARE_ENTRYPOINT);
+        specBuilder.withCmd(buildRshareWrappedCmd(serverArgs));
         ContainerSpec spec = specBuilder.build();
 
         // create -> inject webhook kubeconfig -> start, so the file exists before the API server boots.
@@ -727,6 +745,7 @@ public class EksClusterManager
         injectEcrRegistryMirror(containerId, cluster);
         linkContainerdCertsDir(containerId, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
+        registerEbsStorageEmulation(containerId, cluster);
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
@@ -917,7 +936,7 @@ public class EksClusterManager
     private void applyEndpoints(Cluster cluster, String containerName, int hostPort, ContainerInfo info) {
         cluster.setEndpoint(resolvePublicEndpoint(
                 containerDetector.isRunningInContainer(), config.services().eks().endpointMode(),
-                containerName, hostPort));
+                containerName, hostPort, config.services().eks().endpointHost()));
 
         if (containerDetector.isRunningInContainer()) {
             ContainerLifecycleManager.EndpointInfo ep = info.getEndpoint(K3S_API_SERVER_PORT);
@@ -1434,9 +1453,15 @@ public class EksClusterManager
      */
     static List<String> buildServerArgs(boolean disableCni, boolean defaultStorageClass,
             String serviceCidr, String clusterCidr) {
+        return buildServerArgs(disableCni, defaultStorageClass, serviceCidr, clusterCidr, Optional.empty());
+    }
+
+    static List<String> buildServerArgs(boolean disableCni, boolean defaultStorageClass,
+            String serviceCidr, String clusterCidr, Optional<String> endpointHost) {
         List<String> serverArgs = new ArrayList<>(List.of("server",
                 "--disable=traefik",
                 "--tls-san=localhost"));
+        endpointHost.filter(host -> !host.isBlank()).ifPresent(host -> serverArgs.add("--tls-san=" + host));
         if (!defaultStorageClass) {
             serverArgs.add("--disable=local-storage");
         }
@@ -1516,6 +1541,15 @@ public class EksClusterManager
      */
     static String resolvePublicEndpoint(boolean inContainer, String endpointMode,
                                         String containerName, int hostPort) {
+        return resolvePublicEndpoint(inContainer, endpointMode, containerName, hostPort, Optional.empty());
+    }
+
+    static String resolvePublicEndpoint(boolean inContainer, String endpointMode,
+                                        String containerName, int hostPort, Optional<String> endpointHost) {
+        Optional<String> host = endpointHost.filter(h -> !h.isBlank());
+        if (host.isPresent()) {
+            return "https://" + host.get() + ":" + hostPort;
+        }
         if (inContainer && ENDPOINT_MODE_NETWORK.equalsIgnoreCase(endpointMode)) {
             return "https://" + containerName + ":" + K3S_API_SERVER_PORT;
         }
@@ -2084,6 +2118,259 @@ public class EksClusterManager
     }
 
     /**
+     * Maps managed node group roles in {@code kube-system/aws-auth}, as EKS does for clusters that
+     * authenticate through the ConfigMap. Creates the ConfigMap when absent and otherwise appends
+     * only the missing roles, keeping every other entry. The replace carries the read
+     * resourceVersion, so a concurrent edit makes it fail instead of being overwritten.
+     *
+     * @return true when every role is mapped; false when the caller should try again later
+     */
+    boolean ensureAwsAuthNodeRoles(Cluster cluster, Collection<String> nodeRoleArns) {
+        String containerId = cluster.getContainerId();
+        if (containerId == null || nodeRoleArns.isEmpty()) {
+            return true;
+        }
+        try {
+            ContainerExec.Result current = execInContainerForResult(containerId, new String[]{
+                    "kubectl", "get", "configmap", "aws-auth", "-n", "kube-system", "-o", "json",
+                    "--ignore-not-found"}, 15);
+            if (current.timedOut() || current.exitCode() != 0) {
+                LOG.warnv("Could not read aws-auth of EKS cluster {0}: {1}", cluster.getName(), current.summary());
+                return false;
+            }
+            String existing = current.stdout().trim();
+            ObjectNode configMap = existing.isEmpty()
+                    ? newAwsAuthConfigMap()
+                    : (ObjectNode) SERVICE_ACCOUNT_JSON.readTree(existing);
+            ObjectNode data = configMap.has("data") && configMap.get("data").isObject()
+                    ? (ObjectNode) configMap.get("data")
+                    : configMap.putObject("data");
+            String mapRolesYaml = data.path("mapRoles").asText("");
+            List<Map<String, Object>> mapRoles = mapRolesYaml.isBlank()
+                    ? new ArrayList<>()
+                    : new ArrayList<>(AWS_AUTH_YAML.readValue(mapRolesYaml, MAP_ROLES_TYPE));
+            Set<Object> mappedArns = mapRoles.stream().map(role -> role.get("rolearn")).collect(Collectors.toSet());
+            List<String> missing = nodeRoleArns.stream().filter(arn -> !mappedArns.contains(arn)).toList();
+            if (missing.isEmpty()) {
+                return true;
+            }
+            for (String arn : missing) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("groups", AWS_AUTH_NODE_GROUPS);
+                entry.put("rolearn", arn);
+                entry.put("username", AWS_AUTH_NODE_USERNAME);
+                mapRoles.add(entry);
+            }
+            data.put("mapRoles", AWS_AUTH_YAML.writeValueAsString(mapRoles));
+            ((ObjectNode) configMap.path("metadata")).remove("managedFields");
+            String verb = existing.isEmpty() ? "create" : "replace";
+            String manifest = SERVICE_ACCOUNT_JSON.writeValueAsString(configMap);
+            ContainerExec.Result write = execInContainerForResult(containerId, new String[]{"sh", "-c",
+                    "printf '%s' '" + manifest.replace("'", "'\\''") + "' | kubectl " + verb + " -f -"}, 15);
+            if (write.timedOut() || write.exitCode() != 0) {
+                LOG.warnv("Could not {0} aws-auth of EKS cluster {1}: {2}", verb, cluster.getName(), write.summary());
+                return false;
+            }
+            LOG.infov("Mapped node roles {0} in aws-auth of EKS cluster {1}", missing, cluster.getName());
+            return true;
+        } catch (Exception e) {
+            LOG.warnv("Could not map node roles in aws-auth of EKS cluster {0}: {1}", cluster.getName(), e.getMessage());
+            return false;
+        }
+    }
+
+    private static ObjectNode newAwsAuthConfigMap() {
+        ObjectNode configMap = SERVICE_ACCOUNT_JSON.createObjectNode();
+        configMap.put("apiVersion", "v1");
+        configMap.put("kind", "ConfigMap");
+        ObjectNode metadata = configMap.putObject("metadata");
+        metadata.put("name", "aws-auth");
+        metadata.put("namespace", "kube-system");
+        configMap.putObject("data");
+        return configMap;
+    }
+
+    /**
+     * Gives the cluster the stock EKS {@code gp2} StorageClass and a provisioner named
+     * {@code ebs.csi.aws.com} that serves it and any other StorageClass naming that driver, so
+     * claims written for EBS bind to the node's filesystem. gp2 names the CSI driver rather than
+     * the in-tree {@code kubernetes.io/aws-ebs} EKS ships because CSI migration makes the
+     * controller manager annotate every such claim for {@code ebs.csi.aws.com} anyway, and an
+     * external provisioner only serves classes that name it. local-path-provisioner runs in
+     * shared-filesystem mode because node-path mode refuses {@code Immediate} binding ("no node
+     * was specified"); on a one-node cluster the two modes mean the same disk. Like the webhook
+     * manifest, a copy failure leaves the cluster running, without the storage.
+     */
+    void registerEbsStorageEmulation(String containerId, Cluster cluster) {
+        if (!config.services().eks().emulateEbsStorage()) {
+            return;
+        }
+        String clusterName = cluster.getName();
+        boolean gp2IsDefault = !Boolean.TRUE.equals(cluster.getDefaultStorageClass());
+        String manifest = buildEbsStorageManifest(gp2IsDefault);
+        writeLocalCopy(Paths.get(config.services().eks().dataPath(), "storage", clusterName,
+                EBS_STORAGE_MANIFEST_FILE), manifest, clusterName);
+        try {
+            lifecycleManager.getDockerClient()
+                    .copyArchiveToContainerCmd(containerId)
+                    .withTarInputStream(new ByteArrayInputStream(
+                            tarSingleFile(EBS_STORAGE_MANIFEST_TAR_ENTRY, manifest)))
+                    .withRemotePath(K3S_DATA_DIR)
+                    .exec();
+            LOG.infov("Serving gp2 and every {0} StorageClass of cluster {1} from {2}",
+                    EBS_CSI_PROVISIONER, clusterName, EBS_STORAGE_PATH);
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} gets no EBS storage emulation: could not copy {1} into the k3s "
+                    + "container: {2}", clusterName, EBS_STORAGE_MANIFEST_FILE, e.getMessage());
+        }
+    }
+
+    /**
+     * The gp2 StorageClass as EKS ships it (minus the default annotation when k3s keeps its own
+     * default), and one Deployment running local-path-provisioner under the EBS CSI driver name,
+     * with its own RBAC because k3s's local-storage objects are absent when that component is off.
+     */
+    static String buildEbsStorageManifest(boolean gp2IsDefault) {
+        String defaultAnnotation = gp2IsDefault
+                ? "    storageclass.kubernetes.io/is-default-class: \"true\"\n"
+                : "";
+        return "apiVersion: storage.k8s.io/v1\n"
+                + "kind: StorageClass\n"
+                + "metadata:\n"
+                + "  name: gp2\n"
+                + "  annotations:\n"
+                + "    floci.io/emulated: \"ebs\"\n"
+                + defaultAnnotation
+                + "provisioner: " + EBS_CSI_PROVISIONER + "\n"
+                + "parameters:\n"
+                + "  fsType: ext4\n"
+                + "  type: gp2\n"
+                + "volumeBindingMode: WaitForFirstConsumer\n"
+                + "reclaimPolicy: Delete\n"
+                + "---\n"
+                + "apiVersion: v1\n"
+                + "kind: ServiceAccount\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "---\n"
+                + "apiVersion: rbac.authorization.k8s.io/v1\n"
+                + "kind: ClusterRole\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "rules:\n"
+                + "- apiGroups: [\"\"]\n"
+                + "  resources: [\"nodes\", \"persistentvolumeclaims\", \"configmaps\", \"pods/log\"]\n"
+                + "  verbs: [\"get\", \"list\", \"watch\"]\n"
+                + "- apiGroups: [\"\"]\n"
+                + "  resources: [\"endpoints\", \"persistentvolumes\", \"pods\"]\n"
+                + "  verbs: [\"*\"]\n"
+                + "- apiGroups: [\"\"]\n"
+                + "  resources: [\"events\"]\n"
+                + "  verbs: [\"create\", \"patch\"]\n"
+                + "- apiGroups: [\"storage.k8s.io\"]\n"
+                + "  resources: [\"storageclasses\"]\n"
+                + "  verbs: [\"get\", \"list\", \"watch\"]\n"
+                + "---\n"
+                + "apiVersion: rbac.authorization.k8s.io/v1\n"
+                + "kind: ClusterRoleBinding\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "roleRef:\n"
+                + "  apiGroup: rbac.authorization.k8s.io\n"
+                + "  kind: ClusterRole\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "subjects:\n"
+                + "- kind: ServiceAccount\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "---\n"
+                + "apiVersion: v1\n"
+                + "kind: ConfigMap\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "data:\n"
+                + "  config.json: |-\n"
+                + "    {\"sharedFileSystemPath\": \"" + EBS_STORAGE_PATH + "\"}\n"
+                + "  setup: |-\n"
+                + "    #!/bin/sh\n"
+                + "    set -eu\n"
+                + "    mkdir -m 0777 -p \"${VOL_DIR}\"\n"
+                + "  teardown: |-\n"
+                + "    #!/bin/sh\n"
+                + "    set -eu\n"
+                + "    rm -rf \"${VOL_DIR}\"\n"
+                + "  helperPod.yaml: |-\n"
+                + "    apiVersion: v1\n"
+                + "    kind: Pod\n"
+                + "    metadata:\n"
+                + "      name: helper-pod\n"
+                + "    spec:\n"
+                + "      containers:\n"
+                + "      - name: helper-pod\n"
+                + "        image: " + EBS_HELPER_IMAGE + "\n"
+                + "        imagePullPolicy: IfNotPresent\n"
+                + "---\n"
+                + "apiVersion: apps/v1\n"
+                + "kind: Deployment\n"
+                + "metadata:\n"
+                + "  name: floci-ebs-provisioner\n"
+                + "  namespace: kube-system\n"
+                + "spec:\n"
+                + "  revisionHistoryLimit: 0\n"
+                + "  selector:\n"
+                + "    matchLabels:\n"
+                + "      app: floci-ebs-provisioner\n"
+                + "  template:\n"
+                + "    metadata:\n"
+                + "      labels:\n"
+                + "        app: floci-ebs-provisioner\n"
+                + "    spec:\n"
+                + "      priorityClassName: system-node-critical\n"
+                + "      serviceAccountName: floci-ebs-provisioner\n"
+                + "      tolerations:\n"
+                + "      - key: CriticalAddonsOnly\n"
+                + "        operator: Exists\n"
+                + "      - key: node-role.kubernetes.io/control-plane\n"
+                + "        operator: Exists\n"
+                + "        effect: NoSchedule\n"
+                + "      containers:\n"
+                + ebsProvisionerContainer()
+                + "      volumes:\n"
+                + "      - name: config\n"
+                + "        configMap:\n"
+                + "          name: floci-ebs-provisioner\n";
+    }
+
+    private static String ebsProvisionerContainer() {
+        return "      - name: provisioner\n"
+                + "        image: " + EBS_PROVISIONER_IMAGE + "\n"
+                + "        imagePullPolicy: IfNotPresent\n"
+                + "        command:\n"
+                + "        - local-path-provisioner\n"
+                + "        - start\n"
+                + "        - --config\n"
+                + "        - /etc/config/config.json\n"
+                + "        - --provisioner-name\n"
+                + "        - " + EBS_CSI_PROVISIONER + "\n"
+                + "        - --configmap-name\n"
+                + "        - floci-ebs-provisioner\n"
+                + "        - --service-account-name\n"
+                + "        - floci-ebs-provisioner\n"
+                + "        volumeMounts:\n"
+                + "        - name: config\n"
+                + "          mountPath: /etc/config/\n"
+                + "        env:\n"
+                + "        - name: POD_NAMESPACE\n"
+                + "          valueFrom:\n"
+                + "            fieldRef:\n"
+                + "              fieldPath: metadata.namespace\n"
+                + "        - name: CONFIG_MOUNT_PATH\n"
+                + "          value: /etc/config/\n";
+    }
+
+    /**
      * The Floci pod identity admission route. The account is in the path for the same reason the
      * token webhook puts its scope there: the API server calls Floci with no AWS credentials, so a
      * cluster owned by a non-default account would otherwise never be found.
@@ -2114,7 +2401,7 @@ public class EksClusterManager
                     sideEffects: None
                     failurePolicy: Ignore
                     reinvocationPolicy: Never
-                    timeoutSeconds: 3
+                    timeoutSeconds: 10
                     clientConfig:
                       url: "%s"
                       caBundle: "%s"
@@ -3092,6 +3379,38 @@ public class EksClusterManager
     Instance getRegisteredClusterNodeInstance(Cluster cluster) {
         ClusterNodeRecord record = clusterNodeInstances.get(clusterResourceName(cluster));
         return record != null ? record.instance() : null;
+    }
+
+    /**
+     * The annotations on one service account of the cluster, read with the k3s container's own
+     * kubectl so the pod identity webhook can honour IRSA. Empty when the cluster has no container
+     * (mock mode), the account does not exist, or kubectl does not answer in time.
+     */
+    Map<String, String> serviceAccountAnnotations(Cluster cluster, String namespace, String name) {
+        String containerId = cluster == null ? null : cluster.getContainerId();
+        if (containerId == null || containerId.isBlank()) {
+            return Map.of();
+        }
+        ContainerExec.Result result = ContainerExec.run(lifecycleManager.getDockerClient(), containerId,
+                new String[]{"kubectl", "get", "serviceaccount", "--namespace", namespace, name, "--output", "json"},
+                SERVICE_ACCOUNT_LOOKUP_TIMEOUT_SECONDS);
+        if (result.exitCode() != 0 || result.timedOut()) {
+            LOG.debugv("EKS cluster {0}: service account {1}/{2} has no readable annotations: {3}",
+                    cluster.getName(), namespace, name, result.summary());
+            return Map.of();
+        }
+        return serviceAccountAnnotationsOf(result.stdout());
+    }
+
+    static Map<String, String> serviceAccountAnnotationsOf(String serviceAccountJson) {
+        try {
+            JsonNode annotations = SERVICE_ACCOUNT_JSON.readTree(serviceAccountJson).path("metadata").path("annotations");
+            Map<String, String> result = new LinkedHashMap<>();
+            annotations.properties().forEach(entry -> result.put(entry.getKey(), entry.getValue().asText()));
+            return Map.copyOf(result);
+        } catch (IOException e) {
+            return Map.of();
+        }
     }
 
     ContainerExec.Result execInContainerForResult(String containerId, String[] cmd, int timeoutSeconds) {

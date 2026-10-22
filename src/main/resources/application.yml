@@ -281,6 +281,9 @@ floci:
     # Combine with tls.enabled so clients that hardcode https:// are served on port 443
     # with a certificate covering those suffixes and their regional wildcards.
     spoof-aws-endpoints: false                    # FLOCI_DNS_SPOOF_AWS_ENDPOINTS
+    # Narrow the spoof to these service ids (first hostname label), so public content hosted on
+    # AWS stays reachable. Unset spoofs every AWS name.
+    # spoof-aws-services: [sts]                   # FLOCI_DNS_SPOOF_AWS_SERVICES=sts
 
   auth:
     validate-signatures: false
@@ -309,6 +312,7 @@ floci:
     # cert-path: ""                    # FLOCI_TLS_CERT_PATH (PEM certificate file)
     # key-path: ""                     # FLOCI_TLS_KEY_PATH (PEM private key file)
     self-signed: true                  # FLOCI_TLS_SELF_SIGNED: auto-generate a server cert signed by Floci's local CA if no cert-path provided
+    # extra-sans: ""                  # FLOCI_TLS_EXTRA_SANS: comma-separated extra hostnames or IPs the generated server cert covers
     aws-https-port: 443                # FLOCI_TLS_AWS_HTTPS_PORT — also bind 443 so CDK cfn-response/AWS-on-443 callbacks reach Floci (0 disables)
 
   protocols:
@@ -731,14 +735,17 @@ floci:
       data-path: ./data/eks
       keep-running-on-shutdown: false
       endpoint-mode: host          # host = https://localhost:<hostPort> (host-reachable); network = container DNS name
+      # endpoint-host: floci.example.internal  # optional: describe-cluster returns https://<host>:<hostPort> and k3s adds the host to its cert SANs
       iam-auth-webhook: true       # validate `aws eks get-token` SigV4 tokens through a k3s webhook
       ecr-registry-mirror: true    # inject a registries.yaml so pods can pull images pushed to Floci ECR
       disable-cni: false           # start k3s without its bundled flannel/kube-proxy so a real CNI (e.g. Cilium) can take over
       default-storage-class: false # start k3s without its bundled local-path provisioner to match EKS
+      emulate-ebs-storage: false   # define the stock gp2 StorageClass and serve it and every ebs.csi.aws.com claim from the node's disk
       imds: false                  # expose link-local IMDS (169.254.169.254) inside the cluster container
       imds-pod-network: false      # route link-local IMDS traffic from ordinary pod network namespaces (requires imds: true)
       irsa-signing-key: true       # sign k3s service account tokens with the cluster OIDC key
       pod-identity-webhook: true   # register a mutating webhook that injects pod identity credentials (needs floci.tls.enabled)
+      inject-endpoint-url: false   # also set AWS_ENDPOINT_URL and AWS_CA_BUNDLE on the pods that webhook mutates, so in-cluster SDKs call Floci
       embedded-dns: true           # point cluster containers at Floci's embedded DNS to resolve Route 53 private zones
       vpc-route-programming: true  # program VPC routes into the cluster container for associated subnets
     mwaa:

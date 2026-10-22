@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
+import io.github.hectorvent.floci.services.eks.model.AccessConfig;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
 import io.github.hectorvent.floci.services.eks.model.ClusterOidcKey;
@@ -54,6 +55,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -1244,6 +1246,70 @@ class EksServiceTest {
         AwsException delete = assertThrows(AwsException.class,
                 () -> eksService.deleteFargateProfile("my-eks-cluster", "missing-profile"));
         assertEquals(404, delete.getHttpStatus());
+    }
+
+    @Test
+    void activeNodeGroupRolesAreMappedInAwsAuthOncePerContainer() {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.ensureAwsAuthNodeRoles(any(), any())).thenReturn(true);
+        EksService service = newService(clusterManager, true);
+        Cluster cluster = awsAuthCluster(service, "aws-auth-cluster", null);
+        createNodeGroupWithRole(service, "aws-auth-cluster", "workers", "arn:aws:iam::000000000000:role/workers");
+        createNodeGroupWithRole(service, "aws-auth-cluster", "spot", "arn:aws:iam::000000000000:role/spot");
+        Set<String> roles = Set.of("arn:aws:iam::000000000000:role/spot", "arn:aws:iam::000000000000:role/workers");
+
+        service.mapNodeGroupRolesInAwsAuth("000000000000", cluster);
+        service.mapNodeGroupRolesInAwsAuth("000000000000", cluster);
+        verify(clusterManager, times(1)).ensureAwsAuthNodeRoles(cluster, roles);
+
+        cluster.setContainerId("replacement-container");
+        service.mapNodeGroupRolesInAwsAuth("000000000000", cluster);
+        verify(clusterManager, times(2)).ensureAwsAuthNodeRoles(cluster, roles);
+    }
+
+    @Test
+    void failedAwsAuthMappingIsRetriedOnTheNextTick() {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.ensureAwsAuthNodeRoles(any(), any())).thenReturn(false, true);
+        EksService service = newService(clusterManager, true);
+        Cluster cluster = awsAuthCluster(service, "retry-cluster", null);
+        createNodeGroupWithRole(service, "retry-cluster", "workers", "arn:aws:iam::000000000000:role/workers");
+
+        service.mapNodeGroupRolesInAwsAuth("000000000000", cluster);
+        service.mapNodeGroupRolesInAwsAuth("000000000000", cluster);
+        service.mapNodeGroupRolesInAwsAuth("000000000000", cluster);
+
+        verify(clusterManager, times(2)).ensureAwsAuthNodeRoles(any(), any());
+    }
+
+    @Test
+    void apiOnlyClustersAndClustersWithoutNodeGroupsGetNoAwsAuth() {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        EksService service = newService(clusterManager, true);
+        Cluster apiOnly = awsAuthCluster(service, "api-only", new AccessConfig("API", true));
+        createNodeGroupWithRole(service, "api-only", "workers", "arn:aws:iam::000000000000:role/workers");
+        Cluster empty = awsAuthCluster(service, "no-node-groups", new AccessConfig("API_AND_CONFIG_MAP", true));
+
+        service.mapNodeGroupRolesInAwsAuth("000000000000", apiOnly);
+        service.mapNodeGroupRolesInAwsAuth("000000000000", empty);
+
+        verify(clusterManager, never()).ensureAwsAuthNodeRoles(any(), any());
+    }
+
+    private Cluster awsAuthCluster(EksService service, String name, AccessConfig accessConfig) {
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName(name);
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        request.setAccessConfig(accessConfig);
+        Cluster cluster = service.createCluster(request);
+        cluster.setContainerId("running-container");
+        return cluster;
+    }
+
+    private void createNodeGroupWithRole(EksService service, String clusterName, String name, String role) {
+        CreateNodeGroupRequest request = nodeGroupRequest(name);
+        request.setNodeRole(role);
+        service.createNodeGroup(clusterName, request);
     }
 
     private EksService newService(EksClusterManager clusterManager, boolean mock) {

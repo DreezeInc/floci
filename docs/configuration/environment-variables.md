@@ -61,6 +61,7 @@ Running Floci directly on a Linux host (not in a container) with services that s
 | `FLOCI_TLS_CERT_PATH` | _(none)_ | Path to a PEM certificate file. When set, disables auto-generation |
 | `FLOCI_TLS_KEY_PATH` | _(none)_ | Path to a PEM private key file. Required when `FLOCI_TLS_CERT_PATH` is set |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate and persist a server certificate signed by Floci's local CA when no cert/key paths are provided |
+| `FLOCI_TLS_EXTRA_SANS` | _(none)_ | Comma-separated extra hostnames or IPs for the generated certificate's SANs |
 
 See [TLS / HTTPS](./tls.md) for SDK configuration examples and WebSocket (`wss://`) support.
 
@@ -145,6 +146,7 @@ Floci's embedded DNS server always resolves the following wildcard suffixes to F
 |---|---|---|
 | `FLOCI_DNS_EXTRA_SUFFIXES` | _(none)_ | Comma-separated list of additional hostname suffixes to resolve to Floci's container IP. Use this for custom domains beyond the built-in ones above (e.g. a private internal suffix). |
 | `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` | `false` | Resolve every AWS partition's DNS and dual-stack suffix (`amazonaws.com`, `api.aws`, `amazonaws.eu`, and more) and every subdomain to Floci's container IP inside spawned containers (transparent endpoint injection). See below. |
+| `FLOCI_DNS_SPOOF_AWS_SERVICES` | _(none)_ | Comma-separated service ids that narrow `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` to names whose first label is one of them (`sts`). Unset spoofs every AWS name. |
 
 ### Transparent endpoints
 
@@ -159,6 +161,8 @@ Some tools construct SDK clients with explicit real-AWS endpoints (e.g. `https:/
 - `csp.hci.ic.gov` and `api.aws.hci.ic.gov` (aws-iso-f)
 
 Some of these are live public names, not sandbox-only ones: with the flag on, `api.aws` and `amazonaws.eu` resolve to Floci too, so real endpoints under them are unreachable from spawned containers. All other queries keep the normal forward/fallback behavior.
+
+When only a few hostnames escape `AWS_ENDPOINT_URL`, set `FLOCI_DNS_SPOOF_AWS_SERVICES` to their service ids (the first hostname label, comma-separated): `FLOCI_DNS_SPOOF_AWS_SERVICES=sts` spoofs `sts.amazonaws.com` and `sts.<region>.<suffix>` and leaves every other AWS name on its real address, so content that public registries and package mirrors serve from S3 stays reachable. The certificate still covers every AWS name, so no regeneration follows.
 
 Combine it with `FLOCI_TLS_ENABLED=true` so hardcoded `https://` endpoints work end to end:
 

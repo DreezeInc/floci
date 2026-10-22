@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 
@@ -120,6 +121,15 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
             return null;
         }
         return engine.resolve(props.get(name));
+    }
+
+    /** Resolves a property the schema marks required, failing the resource when it is absent or blank. */
+    public String resolveRequired(JsonNode props, String name, String resourceType) {
+        String value = resolveOptional(props, name);
+        if (value == null || value.isBlank()) {
+            throw new AwsException("ValidationError", resourceType + " requires a " + name + ".", 400);
+        }
+        return value;
     }
 
     /**

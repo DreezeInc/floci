@@ -3,12 +3,16 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.eks.EksService;
+import io.github.hectorvent.floci.services.eks.model.AccessConfig;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
+import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.time.Duration;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -25,10 +29,18 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
     private static final String NODEGROUP = "AWS::EKS::Nodegroup";
 
     private final EksService eksService;
+    private final Duration clusterActiveTimeout;
+    private final Duration clusterActivePoll;
 
     @Inject
     public EksCfnProvisioner(EksService eksService) {
+        this(eksService, EksClusterReadiness.ACTIVE_TIMEOUT, EksClusterReadiness.ACTIVE_POLL);
+    }
+
+    EksCfnProvisioner(EksService eksService, Duration clusterActiveTimeout, Duration clusterActivePoll) {
         this.eksService = eksService;
+        this.clusterActiveTimeout = clusterActiveTimeout;
+        this.clusterActivePoll = clusterActivePoll;
     }
 
     @Override
@@ -54,9 +66,17 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         request.setName(name);
         request.setVersion(ctx.resolveOptional(props, "Version"));
         request.setRoleArn(ctx.resolveOptional(props, "RoleArn"));
+        request.setAccessConfig(accessConfig(props, ctx));
+        Map<String, String> tags = ctx.resolveTags(props, "Tags");
+        if (!tags.isEmpty()) {
+            request.setTags(tags);
+        }
 
         Cluster cluster = eksService.createCluster(request);
         r.setPhysicalId(cluster.getName());
+        if (cluster.getStatus() == ClusterStatus.CREATING) {
+            cluster = awaitClusterActive(r, cluster.getName());
+        }
         r.getAttributes().put("Arn", cluster.getArn());
         if (cluster.getEndpoint() != null) {
             r.getAttributes().put("Endpoint", cluster.getEndpoint());
@@ -68,6 +88,36 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
                 && cluster.getIdentity().getOidc().getIssuer() != null) {
             r.getAttributes().put("OpenIdConnectIssuerUrl", cluster.getIdentity().getOidc().getIssuer());
         }
+    }
+
+    /**
+     * Waits for a cluster this provision created to become ACTIVE, as CloudFormation does before
+     * it reports the resource complete and lets its dependants (access entries, addons, pod
+     * identity associations) proceed. The resource is marked as owned meanwhile, so a cluster
+     * that never comes up is deleted by the create rollback.
+     */
+    private Cluster awaitClusterActive(StackResource r, String name) {
+        r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+        Cluster active = EksClusterReadiness.awaitActive(eksService, name, clusterActiveTimeout, clusterActivePoll);
+        r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
+        return active;
+    }
+
+    /**
+     * Without this every CloudFormation cluster is CONFIG_MAP, and an {@code AWS::EKS::AccessEntry}
+     * in the same template fails on it.
+     */
+    private static AccessConfig accessConfig(JsonNode props, ProvisionContext ctx) {
+        if (props == null || !props.hasNonNull("AccessConfig")) {
+            return null;
+        }
+        JsonNode resolved = ctx.engine().resolveNode(props.get("AccessConfig"));
+        if (resolved == null || !resolved.isObject()) {
+            return null;
+        }
+        String bootstrap = ctx.resolveOptional(resolved, "BootstrapClusterCreatorAdminPermissions");
+        return new AccessConfig(ctx.resolveOptional(resolved, "AuthenticationMode"),
+                bootstrap == null ? null : Boolean.parseBoolean(bootstrap));
     }
 
     private void provisionNodegroup(StackResource r, JsonNode props, ProvisionContext ctx) {
@@ -82,6 +132,8 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         request.setSubnets(ctx.resolveStringList(props, "Subnets"));
 
         Nodegroup nodegroup = eksService.createNodeGroup(clusterName, request);
+        // The first nodegroup may replace the k3s node for its instance type; the cluster is CREATING until it is back.
+        EksClusterReadiness.awaitActive(eksService, clusterName, clusterActiveTimeout, clusterActivePoll);
         // Ref (and the readOnly Id) is the composite the registry primary identifier declares,
         // clusterName/nodegroupName, matching AWS. The plain names stay as their own attributes:
         // ClusterName and NodegroupName back delete() and Fn::GetAtt.
