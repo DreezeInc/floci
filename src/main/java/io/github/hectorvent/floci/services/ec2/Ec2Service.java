@@ -66,6 +66,7 @@ import io.github.hectorvent.floci.services.ec2.model.RouteTableAssociation;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
+import io.github.hectorvent.floci.services.ec2.model.SnapshotLock;
 import io.github.hectorvent.floci.services.ec2.model.SpotInstanceRequest;
 import io.github.hectorvent.floci.services.ec2.model.SpotPrice;
 import io.github.hectorvent.floci.services.ec2.model.SpotPriceHistoryResult;
@@ -106,6 +107,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -171,6 +173,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private static final String COPIED_SNAPSHOT_VOLUME_ID = "vol-ffffffff";
     private static final String CREATE_VOLUME_PERMISSION = "createVolumePermission";
     private static final String PUBLIC_SNAPSHOT_GROUP = "all";
+    private static final Set<String> SNAPSHOT_LOCK_MODES = Set.of(SnapshotLock.GOVERNANCE, SnapshotLock.COMPLIANCE);
+    private static final Set<String> LOCKED_SNAPSHOT_FILTERS = Set.of("lock-state");
+    private static final int MAX_SNAPSHOT_LOCK_DAYS = 36500;
+    private static final int MAX_SNAPSHOT_COOL_OFF_HOURS = 72;
     private static final Pattern ACCOUNT_ID_PATTERN = Pattern.compile("\\d{12}");
     // The ASN AWS assigns when CreateTransitGateway omits Options.AmazonSideAsn.
     private static final long DEFAULT_AMAZON_SIDE_ASN = 64512L;
@@ -310,9 +316,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // Only the CDI constructor receives it; null on the hand-built constructors, which reads as
     // "encryption by default is off".
     private Ec2EbsEncryptionService ebsEncryptionService;
-    // Only the CDI constructor receives these two; the hand-built constructors keep the defaults.
+    // Only the CDI constructor receives these three; the hand-built constructors keep the defaults.
     private EbsVolumeContent ebsVolumeContent = new DefaultEbsVolumeContent();
     private KmsService kmsService;
+    private Clock clock = Clock.systemUTC();
     private jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance;
     private final List<VpcRouteTableListener> routeTableListeners = new CopyOnWriteArrayList<>();
     private jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance;
@@ -398,6 +405,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this.ebsVolumeContent = ebsVolumeContent;
     }
 
+    void setClock(Clock clock) {
+        this.clock = clock;
+    }
+
     void putVolumeForTest(Volume volume) {
         volumes.put(key(volume.getRegion(), volume.getVolumeId()), volume);
     }
@@ -453,7 +464,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                       jakarta.enterprise.inject.Instance<VpcRouteTableListener> routeTableListenersInstance,
                       jakarta.enterprise.inject.Instance<Ec2InstanceLaunchListener> instanceLaunchListenersInstance,
                       Ec2EbsEncryptionService ebsEncryptionService,
-                      EbsVolumeContent ebsVolumeContent, KmsService kmsService) {
+                      EbsVolumeContent ebsVolumeContent, KmsService kmsService, Clock clock) {
         this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog,
                 instanceTypeCatalog, storageFactory, requestContextInstance, iamService, volumeBlockDeviceManager);
         this.vpcNetworkManager = vpcNetworkManager;
@@ -463,6 +474,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         this.ebsEncryptionService = ebsEncryptionService;
         this.ebsVolumeContent = ebsVolumeContent;
         this.kmsService = kmsService;
+        this.clock = clock;
     }
 
     public Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
@@ -7135,6 +7147,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 continue;
             }
             synchronized (snapshotLock) {
+                if (snapshots.get(key(region, snapshotId)).filter(this::isLocked).isPresent()) {
+                    // DeleteSnapshot refuses it with SnapshotLocked, a client error.
+                    results.add(new SnapshotDeletion(snapshotId, "client-error"));
+                    continue;
+                }
                 snapshots.delete(key(region, snapshotId));
             }
             results.add(new SnapshotDeletion(snapshotId, "success"));
@@ -7345,7 +7362,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String caller = callerAccountId();
         synchronized (imageRegistryLock) {
             synchronized (snapshotLock) {
-                requireOwnedSnapshot(region, snapshotId, caller);
+                if (isLocked(requireOwnedSnapshot(region, snapshotId, caller))) {
+                    throw new AwsException("SnapshotLocked", "The snapshot '" + snapshotId
+                            + "' is locked and can't be deleted until its lock expires.", 400);
+                }
                 registeredImages.scan(k -> true).stream()
                         .filter(image -> region.equals(image.getRegion()))
                         .filter(image -> !DEREGISTERED_STATE.equals(image.getState()))
@@ -7418,6 +7438,173 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             snapshot.setCreateVolumePermissionGroups(new ArrayList<>());
             snapshots.put(key(region, snapshotId), snapshot);
         }
+    }
+
+    // ─── EBS Snapshot Locks ────────────────────────────────────────────────────
+
+    public record LockedSnapshot(String snapshotId, String ownerId, String lockState, SnapshotLock lock) {}
+
+    public record LockedSnapshotPage(List<LockedSnapshot> snapshots, String nextToken) {}
+
+    private record LockRequest(String lockMode, Integer lockDuration, Instant expirationDate, Integer coolOffPeriod) {}
+
+    /** @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_LockSnapshot.html">LockSnapshot</a> */
+    public LockedSnapshot lockSnapshot(String region, String snapshotId, String lockMode, Integer lockDuration,
+                                       Instant expirationDate, Integer coolOffPeriod) {
+        requireSnapshotParameter("SnapshotId", snapshotId);
+        requireSnapshotParameter("LockMode", lockMode);
+        LockRequest request = new LockRequest(lockMode, lockDuration, expirationDate, coolOffPeriod);
+        Instant now = clock.instant();
+        requireValidLockRequest(request, now);
+        String caller = callerAccountId();
+        synchronized (snapshotLock) {
+            Snapshot snapshot = requireOwnedSnapshot(region, snapshotId, caller);
+            snapshot.setLock(nextLock(snapshotId, snapshot.getLock(), request, now));
+            snapshots.put(key(region, snapshotId), snapshot);
+            return lockedView(snapshot, caller, now);
+        }
+    }
+
+    /** @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_UnlockSnapshot.html">UnlockSnapshot</a> */
+    public void unlockSnapshot(String region, String snapshotId) {
+        requireSnapshotParameter("SnapshotId", snapshotId);
+        String caller = callerAccountId();
+        synchronized (snapshotLock) {
+            Snapshot snapshot = requireLockedSnapshot(region, snapshotId, caller);
+            if (SnapshotLock.COMPLIANCE.equals(snapshot.getLock().stateAt(clock.instant()))) {
+                throw complianceLocked(snapshotId, "it can't be unlocked");
+            }
+            snapshot.setLock(null);
+            snapshots.put(key(region, snapshotId), snapshot);
+        }
+    }
+
+    /** @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeLockedSnapshots.html">DescribeLockedSnapshots</a> */
+    public LockedSnapshotPage describeLockedSnapshots(String region, List<String> snapshotIds,
+                                                      Map<String, List<String>> filters,
+                                                      Integer maxResults, String nextToken) {
+        Map<String, List<String>> requestedFilters = filters == null ? Map.of() : filters;
+        requireSupportedFilters(requestedFilters.keySet(), LOCKED_SNAPSHOT_FILTERS);
+        if (maxResults != null && maxResults < 5) {
+            throw new AwsException("InvalidParameterValue", "Value ( " + maxResults
+                    + " ) for parameter maxResults is invalid. Parameter must be between 5 and 1000.", 400);
+        }
+        String caller = callerAccountId();
+        Instant now = clock.instant();
+        List<Snapshot> locked = snapshotIds == null || snapshotIds.isEmpty()
+                ? snapshotsIn(region).stream()
+                        .filter(stored -> caller.equals(stored.owner()) && stored.snapshot().getLock() != null)
+                        .map(StoredSnapshot::snapshot)
+                        .toList()
+                : snapshotIds.stream().distinct().map(id -> requireLockedSnapshot(region, id, caller)).toList();
+        List<String> lockStates = requestedFilters.get("lock-state");
+        List<LockedSnapshot> matched = locked.stream()
+                .map(snapshot -> lockedView(snapshot, caller, now))
+                .filter(view -> lockStates == null || lockStates.contains(view.lockState()))
+                .sorted(Comparator.comparing(LockedSnapshot::snapshotId))
+                .toList();
+        int pageSize = maxResults == null ? Integer.MAX_VALUE : Math.min(maxResults, 1000);
+        int offset = Math.min(decodeToken(nextToken), matched.size());
+        int end = (int) Math.min((long) offset + pageSize, matched.size());
+        return new LockedSnapshotPage(matched.subList(offset, end), end < matched.size() ? encodeToken(end) : null);
+    }
+
+    private static void requireValidLockRequest(LockRequest request, Instant now) {
+        if (!SNAPSHOT_LOCK_MODES.contains(request.lockMode())) {
+            throw new AwsException("InvalidParameterValue", "Value (" + request.lockMode()
+                    + ") for parameter lockMode is invalid. Valid values: compliance, governance", 400);
+        }
+        if ((request.lockDuration() == null) == (request.expirationDate() == null)) {
+            throw new AwsException("InvalidParameterCombination",
+                    "Specify either lockDuration or expirationDate, but not both.", 400);
+        }
+        Integer lockDuration = request.lockDuration();
+        if (lockDuration != null && (lockDuration < 1 || lockDuration > MAX_SNAPSHOT_LOCK_DAYS)) {
+            throw new AwsException("InvalidParameterValue", "Value (" + lockDuration
+                    + ") for parameter lockDuration is invalid. It must be between 1 and "
+                    + MAX_SNAPSHOT_LOCK_DAYS + ".", 400);
+        }
+        if (request.expirationDate() != null && !request.expirationDate().isAfter(now)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + ISO_FMT.format(request.expirationDate())
+                            + ") for parameter expirationDate is invalid. It must be in the future.", 400);
+        }
+        Integer coolOffPeriod = request.coolOffPeriod();
+        if (coolOffPeriod != null && SnapshotLock.GOVERNANCE.equals(request.lockMode())) {
+            throw new AwsException("InvalidParameterCombination",
+                    "The parameter coolOffPeriod can be used only with the compliance lock mode.", 400);
+        }
+        if (coolOffPeriod != null && (coolOffPeriod < 1 || coolOffPeriod > MAX_SNAPSHOT_COOL_OFF_HOURS)) {
+            throw new AwsException("InvalidParameterValue", "Value (" + coolOffPeriod
+                    + ") for parameter coolOffPeriod is invalid. It must be between 1 and "
+                    + MAX_SNAPSHOT_COOL_OFF_HOURS + ".", 400);
+        }
+    }
+
+    private static SnapshotLock nextLock(String snapshotId, SnapshotLock current, LockRequest request,
+                                         Instant now) {
+        String currentState = current != null ? current.stateAt(now) : SnapshotLock.EXPIRED;
+        Instant expiresOn = request.expirationDate() != null
+                ? request.expirationDate() : now.plus(request.lockDuration(), ChronoUnit.DAYS);
+        if (SnapshotLock.COMPLIANCE.equals(currentState)) {
+            requireComplianceExtension(snapshotId, current, request, expiresOn);
+        }
+        SnapshotLock next = new SnapshotLock();
+        next.setLockMode(request.lockMode());
+        next.setLockDuration(request.lockDuration());
+        next.setLockDurationStartTime(now);
+        next.setLockExpiresOn(expiresOn);
+        next.setLockCreatedOn(SnapshotLock.EXPIRED.equals(currentState) ? now : current.getLockCreatedOn());
+        if (SnapshotLock.COMPLIANCE.equals(currentState)) {
+            next.setCoolOffPeriod(current.getCoolOffPeriod());
+            next.setCoolOffPeriodExpiresOn(current.getCoolOffPeriodExpiresOn());
+        } else if (request.coolOffPeriod() != null) {
+            // Changing the period during cooling-off moves its end; it still runs from when it began.
+            Instant coolOffStart = SnapshotLock.COMPLIANCE_COOLOFF.equals(currentState)
+                    ? current.getCoolOffPeriodExpiresOn().minus(current.getCoolOffPeriod(), ChronoUnit.HOURS)
+                    : now;
+            next.setCoolOffPeriod(request.coolOffPeriod());
+            next.setCoolOffPeriodExpiresOn(coolOffStart.plus(request.coolOffPeriod(), ChronoUnit.HOURS));
+        }
+        return next;
+    }
+
+    private static void requireComplianceExtension(String snapshotId, SnapshotLock current, LockRequest request,
+                                                   Instant expiresOn) {
+        if (!SnapshotLock.COMPLIANCE.equals(request.lockMode())) {
+            throw complianceLocked(snapshotId, "its lock mode can't be changed");
+        }
+        if (request.coolOffPeriod() != null) {
+            throw complianceLocked(snapshotId, "a cooling-off period can't be specified");
+        }
+        if (expiresOn.isBefore(current.getLockExpiresOn())) {
+            throw complianceLocked(snapshotId, "its lock can only be extended");
+        }
+    }
+
+    private static AwsException complianceLocked(String snapshotId, String consequence) {
+        return new AwsException("SnapshotLocked", "The snapshot '" + snapshotId
+                + "' is locked in compliance mode and its cooling-off period has expired, so "
+                + consequence + ".", 400);
+    }
+
+    private Snapshot requireLockedSnapshot(String region, String snapshotId, String caller) {
+        Snapshot snapshot = requireOwnedSnapshot(region, snapshotId, caller);
+        if (snapshot.getLock() == null) {
+            throw new AwsException("SnapshotLockNotFound",
+                    "The snapshot '" + snapshotId + "' does not have a lock.", 400);
+        }
+        return snapshot;
+    }
+
+    private static LockedSnapshot lockedView(Snapshot snapshot, String owner, Instant now) {
+        SnapshotLock lock = snapshot.getLock();
+        return new LockedSnapshot(snapshot.getSnapshotId(), owner, lock.stateAt(now), new SnapshotLock(lock));
+    }
+
+    private boolean isLocked(Snapshot snapshot) {
+        SnapshotLock lock = snapshot.getLock();
+        return lock != null && !SnapshotLock.EXPIRED.equals(lock.stateAt(clock.instant()));
     }
 
     private Snapshot snapshotVolume(String region, Volume volume, String description, List<Tag> snapshotTags) {

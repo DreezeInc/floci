@@ -26,6 +26,7 @@ public class Snapshot {
     private List<String> createVolumePermissionUserIds = new ArrayList<>();
     private List<String> createVolumePermissionGroups = new ArrayList<>();
     private String contentRef;
+    private SnapshotLock lock;
 
     public Snapshot() {}
 
@@ -45,6 +46,7 @@ public class Snapshot {
         this.createVolumePermissionUserIds = new ArrayList<>(other.createVolumePermissionUserIds);
         this.createVolumePermissionGroups = new ArrayList<>(other.createVolumePermissionGroups);
         this.contentRef = other.contentRef;
+        this.lock = other.lock != null ? new SnapshotLock(other.lock) : null;
     }
 
     public String getSnapshotId() { return snapshotId; }
@@ -95,4 +97,7 @@ public class Snapshot {
 
     public String getContentRef() { return contentRef; }
     public void setContentRef(String contentRef) { this.contentRef = contentRef; }
+
+    public SnapshotLock getLock() { return lock; }
+    public void setLock(SnapshotLock lock) { this.lock = lock; }
 }

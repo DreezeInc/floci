@@ -198,6 +198,7 @@ public class AwsQueryController {
             "DescribeImages", "RegisterImage", "DeregisterImage", "CreateImage", "CopyImage",
             "DescribeSnapshots", "CreateSnapshot", "CreateSnapshots", "CopySnapshot", "DeleteSnapshot",
             "ModifySnapshotAttribute", "DescribeSnapshotAttribute", "ResetSnapshotAttribute",
+            "LockSnapshot", "UnlockSnapshot", "DescribeLockedSnapshots",
             "EnableSnapshotBlockPublicAccess", "DisableSnapshotBlockPublicAccess",
             "GetSnapshotBlockPublicAccessState",
             "CreateTags", "DeleteTags", "DescribeTags",

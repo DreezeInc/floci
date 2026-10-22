@@ -803,10 +803,13 @@ Validation matches AWS behavior:
 | CreateSnapshots | Snapshots every EBS volume attached to an instance, one snapshot per volume, honoring `ExcludeBootVolume`, `ExcludeDataVolumeIds` and `CopyTagsFromSource=volume`. |
 | CopySnapshot | Copies a snapshot into the caller's account in the request region, from any region and from any account that granted the caller `createVolumePermission`. |
 | DescribeSnapshots | Lists snapshots the caller can create volumes from, filterable by id, owner, restorable-by account and filters, with `MaxResults`/`NextToken` paging. |
-| DeleteSnapshot | Deletes a snapshot the caller owns. |
+| DeleteSnapshot | Deletes a snapshot the caller owns, unless a snapshot lock protects it. |
 | ModifySnapshotAttribute | Adds or removes `createVolumePermission` for account ids or the `all` group, in either the `OperationType`/`UserId`/`UserGroup` or the `CreateVolumePermission.Add`/`Remove` form. |
 | DescribeSnapshotAttribute | Returns `createVolumePermission` or `productCodes` (always empty). |
 | ResetSnapshotAttribute | Removes every `createVolumePermission` grant. |
+| LockSnapshot | Locks a snapshot in `governance` or `compliance` mode for a `LockDuration` in days or until an `ExpirationDate`, or changes an existing lock. |
+| UnlockSnapshot | Removes a `governance` lock, or a `compliance` lock still in its cooling-off period. |
+| DescribeLockedSnapshots | Lists the caller's locked snapshots with their lock state, filterable by id and `lock-state`, with `MaxResults`/`NextToken` paging. |
 
 A snapshot is stored in the account that creates it, and `ownerId` carries that account. `CreateSnapshot`, `CreateSnapshots` and `CopySnapshot` report the new snapshot as `pending`; every later read reports it `completed` at `100%`, so the `snapshot_completed` waiter returns on its first poll. A copy's `volumeId` is `vol-ffffffff`, as on AWS, and its description defaults to `[Copied <id> from <region>]`. `storageTier` is always `standard`.
 
@@ -814,7 +817,13 @@ Without `SnapshotIds`, `OwnerIds` or `RestorableByUserIds`, `DescribeSnapshots` 
 
 A snapshot of an encrypted volume is encrypted with the volume's KMS key. `CopySnapshot` encrypts the copy when the source is encrypted, `Encrypted=true` or `KmsKeyId` is given, or encryption by default is on. The key is `KmsKeyId` when given; otherwise the source's key for a same-region copy of a snapshot the caller owns, and otherwise the region's EBS default key (`alias/aws/ebs` unless `ModifyEbsDefaultKmsKeyId` changed it). `CreateVolume` follows the same order with the snapshot as the source. A key in the caller's account is resolved through [KMS](kms.md) and stored as its ARN; one that does not exist, is disabled or is pending deletion is rejected with `InvalidParameterValue`. A key ARN in another account is accepted as given, since key policies are not evaluated.
 
-`ModifySnapshotAttribute` follows the AWS sharing rules: an encrypted snapshot cannot be made public, a snapshot encrypted with the AWS managed `aws/ebs` key cannot be shared with other accounts (both `InvalidParameter`), and adding `all` while snapshot block public access is on fails with `OperationNotPermitted`. Account ids must be 12 digits (`InvalidUserID.Malformed`) and the only group is `all`. `DeleteSnapshot` refuses a snapshot that a registered AMI still uses with `InvalidSnapshot.InUse`. Snapshots of another account, including shared ones, cannot be deleted or modified and read as `InvalidSnapshot.NotFound`.
+`ModifySnapshotAttribute` follows the AWS sharing rules: an encrypted snapshot cannot be made public, a snapshot encrypted with the AWS managed `aws/ebs` key cannot be shared with other accounts (both `InvalidParameter`), and adding `all` while snapshot block public access is on fails with `OperationNotPermitted`. Account ids must be 12 digits (`InvalidUserID.Malformed`) and the only group is `all`. `DeleteSnapshot` refuses a snapshot that a registered AMI still uses with `InvalidSnapshot.InUse`, and a snapshot under an unexpired lock with `SnapshotLocked`. Snapshots of another account, including shared ones, cannot be deleted or modified and read as `InvalidSnapshot.NotFound`.
+
+#### Snapshot locks
+
+A lock is kept on the snapshot record, so it is per account and region and survives a restart. Its state is worked out from the clock on every read rather than stored: `compliance-cooloff` while a compliance lock's `CoolOffPeriod` (1 to 72 hours) runs, `compliance` after it, `governance`, and `expired` once `lockExpiresOn` passes, at which point the snapshot can be deleted again. `LockSnapshot` takes exactly one of `LockDuration` (1 to 36500 days) or `ExpirationDate` (`InvalidParameterCombination` otherwise), and `CoolOffPeriod` only with `compliance`.
+
+Changing a lock follows the AWS rules. A `governance` or `compliance-cooloff` lock can change its mode and its duration in either direction, and a cooling-off period that is changed still runs from when it began; leaving `CoolOffPeriod` out of such a change ends the cooling-off period, since an omitted `CoolOffPeriod` means a compliance lock without one. A `compliance` lock can only be extended: changing the mode, shortening it, passing `CoolOffPeriod` or calling `UnlockSnapshot` fails with `SnapshotLocked`. Locking a snapshot whose lock has expired starts a new lock. `UnlockSnapshot` and `DescribeLockedSnapshots` with `SnapshotIds` reject a snapshot without a lock with `SnapshotLockNotFound`, and a snapshot the caller does not own with `InvalidSnapshot.NotFound`. `DeregisterImage` with `DeleteAssociatedSnapshots` keeps a locked snapshot and reports it with the return code `client-error`.
 
 ### Flow Logs
 

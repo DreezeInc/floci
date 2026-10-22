@@ -211,6 +211,9 @@ public class Ec2QueryHandler {
                 case "ModifySnapshotAttribute" -> handleModifySnapshotAttribute(params, region);
                 case "DescribeSnapshotAttribute" -> handleDescribeSnapshotAttribute(params, region);
                 case "ResetSnapshotAttribute" -> handleResetSnapshotAttribute(params, region);
+                case "LockSnapshot" -> handleLockSnapshot(params, region);
+                case "UnlockSnapshot" -> handleUnlockSnapshot(params, region);
+                case "DescribeLockedSnapshots" -> handleDescribeLockedSnapshots(params, region);
                 // Tags
                 case "CreateTags" -> handleCreateTags(params, region);
                 case "DeleteTags" -> handleDeleteTags(params, region);
@@ -3791,6 +3794,69 @@ public class Ec2QueryHandler {
         checkDryRun(p);
         service.resetSnapshotAttribute(region, p.getFirst("SnapshotId"), p.getFirst("Attribute"));
         return booleanResponse("ResetSnapshotAttribute");
+    }
+
+    private Response handleLockSnapshot(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        Ec2Service.LockedSnapshot locked = service.lockSnapshot(region, p.getFirst("SnapshotId"),
+                p.getFirst("LockMode"), intOrNull(p, "LockDuration"), instantOrNull(p, "ExpirationDate"),
+                intOrNull(p, "CoolOffPeriod"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("LockSnapshotResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .raw(snapshotLockXml(locked))
+                .end("LockSnapshotResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleUnlockSnapshot(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        String snapshotId = p.getFirst("SnapshotId");
+        service.unlockSnapshot(region, snapshotId);
+        XmlBuilder xml = new XmlBuilder()
+                .start("UnlockSnapshotResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("snapshotId", snapshotId)
+                .end("UnlockSnapshotResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleDescribeLockedSnapshots(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        Ec2Service.LockedSnapshotPage page = service.describeLockedSnapshots(region, getList(p, "SnapshotId"),
+                getFilters(p), intOrNull(p, "MaxResults"), p.getFirst("NextToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeLockedSnapshotsResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("snapshotSet");
+        for (Ec2Service.LockedSnapshot locked : page.snapshots()) {
+            xml.start("item")
+                    .elem("ownerId", locked.ownerId())
+                    .raw(snapshotLockXml(locked))
+                    .end("item");
+        }
+        xml.end("snapshotSet")
+                .elem("nextToken", page.nextToken())
+                .end("DescribeLockedSnapshotsResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private static String snapshotLockXml(Ec2Service.LockedSnapshot locked) {
+        SnapshotLock lock = locked.lock();
+        return new XmlBuilder()
+                .elem("snapshotId", locked.snapshotId())
+                .elem("lockState", locked.lockState())
+                .elem("lockDuration", Objects.toString(lock.getLockDuration(), null))
+                .elem("coolOffPeriod", Objects.toString(lock.getCoolOffPeriod(), null))
+                .elem("coolOffPeriodExpiresOn", isoOrNull(lock.getCoolOffPeriodExpiresOn()))
+                .elem("lockCreatedOn", isoOrNull(lock.getLockCreatedOn()))
+                .elem("lockExpiresOn", isoOrNull(lock.getLockExpiresOn()))
+                .elem("lockDurationStartTime", isoOrNull(lock.getLockDurationStartTime()))
+                .build();
+    }
+
+    private static String isoOrNull(Instant instant) {
+        return instant != null ? ISO_FMT.format(instant) : null;
     }
 
     // ─── Tag handlers ─────────────────────────────────────────────────────────
