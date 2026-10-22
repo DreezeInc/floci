@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
+import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
@@ -178,6 +179,55 @@ class EksCfnProvisionerTest {
     }
 
     @Test
+    void clusterPassesResourcesVpcConfigThroughAndPublishesTheClusterSecurityGroup() throws Exception {
+        Cluster created = new Cluster();
+        created.setName("prod");
+        created.setArn("arn:aws:eks:us-east-1:000000000000:cluster/prod");
+        ResourcesVpcConfig createdVpcConfig = new ResourcesVpcConfig();
+        createdVpcConfig.setClusterSecurityGroupId("sg-cluster");
+        created.setResourcesVpcConfig(createdVpcConfig);
+        when(eks.createCluster(any(CreateClusterRequest.class))).thenReturn(created);
+
+        StackResource r = resource("AWS::EKS::Cluster", "Control");
+        provisioner.provision(r, props("""
+                {"Name": "prod",
+                 "ResourcesVpcConfig": {"SubnetIds": ["subnet-1", "subnet-2"], "SecurityGroupIds": ["sg-extra"],
+                                        "EndpointPublicAccess": true, "EndpointPrivateAccess": true,
+                                        "PublicAccessCidrs": ["203.0.113.0/24"]}}
+                """), ctx());
+
+        ArgumentCaptor<CreateClusterRequest> request = ArgumentCaptor.forClass(CreateClusterRequest.class);
+        verify(eks).createCluster(request.capture());
+        ResourcesVpcConfig vpcConfig = request.getValue().getResourcesVpcConfig();
+        assertEquals(List.of("subnet-1", "subnet-2"), vpcConfig.getSubnetIds());
+        assertEquals(List.of("sg-extra"), vpcConfig.getSecurityGroupIds());
+        assertEquals(Boolean.TRUE, vpcConfig.getEndpointPublicAccess());
+        assertEquals(Boolean.TRUE, vpcConfig.getEndpointPrivateAccess());
+        assertEquals(List.of("203.0.113.0/24"), vpcConfig.getPublicAccessCidrs());
+        assertEquals("sg-cluster", r.getAttributes().get("ClusterSecurityGroupId"));
+    }
+
+    @Test
+    void clusterVpcConfigWithoutOptionalFieldsLeavesThemToTheServiceDefault() throws Exception {
+        Cluster created = new Cluster();
+        created.setName("prod");
+        created.setArn("arn:aws:eks:us-east-1:000000000000:cluster/prod");
+        when(eks.createCluster(any(CreateClusterRequest.class))).thenReturn(created);
+
+        provisioner.provision(resource("AWS::EKS::Cluster", "Control"), props("""
+                {"Name": "prod", "ResourcesVpcConfig": {"SubnetIds": ["subnet-1"]}}
+                """), ctx());
+
+        ArgumentCaptor<CreateClusterRequest> request = ArgumentCaptor.forClass(CreateClusterRequest.class);
+        verify(eks).createCluster(request.capture());
+        ResourcesVpcConfig vpcConfig = request.getValue().getResourcesVpcConfig();
+        assertEquals(List.of("subnet-1"), vpcConfig.getSubnetIds());
+        assertNull(vpcConfig.getEndpointPublicAccess());
+        assertNull(vpcConfig.getEndpointPrivateAccess());
+        assertNull(vpcConfig.getPublicAccessCidrs());
+    }
+
+    @Test
     void clusterWithoutAccessConfigLeavesItToTheServiceDefault() throws Exception {
         Cluster created = new Cluster();
         created.setName("prod");
@@ -189,6 +239,7 @@ class EksCfnProvisionerTest {
         ArgumentCaptor<CreateClusterRequest> request = ArgumentCaptor.forClass(CreateClusterRequest.class);
         verify(eks).createCluster(request.capture());
         assertNull(request.getValue().getAccessConfig());
+        assertNull(request.getValue().getResourcesVpcConfig());
         assertNull(request.getValue().getTags());
     }
 

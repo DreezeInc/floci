@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateClusterRequest;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
+import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -67,6 +68,7 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         request.setVersion(ctx.resolveOptional(props, "Version"));
         request.setRoleArn(ctx.resolveOptional(props, "RoleArn"));
         request.setAccessConfig(accessConfig(props, ctx));
+        request.setResourcesVpcConfig(resourcesVpcConfig(props, ctx));
         Map<String, String> tags = ctx.resolveTags(props, "Tags");
         if (!tags.isEmpty()) {
             request.setTags(tags);
@@ -87,6 +89,9 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         if (cluster.getIdentity() != null && cluster.getIdentity().getOidc() != null
                 && cluster.getIdentity().getOidc().getIssuer() != null) {
             r.getAttributes().put("OpenIdConnectIssuerUrl", cluster.getIdentity().getOidc().getIssuer());
+        }
+        if (cluster.getResourcesVpcConfig() != null && cluster.getResourcesVpcConfig().getClusterSecurityGroupId() != null) {
+            r.getAttributes().put("ClusterSecurityGroupId", cluster.getResourcesVpcConfig().getClusterSecurityGroupId());
         }
     }
 
@@ -118,6 +123,33 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         String bootstrap = ctx.resolveOptional(resolved, "BootstrapClusterCreatorAdminPermissions");
         return new AccessConfig(ctx.resolveOptional(resolved, "AuthenticationMode"),
                 bootstrap == null ? null : Boolean.parseBoolean(bootstrap));
+    }
+
+    /**
+     * Without this the cluster has no subnets, so DescribeCluster reports a blank vpcId and no
+     * cluster security group, unlike the same template applied to AWS.
+     */
+    private static ResourcesVpcConfig resourcesVpcConfig(JsonNode props, ProvisionContext ctx) {
+        if (props == null || !props.hasNonNull("ResourcesVpcConfig")) {
+            return null;
+        }
+        JsonNode resolved = ctx.engine().resolveNode(props.get("ResourcesVpcConfig"));
+        if (resolved == null || !resolved.isObject()) {
+            return null;
+        }
+        ResourcesVpcConfig vpcConfig = new ResourcesVpcConfig();
+        vpcConfig.setSubnetIds(ctx.resolveStringList(resolved, "SubnetIds"));
+        vpcConfig.setSecurityGroupIds(ctx.resolveStringList(resolved, "SecurityGroupIds"));
+        vpcConfig.setEndpointPublicAccess(optionalBoolean(ctx.resolveOptional(resolved, "EndpointPublicAccess")));
+        vpcConfig.setEndpointPrivateAccess(optionalBoolean(ctx.resolveOptional(resolved, "EndpointPrivateAccess")));
+        if (resolved.has("PublicAccessCidrs")) {
+            vpcConfig.setPublicAccessCidrs(ctx.resolveStringList(resolved, "PublicAccessCidrs"));
+        }
+        return vpcConfig;
+    }
+
+    private static Boolean optionalBoolean(String value) {
+        return value == null ? null : Boolean.parseBoolean(value);
     }
 
     private void provisionNodegroup(StackResource r, JsonNode props, ProvisionContext ctx) {
