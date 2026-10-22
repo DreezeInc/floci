@@ -120,8 +120,17 @@ Recreate older local clusters before using worker authentication; a legacy unsco
 rejects instance credentials. Obtain fresh IMDS credentials after upgrading so the session
 includes the stable role ID.
 
+### aws-auth ConfigMap
+
+In real mode, a running cluster whose authentication mode is `CONFIG_MAP` or `API_AND_CONFIG_MAP` gets
+`kube-system/aws-auth`, as EKS creates it for managed node groups. Every ACTIVE node group's `nodeRole` is
+mapped as `system:node:{{EC2PrivateDNSName}}` with the `system:bootstrappers` and `system:nodes` groups.
+Floci creates the ConfigMap when it is absent and otherwise adds only the missing roles, so entries that
+other tools added stay. A replaced k3s container is mapped again. The token webhook does not read
+`aws-auth`; the ConfigMap exists for tools that read or edit it.
+
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, access-policy association, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, the aws-auth ConfigMap's mappings, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, access-policy association, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \

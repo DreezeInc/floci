@@ -3913,6 +3913,102 @@ class EksClusterManagerTest {
     }
 
     @Nested
+    class AwsAuthTest {
+
+        private static final String ROLE = "arn:aws:iam::000000000000:role/eks-node";
+        private EksClusterManager manager;
+        private Cluster cluster;
+        private ArgumentCaptor<String[]> commands;
+
+        @BeforeEach
+        void setUp() {
+            EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+            EmulatorConfig.ServicesConfig services = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+            when(config.services()).thenReturn(services);
+            when(services.eks()).thenReturn(Mockito.mock(EmulatorConfig.EksServiceConfig.class));
+            manager = Mockito.spy(new EksClusterManager(Mockito.mock(ContainerBuilder.class),
+                    Mockito.mock(ContainerLifecycleManager.class), Mockito.mock(ContainerDetector.class),
+                    Mockito.mock(PortAllocator.class), Mockito.mock(DockerHostResolver.class),
+                    Mockito.mock(EcrRegistryManager.class), config, new RegionResolver("us-east-1", "000000000000"),
+                    Mockito.mock(Ec2MetadataServer.class), Mockito.mock(EksOidcService.class),
+                    inlineMock(FlociCertificateAuthority.class), Mockito.mock(ContainerLogStreamer.class),
+                    new InMemoryStorage<>()));
+            cluster = new Cluster();
+            cluster.setName("auth-cluster");
+            cluster.setContainerId("auth-container");
+            commands = ArgumentCaptor.forClass(String[].class);
+        }
+
+        private void execReturns(ContainerExec.Result first, ContainerExec.Result... rest) {
+            doReturn(first, (Object[]) rest).when(manager)
+                    .execInContainerForResult(eq("auth-container"), commands.capture(), anyInt());
+        }
+
+        private static ContainerExec.Result ok(String stdout) {
+            return new ContainerExec.Result(0L, stdout, "", false);
+        }
+
+        @Test
+        void createsTheConfigMapWithTheNodeRoleWhenItIsAbsent() {
+            execReturns(ok(""), ok("configmap/aws-auth created"));
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+
+            String script = commands.getAllValues().get(1)[2];
+            assertTrue(script.endsWith("| kubectl create -f -"), script);
+            assertTrue(script.contains("\"name\":\"aws-auth\"") && script.contains("\"namespace\":\"kube-system\""));
+            assertTrue(script.contains("rolearn: \\\"" + ROLE + "\\\"")
+                    && script.contains("system:node:{{EC2PrivateDNSName}}")
+                    && script.contains("system:bootstrappers") && script.contains("system:nodes"), script);
+        }
+
+        @Test
+        void appendsTheMissingRoleAndKeepsEveryOtherEntry() {
+            String existing = "{\"apiVersion\":\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"aws-auth\","
+                    + "\"namespace\":\"kube-system\",\"resourceVersion\":\"417\",\"managedFields\":[{}]},"
+                    + "\"data\":{\"mapRoles\":\"- rolearn: arn:aws:iam::000000000000:role/reader\\n"
+                    + "  username: reader\\n  groups:\\n  - readers\\n\",\"mapUsers\":\"[]\"}}";
+            execReturns(ok(existing), ok("configmap/aws-auth replaced"));
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+
+            String script = commands.getAllValues().get(1)[2];
+            assertTrue(script.endsWith("| kubectl replace -f -"), script);
+            assertTrue(script.contains("\"resourceVersion\":\"417\"") && !script.contains("managedFields"), script);
+            assertTrue(script.contains("role/reader") && script.contains("readers") && script.contains(ROLE), script);
+            assertTrue(script.contains("\"mapUsers\":\"[]\""), script);
+        }
+
+        @Test
+        void writesNothingWhenEveryRoleIsAlreadyMapped() {
+            String existing = "{\"metadata\":{\"name\":\"aws-auth\"},\"data\":{\"mapRoles\":\"- rolearn: "
+                    + ROLE + "\\n  username: node\\n\"}}";
+            execReturns(ok(existing));
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+
+            assertEquals(1, commands.getAllValues().size());
+        }
+
+        @Test
+        void reportsAFailedWriteSoTheCallerRetries() {
+            execReturns(ok(""), new ContainerExec.Result(1L, "Error from server (AlreadyExists)", "", false));
+
+            assertFalse(manager.ensureAwsAuthNodeRoles(cluster, List.of(ROLE)));
+        }
+
+        @Test
+        void doesNothingWithoutAContainerOrRoles() {
+            Cluster stopped = new Cluster();
+            stopped.setName("stopped");
+
+            assertTrue(manager.ensureAwsAuthNodeRoles(stopped, List.of(ROLE)));
+            assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of()));
+            Mockito.verify(manager, Mockito.never()).execInContainerForResult(any(), any(), anyInt());
+        }
+    }
+
+    @Nested
     class JoinedInstancesTest {
 
         private EksClusterManager manager;
