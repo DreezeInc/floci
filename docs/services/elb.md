@@ -175,6 +175,7 @@ aws elbv2 delete-target-group \
 | Environment variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_ELBV2_ENABLED` | `true` | Enable or disable the ELBv2 service |
+| `FLOCI_SERVICES_ELBV2_DNS_SUFFIX` | unset | Domain load balancer DNS names are created under (`{name}-{id}.elb.{suffix}`). Unset, names fall under `FLOCI_HOSTNAME`, then `localhost.floci.io`. Set it to `localhost.floci.io` when clients outside Floci's network cannot resolve names under `FLOCI_HOSTNAME`: that domain resolves to `127.0.0.1` in public DNS and to Floci from containers that use its embedded DNS. |
 
 ## Listener Ports
 

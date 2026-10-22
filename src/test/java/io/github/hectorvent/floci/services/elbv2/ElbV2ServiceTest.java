@@ -365,15 +365,46 @@ class ElbV2ServiceTest {
 
     @Test
     void createLoadBalancerUsesConfiguredHostnameForDnsSuffix() {
-        EmulatorConfig config = mock(EmulatorConfig.class);
-        when(config.hostname()).thenReturn(Optional.of("floci"));
-        service.config = config;
+        service.config = configWithDnsNames(Optional.of("floci"), Optional.empty());
 
         String dnsName = service.createLoadBalancer(
                 REGION, "sample-lb", "internal", "application", "ipv4",
                 ALB_SUBNETS, List.of("sg-a"), Map.of()).getDnsName();
 
         assertTrue(dnsName.endsWith(".elb.floci"));
+    }
+
+    @Test
+    void createLoadBalancerPrefersTheConfiguredDnsSuffixOverTheHostname() {
+        service.config = configWithDnsNames(Optional.of("floci"), Optional.of("localhost.floci.io"));
+
+        String dnsName = service.createLoadBalancer(
+                REGION, "sample-lb", "internal", "network", "ipv4",
+                ALB_SUBNETS, List.of(), Map.of()).getDnsName();
+
+        assertTrue(dnsName.matches("sample-lb-[0-9a-f]+\\.elb\\.localhost\\.floci\\.io"), dnsName);
+    }
+
+    @Test
+    void createLoadBalancerFallsBackToTheDefaultDomainWithNoHostnameOrSuffix() {
+        service.config = configWithDnsNames(Optional.empty(), Optional.empty());
+
+        String dnsName = service.createLoadBalancer(
+                REGION, "sample-lb", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-a"), Map.of()).getDnsName();
+
+        assertTrue(dnsName.endsWith(".elb.localhost.floci.io"));
+    }
+
+    private static EmulatorConfig configWithDnsNames(Optional<String> hostname, Optional<String> dnsSuffix) {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.ElbV2ServiceConfig elbv2 = mock(EmulatorConfig.ElbV2ServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.elbv2()).thenReturn(elbv2);
+        when(elbv2.dnsSuffix()).thenReturn(dnsSuffix);
+        lenient().when(config.hostname()).thenReturn(hostname);
+        return config;
     }
 
     @Test

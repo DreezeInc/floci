@@ -245,7 +245,9 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (config == null) {
             return EmbeddedDnsServer.DEFAULT_SUFFIX;
         }
-        return config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+        return config.services().elbv2().dnsSuffix()
+                .or(config::hostname)
+                .orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
     }
 
     public List<LoadBalancer> describeLoadBalancers(String region, List<String> arns, List<String> names,

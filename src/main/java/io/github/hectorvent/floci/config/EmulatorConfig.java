@@ -3282,6 +3282,12 @@ public interface EmulatorConfig {
 
         @WithDefault("false")
         boolean mock();
+
+        /**
+         * The domain load balancer DNS names are created under. Unset, they fall under
+         * {@code floci.hostname}, or {@code localhost.floci.io} when that is unset too.
+         */
+        Optional<String> dnsSuffix();
     }
 
     interface EksServiceConfig {

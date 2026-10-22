@@ -768,6 +768,7 @@ floci:
     elbv2:
       enabled: true
       mock: false
+      # dns-suffix: localhost.floci.io # domain for load balancer DNS names; defaults to floci.hostname
     codebuild:
       enabled: true
       # docker-network: floci-network
