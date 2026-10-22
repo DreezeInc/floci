@@ -100,7 +100,7 @@ type_order:
     [VPC, Subnet, SecurityGroup, SecurityGroupIngress, SecurityGroupEgress, InternetGateway,
      RouteTable, SubnetRouteTableAssociation, Route, NatGateway, EIP, Instance, LaunchTemplate,
      VPCGatewayAttachment, VPCEndpoint, NetworkAcl, NetworkAclEntry, SubnetNetworkAclAssociation,
-     FlowLog]
+     FlowLog, Volume]
   AWS::ElasticLoadBalancingV2: [LoadBalancer, TargetGroup, Listener, ListenerRule]
   AWS::ApplicationAutoScaling: [ScalableTarget, ScalingPolicy]
   AWS::AutoScaling: [LaunchConfiguration, AutoScalingGroup, LifecycleHook]
@@ -206,6 +206,7 @@ notes:
   AWS::EKS::IdentityProviderConfig: 'metadata only, the issuer is never contacted and the config is ACTIVE at once; a reused config is not reconciled on update'
   AWS::IAM::OIDCProvider: 'a reused provider is not reconciled on update'
   AWS::EFS::FileSystem: '`FileSystemPolicy`, `BackupPolicy` and `LifecyclePolicies` are applied on create and update; `ReplicationConfiguration` and `FileSystemProtection` are ignored'
+  AWS::EC2::Volume: '`KmsKeyId` is accepted and not stored; a reused volume is not reconciled on update'
   AWS::CloudFront::Function: '`KeyValueStoreAssociations` is ignored'
   AWS::GuardDuty::MalwareProtectionPlan: 'management plane only: no scan runs, so the plan stays ACTIVE; Ref returns the plan id; a BucketName change is rejected'
   AWS::BedrockAgentCore::Runtime: 'Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored'

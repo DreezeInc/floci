@@ -56,6 +56,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2Networ
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2NetworkCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2SecurityGroupCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2SecurityGroupRuleCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VolumeCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcEndpointCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcGatewayAttachmentCfnProvisioner;
@@ -480,6 +481,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new WafV2CfnProvisioner(wafV2Service));
             }
             if (ec2Service != null) {
+                discovered.add(new Ec2VolumeCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcEndpointCfnProvisioner(ec2Service));
                 discovered.add(new Ec2VpcGatewayAttachmentCfnProvisioner(ec2Service));
