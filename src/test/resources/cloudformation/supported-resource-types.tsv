@@ -95,6 +95,7 @@ AWS::ECS::TaskDefinition	EcsCfnProvisioner
 AWS::EKS::AccessEntry	EksAccessEntryCfnProvisioner
 AWS::EKS::Addon	EksAddonCfnProvisioner
 AWS::EKS::Cluster	EksCfnProvisioner
+AWS::EKS::IdentityProviderConfig	EksIdentityProviderConfigCfnProvisioner
 AWS::EKS::Nodegroup	EksCfnProvisioner
 AWS::EKS::PodIdentityAssociation	EksPodIdentityAssociationCfnProvisioner
 AWS::ElastiCache::CacheCluster	ElastiCacheCfnProvisioner
