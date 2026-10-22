@@ -23,6 +23,7 @@ order:
   - AWS::ECR
   - AWS::ECS
   - AWS::EKS
+  - AWS::EFS
   - AWS::RDS
   - AWS::ElastiCache
   - AWS::Redshift
@@ -86,6 +87,7 @@ type_order:
   AWS::SecretsManager: [Secret, SecretTargetAttachment]
   AWS::ECS: [Cluster, TaskDefinition, Service]
   AWS::EKS: [Cluster, Nodegroup, Addon, AccessEntry, PodIdentityAssociation, IdentityProviderConfig]
+  AWS::EFS: [FileSystem, MountTarget, AccessPoint]
   AWS::RDS:
     [DBInstance, DBCluster, DBSubnetGroup, DBParameterGroup, DBClusterParameterGroup]
   AWS::ElastiCache:
@@ -137,6 +139,7 @@ service_labels:
   AWS::EC2: EC2
   AWS::ECR: ECR
   AWS::ECS: ECS
+  AWS::EFS: EFS
   AWS::EKS: EKS
   AWS::ElasticLoadBalancingV2: Elastic Load Balancing v2
   AWS::Events: EventBridge
@@ -202,6 +205,7 @@ notes:
   AWS::EKS::PodIdentityAssociation: 'a reused association is not reconciled on update'
   AWS::EKS::IdentityProviderConfig: 'metadata only, the issuer is never contacted and the config is ACTIVE at once; a reused config is not reconciled on update'
   AWS::IAM::OIDCProvider: 'a reused provider is not reconciled on update'
+  AWS::EFS::FileSystem: '`FileSystemPolicy`, `BackupPolicy` and `LifecyclePolicies` are applied on create and update; `ReplicationConfiguration` and `FileSystemProtection` are ignored'
   AWS::CloudFront::Function: '`KeyValueStoreAssociations` is ignored'
   AWS::GuardDuty::MalwareProtectionPlan: 'management plane only: no scan runs, so the plan stays ACTIVE; Ref returns the plan id; a BucketName change is rejected'
   AWS::BedrockAgentCore::Runtime: 'Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored'

@@ -62,6 +62,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcGat
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcrCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCapacityCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.EfsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksAccessEntryCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksAddonCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EksCfnProvisioner;
@@ -129,6 +130,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.FlowLogService;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.efs.EfsService;
 import io.github.hectorvent.floci.services.eks.EksAccessEntryService;
 import io.github.hectorvent.floci.services.eks.EksAddonService;
 import io.github.hectorvent.floci.services.eks.EksIdentityProviderConfigService;
@@ -226,6 +228,7 @@ final class CfnProvisionerFixture {
         private EksAccessEntryService eksAccessEntryService;
         private EksPodIdentityAssociationService eksPodIdentityAssociationService;
         private EksIdentityProviderConfigService eksIdentityProviderConfigService;
+        private EfsService efsService;
         private CloudWatchLogsService logsService;
         private KinesisService kinesisService;
         private CloudWatchMetricsService cloudWatchMetricsService;
@@ -388,6 +391,9 @@ final class CfnProvisionerFixture {
             }
             if (eksIdentityProviderConfigService != null) {
                 discovered.add(new EksIdentityProviderConfigCfnProvisioner(eksService, eksIdentityProviderConfigService));
+            }
+            if (efsService != null) {
+                discovered.add(new EfsCfnProvisioner(efsService));
             }
             if (elbV2Service != null) {
                 discovered.add(new ElbV2CfnProvisioner(elbV2Service));
@@ -694,6 +700,11 @@ final class CfnProvisionerFixture {
 
         public Builder eksIdentityProviderConfigs(EksIdentityProviderConfigService v) {
             this.eksIdentityProviderConfigService = v;
+            return this;
+        }
+
+        public Builder efs(EfsService v) {
+            this.efsService = v;
             return this;
         }
 
