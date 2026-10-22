@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.BiConsumer;
@@ -511,6 +512,59 @@ public class BackupController {
                 "RecoveryPoints", (list, point) -> list.addPOJO(point));
     }
 
+    @GET
+    @Path("/backup-vaults/{backupVaultName}/recovery-points/{recoveryPointArn}/restore-metadata")
+    public Response getRecoveryPointRestoreMetadata(@Context HttpHeaders headers,
+                                                    @PathParam("backupVaultName") String vaultName,
+                                                    @PathParam("recoveryPointArn") String recoveryPointArn,
+                                                    @QueryParam("backupVaultAccountId") String vaultAccountId) {
+        String region = regionResolver.resolveRegion(headers);
+        BackupService.RestoreMetadata result =
+                service.getRecoveryPointRestoreMetadata(vaultName, vaultAccountId, recoveryPointArn, region);
+        ObjectNode out = objectMapper.createObjectNode();
+        out.put("BackupVaultArn", result.backupVaultArn());
+        out.put("RecoveryPointArn", result.recoveryPointArn());
+        out.putPOJO("RestoreMetadata", result.metadata());
+        putIfNotNull(out, "ResourceType", result.resourceType());
+        return Response.ok(out).build();
+    }
+
+    // ── Restore job ────────────────────────────────────────────────────────────
+
+    @PUT
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/restore-jobs")
+    public Response startRestoreJob(@Context HttpHeaders headers, String body) throws IOException {
+        String region = regionResolver.resolveRegion(headers);
+        JsonNode req = objectMapper.readTree(body == null || body.isBlank() ? "{}" : body);
+        RestoreJob job = service.startRestoreJob(stringOrNull(req, "RecoveryPointArn"), readMetadata(req),
+                stringOrNull(req, "IamRoleArn"), textOrNull(req, "IdempotencyToken"),
+                stringOrNull(req, "ResourceType"), region);
+        ObjectNode out = objectMapper.createObjectNode();
+        out.put("RestoreJobId", job.getRestoreJobId());
+        return Response.ok(out).build();
+    }
+
+    @GET
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/restore-jobs/{restoreJobId}")
+    public Response describeRestoreJob(@PathParam("restoreJobId") String restoreJobId) {
+        return Response.ok(service.describeRestoreJob(restoreJobId)).build();
+    }
+
+    @GET
+    @Path(BackupRouteFilter.INTERNAL_PREFIX + "/restore-jobs/")
+    public Response listRestoreJobs(@QueryParam("accountId") String byAccountId,
+                                    @QueryParam("resourceType") String byResourceType,
+                                    @QueryParam("status") String byStatus,
+                                    @QueryParam("createdBefore") String createdBefore,
+                                    @QueryParam("createdAfter") String createdAfter,
+                                    @QueryParam("maxResults") String maxResults,
+                                    @QueryParam("nextToken") String nextToken) {
+        List<RestoreJob> jobs = service.listRestoreJobs(byAccountId, byResourceType, byStatus,
+                epochSecondsOrNull("createdBefore", createdBefore), epochSecondsOrNull("createdAfter", createdAfter));
+        return page(jobs, RestoreJob::getRestoreJobId, maxResults, nextToken, "restore-jobs",
+                "RestoreJobs", (list, job) -> list.addPOJO(job));
+    }
+
     // ── Protected resources ────────────────────────────────────────────────────
 
     @GET
@@ -654,6 +708,25 @@ public class BackupController {
                 throw new AwsException("InvalidParameterValueException", field + " is not a valid timestamp", 400);
             }
         }
+    }
+
+    private static Map<String, String> readMetadata(JsonNode req) {
+        JsonNode node = req.path("Metadata");
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw new AwsException("InvalidParameterValueException", "Metadata must be a map of strings", 400);
+        }
+        Map<String, String> metadata = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonNode> entry : node.properties()) {
+            if (!entry.getValue().isTextual()) {
+                throw new AwsException("InvalidParameterValueException",
+                        "Metadata " + entry.getKey() + " must be a string", 400);
+            }
+            metadata.put(entry.getKey(), entry.getValue().asText());
+        }
+        return metadata;
     }
 
     private Lifecycle readLifecycle(JsonNode req) throws IOException {

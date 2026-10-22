@@ -19,6 +19,7 @@ public class BackupRouteFilter implements ContainerRequestFilter {
 
     private static final Predicate<String> ROUTED_PATHS = SignedServiceRoute.under("/resources")
             .or(SignedServiceRoute.under("/copy-jobs"))
+            .or(SignedServiceRoute.under("/restore-jobs"))
             .or(SignedServiceRoute.under("/logically-air-gapped-backup-vaults"));
 
     private final SignedServiceRoute route;

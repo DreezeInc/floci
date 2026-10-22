@@ -75,9 +75,11 @@
 | `ListRecoveryPointsByBackupVault` | `GET` | `/backup-vaults/{backupVaultName}/recovery-points/` | List recovery points in a vault, filtered by resource, type and creation time, paginated |
 | `ListRecoveryPointsByResource` | `GET` | `/resources/{resourceArn}/recovery-points/` | List the caller's recovery points of one resource |
 | `DeleteRecoveryPoint` | `DELETE` | `/backup-vaults/{backupVaultName}/recovery-points/{recoveryPointArn}` | Delete a recovery point |
+| `GetRecoveryPointRestoreMetadata` | `GET` | `/backup-vaults/{backupVaultName}/recovery-points/{recoveryPointArn}/restore-metadata` | Read the metadata a restore starts from |
 
-`DescribeRecoveryPoint` and `ListRecoveryPointsByBackupVault` accept `BackupVaultAccountId` to
-read a logically air-gapped vault another account shares with the caller.
+`DescribeRecoveryPoint`, `ListRecoveryPointsByBackupVault` and `GetRecoveryPointRestoreMetadata`
+accept `BackupVaultAccountId` to read a logically air-gapped vault another account shares with
+the caller.
 
 ### Copy Jobs
 
@@ -87,6 +89,14 @@ read a logically air-gapped vault another account shares with the caller.
 | `DescribeCopyJob` | `GET` | `/copy-jobs/{copyJobId}` | Get copy job status |
 | `ListCopyJobs` | `GET` | `/copy-jobs/` | List copy jobs with optional filters, paginated |
 
+### Restore Jobs
+
+| Action | Method | Path | Description |
+|---|---|---|---|
+| `StartRestoreJob` | `PUT` | `/restore-jobs` | Restore an S3 recovery point into a bucket of the caller's |
+| `DescribeRestoreJob` | `GET` | `/restore-jobs/{restoreJobId}` | Get restore job status |
+| `ListRestoreJobs` | `GET` | `/restore-jobs/` | List restore jobs with optional filters, paginated |
+
 ### Protected Resources
 
 | Action | Method | Path | Description |
@@ -94,7 +104,7 @@ read a logically air-gapped vault another account shares with the caller.
 | `ListProtectedResources` | `GET` | `/resources/` | List resources the caller has recovery points of |
 | `DescribeProtectedResource` | `GET` | `/resources/{resourceArn}` | Describe the latest backup of one resource |
 
-S3 also serves `/{bucket}` paths, so `/resources`, `/copy-jobs` and
+S3 also serves `/{bucket}` paths, so `/resources`, `/copy-jobs`, `/restore-jobs` and
 `/logically-air-gapped-backup-vaults` answer only requests signed for `backup`; anything else
 on those paths reaches S3.
 
@@ -140,6 +150,40 @@ vault (missing, still `CREATING`, a lifecycle outside its lock window, or anothe
 whose access policy does not allow `backup:CopyIntoBackupVault` to the caller) fail the job with a
 `StatusMessage` instead of failing the request.
 
+Restore jobs go `PENDING → RUNNING (after ~1 s) → COMPLETED or FAILED (after
+job-completion-delay-seconds)`.
+
+## S3 Backup and Restore
+
+- **A backup job of an S3 bucket saves its objects.** When the job completes it reads every
+  current object of the bucket: its bytes, content type, user metadata, `Content-Encoding`,
+  `Cache-Control`, `Content-Disposition`, tags and server-side encryption. Changes to the bucket
+  after that do not reach the recovery point. `BackupSizeInBytes` is the total object size.
+- The bucket must exist and have versioning enabled, as AWS Backup requires; otherwise the job
+  ends `FAILED` with a `StatusMessage` and no recovery point.
+- A copy job carries the saved objects to the copy, in any account or region.
+- `GetRecoveryPointRestoreMetadata` returns `DestinationBucketName` (the source bucket),
+  `NewBucket` `false`, `Encrypted` `false`, `EncryptionType` `ORIGINAL` and a fresh
+  `aws:backup:request-id`.
+- **`StartRestoreJob` reads these `Metadata` keys, in any letter case:**
+  - `DestinationBucketName` (required).
+  - `NewBucket`: `true` creates the bucket with versioning enabled, and fails the job if the
+    caller already owns it. `false` (the default) restores into an existing bucket of the
+    caller's, which must have versioning enabled.
+  - `EncryptionType`: `SSE_S3`, `SSE_KMS` (needs `KMSKey`) or `ORIGINAL` (each object keeps the
+    encryption it was saved with). Without it, `Encrypted=true` means `SSE_KMS` when `KMSKey` is
+    given and `SSE_S3` otherwise.
+  - `ItemsToRestore`: a JSON array of up to five `s3://bucket/prefix` paths; only matching keys
+    are restored.
+- The restore writes into the **caller's** account. A recovery point in another account's
+  logically air-gapped vault can be restored once that vault is shared with the caller through
+  an accepted RAM invitation; otherwise `StartRestoreJob` returns `ResourceNotFoundException`.
+- A repeated `IdempotencyToken` returns the job it first started.
+- When the job completes, `CreatedResourceArn` is the bucket ARN and the recovery point's
+  `LastRestoreTime` is set.
+- Saved objects live in the Backup service's storage (`backup-recovery-point-contents.json`), so
+  this suits test-sized buckets, not large ones.
+
 ## Logically Air-Gapped Vaults
 
 - `CreateLogicallyAirGappedBackupVault` requires `MinRetentionDays` (at least 7) and
@@ -162,7 +206,9 @@ whose access policy does not allow `backup:CopyIntoBackupVault` to the caller) f
 
 `S3`, `RDS`, `DynamoDB`, `EFS`, `EC2`, `EBS`, `Aurora`, `DocumentDB`, `Neptune`, `FSx`, `VirtualMachine`
 
-Actual backup is simulated — no data is read from or written to the referenced resources.
+S3 backups save the bucket's objects (see [S3 Backup and Restore](#s3-backup-and-restore)).
+For every other type the backup is simulated: no data is read from or written to the
+referenced resource.
 
 ## Constraints
 
@@ -262,7 +308,8 @@ Actual backup is simulated — no data is read from or written to the referenced
   Floci rather than being specific to Backup -- S3 bucket policies are the only resource
   policies any service enforces today. Stated here because a stored-and-ignored policy is
   otherwise indistinguishable from an enforced one.
-- Restore jobs (`StartRestoreJob`, `DescribeRestoreJob`, `ListRestoreJobs`)
+- Restoring resource types other than S3; such a restore job ends `FAILED` with a
+  `StatusMessage`. `CopySourceTagsToRestoredResource` is ignored.
 - Backing up straight into a logically air-gapped vault with `LogicallyAirGappedBackupVaultArn`;
   the parameter is ignored and the backup lands in `BackupVaultName`
 - Organization-level cross-account backup settings; a cross-account copy needs only the
