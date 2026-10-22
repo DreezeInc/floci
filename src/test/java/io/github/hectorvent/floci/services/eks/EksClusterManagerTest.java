@@ -1,7 +1,10 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.MappingIterator;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
@@ -73,6 +76,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -3268,33 +3272,69 @@ class EksClusterManagerTest {
         }
 
         @Test
-        void ebsStorageManifestServesGp2ThroughTheEbsCsiDriverName() {
-            String manifest = EksClusterManager.buildEbsStorageManifest(true);
+        void ebsCsiManifestServesGp2ThroughTheEbsCsiDriver() throws Exception {
+            String manifest = EksClusterManager.buildEbsCsiManifest(true, "10.0.0.5:4591", "ip-10-0-0-5.ec2.internal");
 
-            assertTrue(manifest.contains("kind: StorageClass\nmetadata:\n  name: gp2\n"));
-            assertTrue(manifest.contains("storageclass.kubernetes.io/is-default-class: \"true\""));
+            List<JsonNode> documents = new ArrayList<>();
+            try (MappingIterator<JsonNode> it = new ObjectMapper(new YAMLFactory()).readerFor(JsonNode.class)
+                    .readValues(manifest)) {
+                it.forEachRemaining(documents::add);
+            }
+            Map<String, JsonNode> byKind = new HashMap<>();
+            documents.forEach(document -> byKind.put(document.path("kind").asText(), document));
+            assertEquals(Set.of("StorageClass", "CSIDriver", "ServiceAccount", "ClusterRole", "ClusterRoleBinding",
+                    "DaemonSet", "Deployment"), byKind.keySet());
+
+            JsonNode gp2 = byKind.get("StorageClass");
+            assertEquals("gp2", gp2.path("metadata").path("name").asText());
+            assertEquals("true", gp2.path("metadata").path("annotations")
+                    .path("storageclass.kubernetes.io/is-default-class").asText());
             // CSI migration annotates a kubernetes.io/aws-ebs claim for ebs.csi.aws.com, and an
             // external provisioner only serves classes that name it, so gp2 names the driver.
-            assertTrue(manifest.contains("provisioner: ebs.csi.aws.com\n"));
-            assertFalse(manifest.contains("kubernetes.io/aws-ebs"));
-            assertTrue(manifest.contains("- --provisioner-name\n        - ebs.csi.aws.com\n"));
-            // Node-path mode refuses Immediate binding; shared mode serves both binding modes.
-            assertTrue(manifest.contains("\"sharedFileSystemPath\": \"/var/lib/rancher/k3s/storage/floci-ebs\""));
-            assertFalse(manifest.contains("nodePathMap"));
-            assertTrue(manifest.contains("kind: ClusterRoleBinding"), "k3s's local-storage RBAC is off, so it ships its own");
+            assertEquals("ebs.csi.aws.com", gp2.path("provisioner").asText());
+
+            JsonNode driver = byKind.get("CSIDriver").path("spec");
+            assertFalse(driver.path("attachRequired").asBoolean(true));
+            assertEquals("File", driver.path("fsGroupPolicy").asText());
+
+            JsonNode node = byKind.get("DaemonSet").path("spec").path("template").path("spec");
+            assertTrue(node.path("hostNetwork").asBoolean());
+            assertEquals("ip-10-0-0-5.ec2.internal", node.at("/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution"
+                    + "/nodeSelectorTerms/0/matchFields/0/values/0").asText());
+            assertEquals("UNIX-LISTEN:/csi/csi.sock,fork,unlink-early,mode=0666", node.at("/containers/0/args/0").asText());
+            assertEquals("TCP:10.0.0.5:4591", node.at("/containers/0/args/1").asText());
+            assertEquals("UNIX-LISTEN:/registration/ebs.csi.aws.com-reg.sock,fork,unlink-early",
+                    node.at("/containers/1/args/0").asText());
+            assertEquals("/var/lib/kubelet/plugins/ebs.csi.aws.com", node.at("/volumes/0/hostPath/path").asText());
+            assertEquals("/var/lib/kubelet/plugins_registry", node.at("/volumes/1/hostPath/path").asText());
+
+            JsonNode controller = byKind.get("Deployment").path("spec").path("template").path("spec");
+            assertEquals("ip-10-0-0-5.ec2.internal", controller.at("/affinity/nodeAffinity"
+                    + "/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchFields/0/values/0").asText());
+            assertTrue(controller.at("/containers/0/args").toString().contains("--extra-create-metadata"));
+            assertEquals("/var/lib/kubelet/plugins/ebs.csi.aws.com", controller.at("/volumes/0/hostPath/path").asText());
         }
 
         @Test
         void gp2StaysNonDefaultWhenK3sKeepsItsOwnDefaultClass() {
-            String manifest = EksClusterManager.buildEbsStorageManifest(false);
+            String manifest = EksClusterManager.buildEbsCsiManifest(false, "floci:4591", "node-1");
 
             assertFalse(manifest.contains("is-default-class"));
             assertTrue(manifest.contains("  name: gp2\n"));
         }
 
         @Test
+        void ebsCsiPodsGoAnywhereWithoutANodeName() {
+            String manifest = EksClusterManager.buildEbsCsiManifest(true, "floci:4591", null);
+
+            assertFalse(manifest.contains("affinity"));
+            assertTrue(manifest.contains("kind: DaemonSet"));
+        }
+
+        @Test
         void writesTheEbsStorageManifestIntoTheK3sManifestsDirectory() throws Exception {
             when(eks.emulateEbsStorage()).thenReturn(true);
+            when(eks.ebsCsiPort()).thenReturn(4591);
             Cluster cluster = cluster();
             cluster.setDefaultStorageClass(false);
 
@@ -3305,6 +3345,7 @@ class EksClusterManagerTest {
             String written = Files.readString(tempDir.resolve("storage").resolve("demo")
                     .resolve("floci-eks-ebs-storage.yaml"));
             assertTrue(written.contains("is-default-class"));
+            assertTrue(written.contains("\"TCP:host.docker.internal:4591\""));
         }
 
         @Test

@@ -52,6 +52,8 @@ import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
+import io.github.hectorvent.floci.services.eks.csi.EbsCsiNode;
+import io.github.hectorvent.floci.services.eks.csi.EbsCsiNodes;
 import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
@@ -109,7 +111,7 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class EksClusterManager
         implements ClusterNodeInstanceProvider, VpcRouteTableListener, DnsClientVpcSource,
-        DnsRecordSource, DnsForwardingRuleSource {
+        DnsRecordSource, DnsForwardingRuleSource, EbsCsiNodes {
 
     private static final Logger LOG = Logger.getLogger(EksClusterManager.class);
     private static final int K3S_API_SERVER_PORT = 6443;
@@ -136,9 +138,8 @@ public class EksClusterManager
     static final String EBS_STORAGE_MANIFEST_FILE = "floci-eks-ebs-storage.yaml";
     static final String EBS_STORAGE_MANIFEST_TAR_ENTRY = "server/manifests/" + EBS_STORAGE_MANIFEST_FILE;
     static final String EBS_CSI_PROVISIONER = "ebs.csi.aws.com";
-    static final String EBS_STORAGE_PATH = K3S_DATA_DIR + "/storage/floci-ebs";
-    static final String EBS_PROVISIONER_IMAGE = "rancher/local-path-provisioner:v0.0.37";
-    static final String EBS_HELPER_IMAGE = "rancher/mirrored-library-busybox:1.37.0";
+    static final String EBS_CSI_SOCKET_IMAGE = "alpine/socat:1.8.0.3";
+    static final String EBS_CSI_PROVISIONER_IMAGE = "registry.k8s.io/sig-storage/csi-provisioner:v5.2.0";
     /** The pod identity webhook reads service account annotations through the cluster's own kubectl. */
     static final int SERVICE_ACCOUNT_LOOKUP_TIMEOUT_SECONDS = 10;
     private static final ObjectMapper SERVICE_ACCOUNT_JSON = new ObjectMapper();
@@ -230,6 +231,49 @@ public class EksClusterManager
     record ClusterNodeVpc(String clusterResourceName, ClientVpc clientVpc) {}
 
     private final Map<String, ClusterNodeVpc> clusterNodeVpcs = new ConcurrentHashMap<>();
+
+    /** The cluster each node container address belongs to, whether or not the cluster has a VPC. */
+    private final Map<String, String> clusterNodeAddresses = new ConcurrentHashMap<>();
+
+    @Override
+    public Optional<EbsCsiNode> nodeAt(String address) {
+        if (address == null || address.isBlank()) {
+            return Optional.empty();
+        }
+        String clusterKey = clusterNodeAddresses.get(address.trim());
+        return clusterKey == null ? Optional.empty() : ebsCsiNode(clusterKey);
+    }
+
+    @Override
+    public List<EbsCsiNode> nodes() {
+        List<EbsCsiNode> nodes = new ArrayList<>();
+        for (String clusterKey : clusterNodeInstances.keySet()) {
+            ebsCsiNode(clusterKey).ifPresent(nodes::add);
+        }
+        return nodes;
+    }
+
+    private Optional<EbsCsiNode> ebsCsiNode(String clusterKey) {
+        ClusterNodeRecord record = clusterNodeInstances.get(clusterKey);
+        Instance instance = record != null ? record.instance() : null;
+        if (instance == null || instance.getDockerContainerId() == null || instance.getDockerContainerId().isBlank()) {
+            return Optional.empty();
+        }
+        String zone = instance.getPlacement() != null && instance.getPlacement().getAvailabilityZone() != null
+                ? instance.getPlacement().getAvailabilityZone()
+                : record.region() + "a";
+        return Optional.of(new EbsCsiNode(clusterKey, record.accountId(), record.region(), zone,
+                instance.getDockerContainerId(), instance.getInstanceId()));
+    }
+
+    private void rememberClusterNodeAddresses(String clusterKey, Set<String> addresses) {
+        clusterNodeAddresses.values().removeIf(clusterKey::equals);
+        for (String address : addresses) {
+            if (address != null && !address.isBlank()) {
+                clusterNodeAddresses.put(address.trim(), clusterKey);
+            }
+        }
+    }
 
     /**
      * A DNS query from a cluster container originates in the account, region and VPC the cluster was
@@ -2191,15 +2235,13 @@ public class EksClusterManager
     }
 
     /**
-     * Gives the cluster the stock EKS {@code gp2} StorageClass and a provisioner named
-     * {@code ebs.csi.aws.com} that serves it and any other StorageClass naming that driver, so
-     * claims written for EBS bind to the node's filesystem. gp2 names the CSI driver rather than
-     * the in-tree {@code kubernetes.io/aws-ebs} EKS ships because CSI migration makes the
-     * controller manager annotate every such claim for {@code ebs.csi.aws.com} anyway, and an
-     * external provisioner only serves classes that name it. local-path-provisioner runs in
-     * shared-filesystem mode because node-path mode refuses {@code Immediate} binding ("no node
-     * was specified"); on a one-node cluster the two modes mean the same disk. Like the webhook
-     * manifest, a copy failure leaves the cluster running, without the storage.
+     * Gives the cluster the stock EKS {@code gp2} StorageClass and an {@code ebs.csi.aws.com} CSI
+     * driver that Floci serves: a DaemonSet bridges the driver's kubelet sockets to Floci's CSI
+     * port, and the stock external provisioner turns claims into EC2 volumes through it. gp2 names
+     * the CSI driver rather than the in-tree {@code kubernetes.io/aws-ebs} EKS ships because CSI
+     * migration makes the controller manager annotate every such claim for {@code ebs.csi.aws.com}
+     * anyway. Like the webhook manifest, a copy failure leaves the cluster running, without the
+     * storage.
      */
     void registerEbsStorageEmulation(String containerId, Cluster cluster) {
         if (!config.services().eks().emulateEbsStorage()) {
@@ -2207,7 +2249,8 @@ public class EksClusterManager
         }
         String clusterName = cluster.getName();
         boolean gp2IsDefault = !Boolean.TRUE.equals(cluster.getDefaultStorageClass());
-        String manifest = buildEbsStorageManifest(gp2IsDefault);
+        String csiEndpoint = dockerHostResolver.resolve() + ":" + config.services().eks().ebsCsiPort();
+        String manifest = buildEbsCsiManifest(gp2IsDefault, csiEndpoint, ebsCsiNodeName(cluster));
         writeLocalCopy(Paths.get(config.services().eks().dataPath(), "storage", clusterName,
                 EBS_STORAGE_MANIFEST_FILE), manifest, clusterName);
         try {
@@ -2217,157 +2260,205 @@ public class EksClusterManager
                             tarSingleFile(EBS_STORAGE_MANIFEST_TAR_ENTRY, manifest)))
                     .withRemotePath(K3S_DATA_DIR)
                     .exec();
-            LOG.infov("Serving gp2 and every {0} StorageClass of cluster {1} from {2}",
-                    EBS_CSI_PROVISIONER, clusterName, EBS_STORAGE_PATH);
+            LOG.infov("Serving gp2 and every {0} StorageClass of cluster {1} through the CSI driver at {2}",
+                    EBS_CSI_PROVISIONER, clusterName, csiEndpoint);
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no EBS storage emulation: could not copy {1} into the k3s "
                     + "container: {2}", clusterName, EBS_STORAGE_MANIFEST_FILE, e.getMessage());
         }
     }
 
+    // Nodes that joined the cluster have no kubelet, so the driver's pods are kept on the k3s node.
+    private String ebsCsiNodeName(Cluster cluster) {
+        try {
+            return deriveClusterNodePrivateDnsName(cluster);
+        } catch (Exception e) {
+            LOG.warnv("The EBS CSI pods of cluster {0} may land on a node without a kubelet: could not derive "
+                    + "the k3s node name: {1}", cluster.getName(), e.getMessage());
+            return null;
+        }
+    }
+
     /**
      * The gp2 StorageClass as EKS ships it (minus the default annotation when k3s keeps its own
-     * default), and one Deployment running local-path-provisioner under the EBS CSI driver name,
-     * with its own RBAC because k3s's local-storage objects are absent when that component is off.
+     * default), the CSIDriver object, the node DaemonSet whose socat containers bridge the CSI and
+     * registration sockets to {@code csiEndpoint}, and the external provisioner with its RBAC.
      */
-    static String buildEbsStorageManifest(boolean gp2IsDefault) {
+    static String buildEbsCsiManifest(boolean gp2IsDefault, String csiEndpoint, String nodeName) {
         String defaultAnnotation = gp2IsDefault
                 ? "    storageclass.kubernetes.io/is-default-class: \"true\"\n"
                 : "";
-        return "apiVersion: storage.k8s.io/v1\n"
-                + "kind: StorageClass\n"
-                + "metadata:\n"
-                + "  name: gp2\n"
-                + "  annotations:\n"
-                + "    floci.io/emulated: \"ebs\"\n"
-                + defaultAnnotation
-                + "provisioner: " + EBS_CSI_PROVISIONER + "\n"
-                + "parameters:\n"
-                + "  fsType: ext4\n"
-                + "  type: gp2\n"
-                + "volumeBindingMode: WaitForFirstConsumer\n"
-                + "reclaimPolicy: Delete\n"
-                + "---\n"
-                + "apiVersion: v1\n"
-                + "kind: ServiceAccount\n"
-                + "metadata:\n"
-                + "  name: floci-ebs-provisioner\n"
-                + "  namespace: kube-system\n"
-                + "---\n"
-                + "apiVersion: rbac.authorization.k8s.io/v1\n"
-                + "kind: ClusterRole\n"
-                + "metadata:\n"
-                + "  name: floci-ebs-provisioner\n"
-                + "rules:\n"
-                + "- apiGroups: [\"\"]\n"
-                + "  resources: [\"nodes\", \"persistentvolumeclaims\", \"configmaps\", \"pods/log\"]\n"
-                + "  verbs: [\"get\", \"list\", \"watch\"]\n"
-                + "- apiGroups: [\"\"]\n"
-                + "  resources: [\"endpoints\", \"persistentvolumes\", \"pods\"]\n"
-                + "  verbs: [\"*\"]\n"
-                + "- apiGroups: [\"\"]\n"
-                + "  resources: [\"events\"]\n"
-                + "  verbs: [\"create\", \"patch\"]\n"
-                + "- apiGroups: [\"storage.k8s.io\"]\n"
-                + "  resources: [\"storageclasses\"]\n"
-                + "  verbs: [\"get\", \"list\", \"watch\"]\n"
-                + "---\n"
-                + "apiVersion: rbac.authorization.k8s.io/v1\n"
-                + "kind: ClusterRoleBinding\n"
-                + "metadata:\n"
-                + "  name: floci-ebs-provisioner\n"
-                + "roleRef:\n"
-                + "  apiGroup: rbac.authorization.k8s.io\n"
-                + "  kind: ClusterRole\n"
-                + "  name: floci-ebs-provisioner\n"
-                + "subjects:\n"
-                + "- kind: ServiceAccount\n"
-                + "  name: floci-ebs-provisioner\n"
-                + "  namespace: kube-system\n"
-                + "---\n"
-                + "apiVersion: v1\n"
-                + "kind: ConfigMap\n"
-                + "metadata:\n"
-                + "  name: floci-ebs-provisioner\n"
-                + "  namespace: kube-system\n"
-                + "data:\n"
-                + "  config.json: |-\n"
-                + "    {\"sharedFileSystemPath\": \"" + EBS_STORAGE_PATH + "\"}\n"
-                + "  setup: |-\n"
-                + "    #!/bin/sh\n"
-                + "    set -eu\n"
-                + "    mkdir -m 0777 -p \"${VOL_DIR}\"\n"
-                + "  teardown: |-\n"
-                + "    #!/bin/sh\n"
-                + "    set -eu\n"
-                + "    rm -rf \"${VOL_DIR}\"\n"
-                + "  helperPod.yaml: |-\n"
-                + "    apiVersion: v1\n"
-                + "    kind: Pod\n"
-                + "    metadata:\n"
-                + "      name: helper-pod\n"
-                + "    spec:\n"
-                + "      containers:\n"
-                + "      - name: helper-pod\n"
-                + "        image: " + EBS_HELPER_IMAGE + "\n"
-                + "        imagePullPolicy: IfNotPresent\n"
-                + "---\n"
-                + "apiVersion: apps/v1\n"
-                + "kind: Deployment\n"
-                + "metadata:\n"
-                + "  name: floci-ebs-provisioner\n"
-                + "  namespace: kube-system\n"
-                + "spec:\n"
-                + "  revisionHistoryLimit: 0\n"
-                + "  selector:\n"
-                + "    matchLabels:\n"
-                + "      app: floci-ebs-provisioner\n"
-                + "  template:\n"
-                + "    metadata:\n"
-                + "      labels:\n"
-                + "        app: floci-ebs-provisioner\n"
-                + "    spec:\n"
-                + "      priorityClassName: system-node-critical\n"
-                + "      serviceAccountName: floci-ebs-provisioner\n"
-                + "      tolerations:\n"
-                + "      - key: CriticalAddonsOnly\n"
-                + "        operator: Exists\n"
-                + "      - key: node-role.kubernetes.io/control-plane\n"
-                + "        operator: Exists\n"
-                + "        effect: NoSchedule\n"
-                + "      containers:\n"
-                + ebsProvisionerContainer()
-                + "      volumes:\n"
-                + "      - name: config\n"
-                + "        configMap:\n"
-                + "          name: floci-ebs-provisioner\n";
-    }
-
-    private static String ebsProvisionerContainer() {
-        return "      - name: provisioner\n"
-                + "        image: " + EBS_PROVISIONER_IMAGE + "\n"
-                + "        imagePullPolicy: IfNotPresent\n"
-                + "        command:\n"
-                + "        - local-path-provisioner\n"
-                + "        - start\n"
-                + "        - --config\n"
-                + "        - /etc/config/config.json\n"
-                + "        - --provisioner-name\n"
-                + "        - " + EBS_CSI_PROVISIONER + "\n"
-                + "        - --configmap-name\n"
-                + "        - floci-ebs-provisioner\n"
-                + "        - --service-account-name\n"
-                + "        - floci-ebs-provisioner\n"
-                + "        volumeMounts:\n"
-                + "        - name: config\n"
-                + "          mountPath: /etc/config/\n"
-                + "        env:\n"
-                + "        - name: POD_NAMESPACE\n"
-                + "          valueFrom:\n"
-                + "            fieldRef:\n"
-                + "              fieldPath: metadata.namespace\n"
-                + "        - name: CONFIG_MOUNT_PATH\n"
-                + "          value: /etc/config/\n";
+        String affinity = nodeName == null || nodeName.isBlank() ? "" : """
+                      affinity:
+                        nodeAffinity:
+                          requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                            - matchFields:
+                              - key: metadata.name
+                                operator: In
+                                values: ["%s"]
+                """.formatted(nodeName);
+        String pluginDir = "/var/lib/kubelet/plugins/" + EBS_CSI_PROVISIONER;
+        return """
+                apiVersion: storage.k8s.io/v1
+                kind: StorageClass
+                metadata:
+                  name: gp2
+                  annotations:
+                    floci.io/emulated: "ebs"
+                %sprovisioner: %s
+                parameters:
+                  fsType: ext4
+                  type: gp2
+                volumeBindingMode: WaitForFirstConsumer
+                reclaimPolicy: Delete
+                ---
+                apiVersion: storage.k8s.io/v1
+                kind: CSIDriver
+                metadata:
+                  name: %s
+                spec:
+                  attachRequired: false
+                  podInfoOnMount: false
+                  fsGroupPolicy: File
+                  volumeLifecycleModes:
+                  - Persistent
+                ---
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: floci-ebs-csi-controller
+                  namespace: kube-system
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: floci-ebs-csi-provisioner
+                rules:
+                - apiGroups: [""]
+                  resources: ["persistentvolumes"]
+                  verbs: ["get", "list", "watch", "create", "patch", "delete"]
+                - apiGroups: [""]
+                  resources: ["persistentvolumeclaims"]
+                  verbs: ["get", "list", "watch", "update"]
+                - apiGroups: ["storage.k8s.io"]
+                  resources: ["storageclasses", "csinodes"]
+                  verbs: ["get", "list", "watch"]
+                - apiGroups: [""]
+                  resources: ["events"]
+                  verbs: ["list", "watch", "create", "update", "patch"]
+                - apiGroups: ["snapshot.storage.k8s.io"]
+                  resources: ["volumesnapshots", "volumesnapshotcontents"]
+                  verbs: ["get", "list"]
+                - apiGroups: [""]
+                  resources: ["nodes"]
+                  verbs: ["get", "list", "watch"]
+                - apiGroups: ["storage.k8s.io"]
+                  resources: ["volumeattachments"]
+                  verbs: ["get", "list", "watch"]
+                - apiGroups: ["storage.k8s.io"]
+                  resources: ["volumeattributesclasses"]
+                  verbs: ["get"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: floci-ebs-csi-provisioner
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: floci-ebs-csi-provisioner
+                subjects:
+                - kind: ServiceAccount
+                  name: floci-ebs-csi-controller
+                  namespace: kube-system
+                ---
+                apiVersion: apps/v1
+                kind: DaemonSet
+                metadata:
+                  name: floci-ebs-csi-node
+                  namespace: kube-system
+                spec:
+                  selector:
+                    matchLabels:
+                      app: floci-ebs-csi-node
+                  template:
+                    metadata:
+                      labels:
+                        app: floci-ebs-csi-node
+                    spec:
+                      hostNetwork: true
+                      dnsPolicy: Default
+                      priorityClassName: system-node-critical
+                      tolerations:
+                      - operator: Exists
+                %s      containers:
+                      - name: csi-socket
+                        image: %s
+                        args: ["UNIX-LISTEN:/csi/csi.sock,fork,unlink-early,mode=0666", "TCP:%s"]
+                        volumeMounts:
+                        - name: plugin-dir
+                          mountPath: /csi
+                      - name: registration-socket
+                        image: %s
+                        args: ["UNIX-LISTEN:/registration/%s-reg.sock,fork,unlink-early", "TCP:%s"]
+                        volumeMounts:
+                        - name: registration-dir
+                          mountPath: /registration
+                      volumes:
+                      - name: plugin-dir
+                        hostPath:
+                          path: %s
+                          type: DirectoryOrCreate
+                      - name: registration-dir
+                        hostPath:
+                          path: /var/lib/kubelet/plugins_registry
+                          type: DirectoryOrCreate
+                ---
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: floci-ebs-csi-controller
+                  namespace: kube-system
+                spec:
+                  replicas: 1
+                  revisionHistoryLimit: 0
+                  selector:
+                    matchLabels:
+                      app: floci-ebs-csi-controller
+                  template:
+                    metadata:
+                      labels:
+                        app: floci-ebs-csi-controller
+                    spec:
+                      serviceAccountName: floci-ebs-csi-controller
+                      priorityClassName: system-cluster-critical
+                      tolerations:
+                      - key: CriticalAddonsOnly
+                        operator: Exists
+                      - key: node-role.kubernetes.io/control-plane
+                        operator: Exists
+                        effect: NoSchedule
+                %s      containers:
+                      - name: csi-provisioner
+                        image: %s
+                        args:
+                        - --csi-address=/csi/csi.sock
+                        - --extra-create-metadata
+                        - --leader-election=false
+                        - --default-fstype=ext4
+                        - --timeout=60s
+                        volumeMounts:
+                        - name: plugin-dir
+                          mountPath: /csi
+                      volumes:
+                      - name: plugin-dir
+                        hostPath:
+                          path: %s
+                          type: DirectoryOrCreate
+                """.formatted(defaultAnnotation, EBS_CSI_PROVISIONER, EBS_CSI_PROVISIONER,
+                affinity, EBS_CSI_SOCKET_IMAGE, csiEndpoint, EBS_CSI_SOCKET_IMAGE, EBS_CSI_PROVISIONER,
+                csiEndpoint, pluginDir, affinity, EBS_CSI_PROVISIONER_IMAGE, pluginDir);
     }
 
     /**
@@ -2559,6 +2650,7 @@ public class EksClusterManager
             nodeInstance.setDockerContainerId(containerId);
             clusterNodeInstances.put(clusterResourceName(cluster), new ClusterNodeRecord(accountId, region, nodeInstance));
             registerClusterNodeVpc(cluster, accountId, region, containerIps.allIps());
+            rememberClusterNodeAddresses(clusterResourceName(cluster), containerIps.allIps());
             for (Consumer<Instance> listener : nodeRegistrationListeners) {
                 try {
                     listener.accept(nodeInstance);
@@ -2804,6 +2896,7 @@ public class EksClusterManager
             programmedClusterRoutes.remove(clusterKey);
         }
         forgetClusterNodeVpcs(clusterKey);
+        clusterNodeAddresses.values().removeIf(clusterKey::equals);
         joinedClusterInstances.remove(clusterKey);
         ClusterNodeRecord record = clusterNodeInstances.remove(clusterKey);
         Instance nodeInstance = record != null ? record.instance() : null;

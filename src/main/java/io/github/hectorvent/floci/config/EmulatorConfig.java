@@ -3392,14 +3392,18 @@ public interface EmulatorConfig {
         boolean defaultStorageClass();
 
         /**
-         * When true, every new cluster gets the stock EKS {@code gp2} StorageClass and a provisioner
-         * that serves it, and any other StorageClass naming {@code ebs.csi.aws.com}, from the
-         * node's filesystem, so workloads written for EBS bind their claims without the EBS CSI
-         * driver. {@code gp2} is the cluster's default class unless {@link #defaultStorageClass()}
-         * keeps k3s's own.
+         * When true, every new cluster gets the stock EKS {@code gp2} StorageClass and an
+         * {@code ebs.csi.aws.com} CSI driver served by Floci: each claim gets an EC2 volume in the
+         * cluster's account whose data lives on the node's filesystem, and EC2 snapshots of that
+         * volume carry the data to the volumes created from them. {@code gp2} is the cluster's
+         * default class unless {@link #defaultStorageClass()} keeps k3s's own.
          */
         @WithDefault("false")
         boolean emulateEbsStorage();
+
+        /** The port Floci serves the EBS CSI driver's gRPC services on when {@link #emulateEbsStorage()} is on. */
+        @WithDefault("4591")
+        int ebsCsiPort();
 
         /**
          * When true, exposes an IMDS link-local proxy (169.254.169.254:80) inside the cluster container's
