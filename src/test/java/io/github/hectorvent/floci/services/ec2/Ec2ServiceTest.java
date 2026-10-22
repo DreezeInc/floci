@@ -298,7 +298,8 @@ class Ec2ServiceTest {
                         && table.getAssociations().stream().anyMatch(association -> association.isMain())));
         assertTrue(service.describeNetworkAcls(region, List.of(), Map.of()).stream()
                 .anyMatch(acl -> vpcId.equals(acl.getVpcId()) && acl.isDefault()));
-        assertFalse(service.describeSecurityGroupRules(region, List.of(defaultGroup.getGroupId()), List.of()).isEmpty());
+        assertFalse(service.describeSecurityGroupRules(
+                region, List.of(), Map.of("group-id", List.of(defaultGroup.getGroupId()))).isEmpty());
 
         service.deleteVpc(region, vpcId);
 
@@ -308,7 +309,8 @@ class Ec2ServiceTest {
                 .noneMatch(table -> vpcId.equals(table.getVpcId())));
         assertTrue(service.describeNetworkAcls(region, List.of(), Map.of()).stream()
                 .noneMatch(acl -> vpcId.equals(acl.getVpcId())));
-        assertTrue(service.describeSecurityGroupRules(region, List.of(defaultGroup.getGroupId()), List.of()).isEmpty());
+        assertTrue(service.describeSecurityGroupRules(
+                region, List.of(), Map.of("group-id", List.of(defaultGroup.getGroupId()))).isEmpty());
     }
 
     @Test
@@ -478,7 +480,8 @@ class Ec2ServiceTest {
         String aclId = service.describeNetworkAcls(region, List.of(), Map.of()).stream()
                 .filter(acl -> vpcId.equals(acl.getVpcId()) && acl.isDefault())
                 .findFirst().orElseThrow().getNetworkAclId();
-        String ruleId = service.describeSecurityGroupRules(region, List.of(groupId), List.of()).getFirst()
+        String ruleId = service.describeSecurityGroupRules(
+                region, List.of(), Map.of("group-id", List.of(groupId))).getFirst()
                 .getSecurityGroupRuleId();
         List<String> defaultIds = List.of(vpcId, groupId, routeTableId, aclId, ruleId);
         service.createTags(region, defaultIds, List.of(new Tag("Name", "doomed")));
@@ -3563,7 +3566,7 @@ class Ec2ServiceTest {
         service.authorizeSecurityGroupIngress("us-east-1", groupId, List.of(ipv6Permission("2001:db8:1::/64")));
 
         List<SecurityGroupRule> rules =
-                service.describeSecurityGroupRules("us-east-1", List.of(groupId), List.of());
+                service.describeSecurityGroupRules("us-east-1", List.of(), Map.of("group-id", List.of(groupId)));
 
         assertEquals(1, rules.stream().filter(r -> r.getReferencedGroupInfo() != null
                 && "sg-peer-a".equals(r.getReferencedGroupInfo().getGroupId())).count());
@@ -3572,7 +3575,7 @@ class Ec2ServiceTest {
 
     /** Ingress only: createSecurityGroup seeds a default allow-all egress rule. */
     private static List<String> ingressRuleIds(Ec2Service service, String groupId) {
-        return service.describeSecurityGroupRules("us-east-1", List.of(groupId), List.of())
+        return service.describeSecurityGroupRules("us-east-1", List.of(), Map.of("group-id", List.of(groupId)))
                 .stream().filter(r -> !r.isEgress())
                 .map(SecurityGroupRule::getSecurityGroupRuleId).toList();
     }
@@ -3961,7 +3964,8 @@ class Ec2ServiceTest {
         assertEquals("InvalidPrefixListID.NotFound", error.getErrorCode());
         // The rejected rule must not have been stored. The group still holds its default
         // allow-all egress rule, so the check is for an ingress rule rather than for none.
-        assertTrue(service.describeSecurityGroupRules("us-east-1", List.of(groupId), List.of()).stream()
+        assertTrue(service.describeSecurityGroupRules(
+                "us-east-1", List.of(), Map.of("group-id", List.of(groupId))).stream()
                 .noneMatch(r -> !r.isEgress() || r.getPrefixListId() != null));
     }
 
@@ -3999,7 +4003,8 @@ class Ec2ServiceTest {
         AwsException error = assertThrows(AwsException.class,
                 () -> service.authorizeSecurityGroupIngress("us-east-1", groupId, List.of(perm)));
         assertEquals("InvalidPrefixListID.NotFound", error.getErrorCode());
-        assertTrue(service.describeSecurityGroupRules("us-east-1", List.of(groupId), List.of()).stream()
+        assertTrue(service.describeSecurityGroupRules(
+                "us-east-1", List.of(), Map.of("group-id", List.of(groupId))).stream()
                 .noneMatch(r -> !r.isEgress()), "the CIDR rule must not survive the rejection");
     }
 
@@ -4016,7 +4021,8 @@ class Ec2ServiceTest {
 
         assertThrows(AwsException.class,
                 () -> service.authorizeSecurityGroupIngress("us-east-1", groupId, List.of(good, bad)));
-        assertTrue(service.describeSecurityGroupRules("us-east-1", List.of(groupId), List.of()).stream()
+        assertTrue(service.describeSecurityGroupRules(
+                "us-east-1", List.of(), Map.of("group-id", List.of(groupId))).stream()
                 .noneMatch(r -> !r.isEgress()), "no ingress rule from either permission");
     }
 
@@ -4120,6 +4126,100 @@ class Ec2ServiceTest {
                 Map.of("resource-id", List.of(groupId))).getFirst().get("resourceType"));
         assertEquals(1, service.describeTags("us-east-1",
                 Map.of("resource-type", List.of("security-group"))).size());
+    }
+
+    @Test
+    void tagFiltersOnSecurityGroupRulesMatchOnlyTheTaggedRule() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        String tagged = authorizeTcpFromPrivateRange(service, groupId, 443);
+        String untagged = authorizeTcpFromPrivateRange(service, groupId, 80);
+        service.createTags("us-east-1", List.of(tagged), List.of(new Tag("Name", "allow-https")));
+
+        assertTrue(securityGroupRuleIds(service, Map.of("group-id", List.of(groupId)))
+                .containsAll(List.of(tagged, untagged)));
+        assertEquals(List.of(tagged), securityGroupRuleIds(service, Map.of("tag:Name", List.of("allow-https"))));
+        assertEquals(List.of(tagged), securityGroupRuleIds(service, Map.of("tag-key", List.of("Name"))));
+        assertEquals(List.of(tagged), securityGroupRuleIds(service, Map.of("tag-value", List.of("allow-*"))));
+        assertEquals(List.of(tagged), securityGroupRuleIds(service,
+                Map.of("group-id", List.of(groupId), "tag:Name", List.of("allow-https"))));
+        assertTrue(securityGroupRuleIds(service, Map.of("tag:Name", List.of("allow-http"))).isEmpty());
+        assertTrue(securityGroupRuleIds(service,
+                Map.of("group-id", List.of("sg-other"), "tag:Name", List.of("allow-https"))).isEmpty());
+
+        SecurityGroupRule described =
+                service.describeSecurityGroupRules("us-east-1", List.of(tagged), Map.of()).getFirst();
+        assertEquals("Name", described.getTags().getFirst().getKey());
+        assertEquals("allow-https", described.getTags().getFirst().getValue());
+    }
+
+    @Test
+    void deleteTagsTakesASecurityGroupRuleOutOfItsTagFilter() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        String ruleId = authorizeTcpFromPrivateRange(service, groupId, 443);
+        service.createTags("us-east-1", List.of(ruleId), List.of(new Tag("Name", "allow-https")));
+
+        service.deleteTags("us-east-1", List.of(ruleId), List.of(new Tag("Name", null)));
+
+        assertTrue(securityGroupRuleIds(service, Map.of("tag-key", List.of("Name"))).isEmpty());
+        assertTrue(service.describeSecurityGroupRules("us-east-1", List.of(ruleId), Map.of())
+                .getFirst().getTags().isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(ruleId))).isEmpty());
+    }
+
+    @Test
+    void deletingASecurityGroupRuleDropsItsTags() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        String ruleId = authorizeTcpFromPrivateRange(service, groupId, 443);
+        service.createTags("us-east-1", List.of(ruleId), List.of(new Tag("Name", "allow-https")));
+
+        assertTrue(service.deleteSecurityGroupRule("us-east-1", ruleId));
+
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(ruleId))).isEmpty());
+    }
+
+    @Test
+    void describeSecurityGroupRulesRefusesAFilterItDoesNotServe() {
+        Ec2Service service = prefixListService();
+
+        AwsException error = assertThrows(AwsException.class, () -> service.describeSecurityGroupRules(
+                "us-east-1", List.of(), Map.of("ip-protocol", List.of("tcp"))));
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+    }
+
+    @Test
+    void tagFiltersOnNetworkAclsMatchOnlyTheTaggedAcl() {
+        Ec2Service service = prefixListService();
+        String vpcId = service.createVpc("us-east-1", "10.80.0.0/16", false).getVpcId();
+        String tagged = service.createNetworkAcl("us-east-1", vpcId).getNetworkAclId();
+        String untagged = service.createNetworkAcl("us-east-1", vpcId).getNetworkAclId();
+        service.createTags("us-east-1", List.of(tagged), List.of(new Tag("tier", "private")));
+
+        assertTrue(networkAclIds(service, Map.of("vpc-id", List.of(vpcId))).containsAll(List.of(tagged, untagged)));
+        assertEquals(List.of(tagged), networkAclIds(service, Map.of("tag:tier", List.of("private"))));
+        assertEquals(List.of(tagged), networkAclIds(service, Map.of("tag-key", List.of("tier"))));
+        assertEquals(List.of(tagged), networkAclIds(service, Map.of("tag-value", List.of("priv*"))));
+        assertTrue(networkAclIds(service, Map.of("tag:tier", List.of("public"))).isEmpty());
+    }
+
+    private static String authorizeTcpFromPrivateRange(Ec2Service service, String groupId, int port) {
+        IpPermission perm = tcpPermission(port);
+        perm.getIpRanges().add(new IpRange("10.0.0.0/8", null));
+        return service.authorizeSecurityGroupIngress("us-east-1", groupId, List.of(perm))
+                .getFirst().getSecurityGroupRuleId();
+    }
+
+    private static List<String> securityGroupRuleIds(Ec2Service service, Map<String, List<String>> filters) {
+        return service.describeSecurityGroupRules("us-east-1", List.of(), filters).stream()
+                .map(SecurityGroupRule::getSecurityGroupRuleId).toList();
+    }
+
+    private static List<String> networkAclIds(Ec2Service service, Map<String, List<String>> filters) {
+        return service.describeNetworkAcls("us-east-1", List.of(), filters).stream()
+                .map(acl -> acl.getNetworkAclId()).toList();
     }
 
     // =========================================================================

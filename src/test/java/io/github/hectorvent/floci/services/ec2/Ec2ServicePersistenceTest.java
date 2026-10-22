@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
+import io.github.hectorvent.floci.services.ec2.model.IpRange;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
@@ -82,7 +83,7 @@ class Ec2ServicePersistenceTest {
         assertTrue(restarted.describeSecurityGroups(REGION, List.of(), List.of(), Map.of()).stream()
                 .noneMatch(group -> vpc.getVpcId().equals(group.getVpcId())));
         assertTrue(restarted.describeSecurityGroupRules(
-                REGION, List.of(defaultGroup.getGroupId()), List.of()).isEmpty());
+                REGION, List.of(), Map.of("group-id", List.of(defaultGroup.getGroupId()))).isEmpty());
         assertTrue(restarted.describeRouteTables(REGION, List.of(), Map.of()).stream()
                 .noneMatch(table -> vpc.getVpcId().equals(table.getVpcId())));
         assertTrue(restarted.describeNetworkAcls(REGION, List.of(), Map.of()).stream()
@@ -224,13 +225,39 @@ class Ec2ServicePersistenceTest {
         // referencedGroupInfo is a nested object on the flattened rule, so a restart is the first
         // place a broken serialization round trip would show up.
         List<SecurityGroupRule> ingress =
-                restarted.describeSecurityGroupRules(REGION, List.of(target.getGroupId()), List.of()).stream()
+                restarted.describeSecurityGroupRules(
+                        REGION, List.of(), Map.of("group-id", List.of(target.getGroupId()))).stream()
                         .filter(r -> !r.isEgress())
                         .toList();
         assertEquals(1, ingress.size(), "one rule per source, and only the ingress rule here");
         assertEquals(source.getGroupId(), ingress.getFirst().getReferencedGroupInfo().getGroupId());
         assertEquals("000000000000", ingress.getFirst().getReferencedGroupInfo().getUserId());
         assertEquals("from-source-sg", ingress.getFirst().getDescription());
+    }
+
+    @Test
+    void securityGroupRuleTagsSurviveRestart(@TempDir Path dir) {
+        Ec2Service first = newService(dir);
+        Vpc vpc = first.createVpc(REGION, "10.0.0.0/16", false);
+        SecurityGroup group = first.createSecurityGroup(REGION, "tagged-rules", "tagged rules", vpc.getVpcId());
+        IpPermission perm = new IpPermission();
+        perm.setIpProtocol("tcp");
+        perm.setFromPort(443);
+        perm.setToPort(443);
+        perm.getIpRanges().add(new IpRange("10.0.0.0/8", null));
+        String ruleId = first.authorizeSecurityGroupIngress(REGION, group.getGroupId(), List.of(perm))
+                .getFirst().getSecurityGroupRuleId();
+        first.createTags(REGION, List.of(ruleId), List.of(new Tag("Name", "allow-https")));
+
+        Ec2Service restarted = newService(dir);
+
+        List<SecurityGroupRule> matches =
+                restarted.describeSecurityGroupRules(REGION, List.of(), Map.of("tag:Name", List.of("allow-https")));
+        assertEquals(1, matches.size(), "the tag filter must still find the rule after a restart");
+        assertEquals(ruleId, matches.getFirst().getSecurityGroupRuleId());
+        assertEquals("allow-https", matches.getFirst().getTags().getFirst().getValue());
+        assertEquals("security-group-rule", restarted.describeTags(REGION,
+                Map.of("resource-id", List.of(ruleId))).getFirst().get("resourceType"));
     }
 
     /**

@@ -227,6 +227,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     private static final Set<String> EGRESS_ONLY_INTERNET_GATEWAY_FILTERS = Set.of(
             "attachment.state", "attachment.vpc-id",
             "egress-only-internet-gateway-id", "tag-key", "tag-value");
+    // AWS documents only tag:<key> here; tag-key and tag-value are kept as on the other tag-aware calls.
+    private static final Set<String> SECURITY_GROUP_RULE_FILTERS = Set.of(
+            "group-id", "security-group-rule-id", "tag-key", "tag-value");
     private static final Set<String> AVAILABILITY_ZONE_FILTERS = Set.of(
             "group-long-name", "group-name", "message", "opt-in-status",
             "parent-zone-id", "parent-zone-name", "region-name", "state",
@@ -1270,7 +1273,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         acl.getAssociations().stream().anyMatch(a -> values.contains(a.getSubnetId()));
                 case "association.network-acl-association-id" ->
                         acl.getAssociations().stream().anyMatch(a -> values.contains(a.getNetworkAclAssociationId()));
-                default -> true;
+                // tag:<key>, tag-key and tag-value
+                default -> matchesFilter(acl, f.getKey(), values, acl.getRegion());
             };
             if (!matches) {
                 return false;
@@ -6251,6 +6255,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return false;
         }
         securityGroupRules.delete(key(region, securityGroupRuleId));
+        tags.delete(securityGroupRuleId);
         String groupId = rule.getGroupId();
         if (groupId == null) {
             return true;
@@ -6405,12 +6410,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 || !perm.getPrefixListIds().isEmpty() || !perm.getUserIdGroupPairs().isEmpty();
     }
 
-    public List<SecurityGroupRule> describeSecurityGroupRules(String region, List<String> groupIds, List<String> ruleIds) {
+    public List<SecurityGroupRule> describeSecurityGroupRules(String region, List<String> ruleIds,
+                                                              Map<String, List<String>> filters) {
         ensureDefaultResources(region);
+        requireSupportedFilters(filters.keySet(), SECURITY_GROUP_RULE_FILTERS);
         String regionPrefix = region + "::";
         return securityGroupRules.scan(k -> k.startsWith(regionPrefix)).stream()
-                .filter(r -> groupIds.isEmpty() || groupIds.contains(r.getGroupId()))
                 .filter(r -> ruleIds.isEmpty() || ruleIds.contains(r.getSecurityGroupRuleId()))
+                .filter(r -> matchesFilters(r, filters, region))
                 .collect(Collectors.toList());
     }
 
@@ -10541,6 +10548,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 default -> true;
             };
         }
+        if (resource instanceof SecurityGroupRule rule) {
+            return switch (filterName) {
+                case "group-id" -> matchesValue(values, rule.getGroupId());
+                case "security-group-rule-id" -> matchesValue(values, rule.getSecurityGroupRuleId());
+                default -> true;
+            };
+        }
         if (resource instanceof VpcPeeringConnection pcx) {
             return switch (filterName) {
                 case "vpc-peering-connection-id" -> matchesValue(values, pcx.getVpcPeeringConnectionId());
@@ -10772,6 +10786,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (resource instanceof Vpc vpc) return vpc.getTags();
         if (resource instanceof Subnet subnet) return subnet.getTags();
         if (resource instanceof SecurityGroup sg) return sg.getTags();
+        if (resource instanceof SecurityGroupRule rule) return rule.getTags();
+        if (resource instanceof NetworkAcl acl) return acl.getTags();
         if (resource instanceof InternetGateway igw) return igw.getTags();
         if (resource instanceof RouteTable rt) return rt.getTags();
         if (resource instanceof KeyPair kp) return kp.getTags();

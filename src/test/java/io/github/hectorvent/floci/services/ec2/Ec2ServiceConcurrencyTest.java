@@ -99,7 +99,8 @@ class Ec2ServiceConcurrencyTest {
             SecurityGroup sg = service.describeSecurityGroups(region, List.of(groupId), List.of(), Map.of()).getFirst();
             assertEquals(N, sg.getIpPermissions().size(),
                     "trial " + trial + ": lost security group ingress permissions");
-            long ingressRules = service.describeSecurityGroupRules(region, List.of(groupId), List.of()).stream()
+            long ingressRules = service.describeSecurityGroupRules(
+                    region, List.of(), Map.of("group-id", List.of(groupId))).stream()
                     .filter(r -> !r.isEgress())
                     .count();
             assertEquals(N, ingressRules, "trial " + trial + ": lost security group rule records");

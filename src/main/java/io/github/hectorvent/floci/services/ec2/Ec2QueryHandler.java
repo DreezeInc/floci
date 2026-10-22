@@ -3261,20 +3261,8 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeSecurityGroupRules(MultivaluedMap<String, String> p, String region) {
-        Map<String, List<String>> filters = getFilters(p);
-        // The AWS SDK sends the security group id as a filter with name "group-id". Rule ids can
-        // arrive as the SecurityGroupRuleId.N parameter or the "security-group-rule-id" filter;
-        // filters are conjunctive with parameters, so intersect rather than union when both appear.
-        List<String> paramRuleIds = getList(p, "SecurityGroupRuleId");
-        List<String> filterRuleIds = filters.getOrDefault("security-group-rule-id", List.of());
-        List<String> ruleIds = paramRuleIds.isEmpty() || filterRuleIds.isEmpty()
-                ? (paramRuleIds.isEmpty() ? filterRuleIds : paramRuleIds)
-                : paramRuleIds.stream().filter(filterRuleIds::contains).toList();
-        boolean unsatisfiable = !paramRuleIds.isEmpty() && !filterRuleIds.isEmpty() && ruleIds.isEmpty();
-        List<String> groupIds = filters.getOrDefault("group-id", List.of());
-        List<SecurityGroupRule> rules = unsatisfiable
-                ? List.of()
-                : service.describeSecurityGroupRules(region, groupIds, ruleIds);
+        List<SecurityGroupRule> rules = service.describeSecurityGroupRules(
+                region, getList(p, "SecurityGroupRuleId"), getFilters(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeSecurityGroupRulesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
