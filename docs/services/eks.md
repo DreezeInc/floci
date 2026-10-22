@@ -600,6 +600,8 @@ Callers requiring dynamic volume provisioning can install a driver (such as the 
 
 For local testing workflows that rely on automatic volume binding without a CSI driver, set `floci.services.eks.default-storage-class: true` (or `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS=true`) to retain k3s's bundled `local-path` provisioner and default StorageClass.
 
+For workloads written for EBS, set `floci.services.eks.emulate-ebs-storage: true` (or `FLOCI_SERVICES_EKS_EMULATE_EBS_STORAGE=true`). Every new cluster then gets the stock `gp2` StorageClass (`WaitForFirstConsumer`, the default class unless `default-storage-class` keeps k3s's own) and a `floci-ebs-provisioner` Deployment in `kube-system` that runs [local-path-provisioner](https://github.com/rancher/local-path-provisioner) under the name `ebs.csi.aws.com`. The emulated `gp2` names that CSI driver rather than the in-tree `kubernetes.io/aws-ebs` EKS ships: CSI migration makes the controller manager annotate every in-tree EBS claim for `ebs.csi.aws.com`, and an external provisioner only serves classes that name it. A PersistentVolumeClaim against `gp2`, or against any StorageClass a chart defines with that provisioner (`parameters` such as `type: gp3` are ignored), binds to a `hostPath` volume under `/var/lib/rancher/k3s/storage/floci-ebs` on the node, with both `Immediate` and `WaitForFirstConsumer` binding. The StorageClass objects themselves are left as created, so what a client reads back matches what it applied; only the volumes behind them are local. Nothing is created in EC2 for these volumes, and there is no snapshot or resize support.
+
 ## Joining EC2 instances as cluster nodes
 
 Floci allows EC2 instances to join an EKS cluster as Kubernetes worker nodes. Launching an instance via `RunInstances` with user data targeting a cluster automatically registers a matching Kubernetes node.
@@ -646,6 +648,7 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_ECR_REGISTRY_MIRROR` | `true` | Inject a containerd `registries.yaml` so pods can pull images pushed to [Floci ECR](ecr.md) |
 | `FLOCI_SERVICES_EKS_DISABLE_CNI` | `false` | Start k3s without bundled flannel, network policy, and kube-proxy so an external CNI can take over |
 | `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS` | `false` | Retain k3s bundled local-path provisioner and default StorageClass (default false matches EKS with no default class) |
+| `FLOCI_SERVICES_EKS_EMULATE_EBS_STORAGE` | `false` | Define the stock `gp2` StorageClass and serve it, and every StorageClass naming `ebs.csi.aws.com`, from the node's filesystem |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
 | `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
 | `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |
