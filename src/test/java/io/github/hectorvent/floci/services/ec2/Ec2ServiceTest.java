@@ -4205,6 +4205,226 @@ class Ec2ServiceTest {
         assertTrue(networkAclIds(service, Map.of("tag:tier", List.of("public"))).isEmpty());
     }
 
+    @Test
+    void revokingByRuleIdRemovesExactlyThatRuleAndItsTags() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        IpPermission perm = tcpPermission(443);
+        perm.getIpRanges().add(new IpRange("10.0.0.0/8", null));
+        perm.getIpRanges().add(new IpRange("192.168.0.0/16", null));
+        List<SecurityGroupRule> rules = service.authorizeSecurityGroupIngress("us-east-1", groupId, List.of(perm));
+        String revokedId = rules.get(0).getSecurityGroupRuleId();
+        String keptId = rules.get(1).getSecurityGroupRuleId();
+        service.createTags("us-east-1", List.of(revokedId), List.of(new Tag("Name", "office")));
+
+        Ec2Service.SecurityGroupRuleRevocation revocation =
+                service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(), List.of(revokedId));
+
+        assertEquals(List.of(revokedId), revocation.revokedRules().stream()
+                .map(SecurityGroupRule::getSecurityGroupRuleId).toList());
+        assertTrue(revocation.unknownPermissions().isEmpty());
+        assertEquals(List.of(keptId), ingressRuleIds(service, groupId));
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(revokedId))).isEmpty());
+        List<IpPermission> left = service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissions();
+        assertEquals(1, left.size());
+        assertEquals(List.of("192.168.0.0/16"), left.getFirst().getIpRanges().stream().map(IpRange::getCidrIp).toList());
+    }
+
+    @Test
+    void anUnknownRuleIdFailsTheWholeRevoke() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        String https = authorizeTcpFromPrivateRange(service, groupId, 443);
+        String http = authorizeTcpFromPrivateRange(service, groupId, 80);
+
+        AwsException unknown = assertThrows(AwsException.class, () -> service.revokeSecurityGroupIngress(
+                "us-east-1", groupId, List.of(), List.of(https, "sgr-0123456789abcdef0")));
+        AwsException wrongDirection = assertThrows(AwsException.class, () -> service.revokeSecurityGroupEgress(
+                "us-east-1", groupId, List.of(), List.of(http)));
+
+        assertEquals("InvalidSecurityGroupRuleId.NotFound", unknown.getErrorCode());
+        assertEquals("InvalidSecurityGroupRuleId.NotFound", wrongDirection.getErrorCode());
+        assertTrue(ingressRuleIds(service, groupId).containsAll(List.of(https, http)));
+        assertEquals(2, service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissions().size());
+    }
+
+    @Test
+    void revokingByPermissionRemovesTheMatchingRuleRecordAndItsTags() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        String https = authorizeTcpFromPrivateRange(service, groupId, 443);
+        String http = authorizeTcpFromPrivateRange(service, groupId, 80);
+        service.createTags("us-east-1", List.of(https), List.of(new Tag("Name", "allow-https")));
+        IpPermission revoke = tcpPermission(443);
+        revoke.getIpRanges().add(new IpRange("10.0.0.0/8", null));
+
+        Ec2Service.SecurityGroupRuleRevocation revocation =
+                service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(revoke));
+
+        assertEquals(List.of(https), revocation.revokedRules().stream()
+                .map(SecurityGroupRule::getSecurityGroupRuleId).toList());
+        assertEquals(List.of(http), ingressRuleIds(service, groupId));
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(https))).isEmpty());
+        assertTrue(securityGroupRuleIds(service, Map.of("tag:Name", List.of("allow-https"))).isEmpty());
+    }
+
+    @Test
+    void destroyThenRecreateLeavesExactlyOneRuleMatchingItsTag() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        Map<String, List<String>> byTag = Map.of("tag:Name", List.of("allow-https"));
+        String first = authorizeTcpFromPrivateRange(service, groupId, 443);
+        service.createTags("us-east-1", List.of(first), List.of(new Tag("Name", "allow-https")));
+
+        service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(), List.of(first));
+        String second = authorizeTcpFromPrivateRange(service, groupId, 443);
+        service.createTags("us-east-1", List.of(second), List.of(new Tag("Name", "allow-https")));
+        assertNotEquals(first, second);
+        assertEquals(List.of(second), securityGroupRuleIds(service, byTag));
+
+        IpPermission revoke = tcpPermission(443);
+        revoke.getIpRanges().add(new IpRange("10.0.0.0/8", null));
+        service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(revoke));
+        String third = authorizeTcpFromPrivateRange(service, groupId, 443);
+        service.createTags("us-east-1", List.of(third), List.of(new Tag("Name", "allow-https")));
+        assertEquals(List.of(third), securityGroupRuleIds(service, byTag));
+        assertEquals(1, service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissions().size());
+    }
+
+    @Test
+    void revokeReportsRequestedSourcesTheGroupDoesNotHave() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        String https = authorizeTcpFromPrivateRange(service, groupId, 443);
+        IpPermission revoke = tcpPermission(443);
+        revoke.getIpRanges().add(new IpRange("10.0.0.0/8", null));
+        revoke.getIpRanges().add(new IpRange("172.16.0.0/12", null));
+
+        Ec2Service.SecurityGroupRuleRevocation revocation =
+                service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(revoke, tcpPermission(22)));
+
+        assertEquals(List.of(https), revocation.revokedRules().stream()
+                .map(SecurityGroupRule::getSecurityGroupRuleId).toList());
+        assertEquals(2, revocation.unknownPermissions().size());
+        IpPermission unknownSource = revocation.unknownPermissions().get(0);
+        assertEquals(443, unknownSource.getFromPort());
+        assertEquals(List.of("172.16.0.0/12"),
+                unknownSource.getIpRanges().stream().map(IpRange::getCidrIp).toList());
+        assertEquals(22, revocation.unknownPermissions().get(1).getFromPort());
+    }
+
+    @Test
+    void revokingAPrefixListRuleByIdLeavesTheCidrInTheSamePermission() {
+        Ec2Service service = prefixListService();
+        ManagedPrefixList list = service.createManagedPrefixList("us-east-1", "corp", "IPv4", 5,
+                List.of(), List.of());
+        String groupId = service.createSecurityGroup("us-east-1", "db", "db", null).getGroupId();
+        IpPermission perm = tcpPermission(5432);
+        perm.getIpRanges().add(new IpRange("192.168.0.0/16", null));
+        perm.getPrefixListIds().add(new PrefixListId(list.getPrefixListId(), null));
+        List<SecurityGroupRule> rules = service.authorizeSecurityGroupIngress("us-east-1", groupId, List.of(perm));
+        String listRule = rules.stream().filter(r -> r.getPrefixListId() != null).findFirst().orElseThrow()
+                .getSecurityGroupRuleId();
+
+        service.revokeSecurityGroupIngress("us-east-1", groupId, List.of(), List.of(listRule));
+
+        IpPermission left = service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissions().getFirst();
+        assertTrue(left.getPrefixListIds().isEmpty(), "the revoked prefix list must leave the permission");
+        assertEquals("192.168.0.0/16", left.getIpRanges().getFirst().getCidrIp());
+        assertEquals(1, ingressRuleIds(service, groupId).size());
+    }
+
+    @Test
+    void revokingAllTrafficEgressWithAPortRangeMatchesTheDefaultRule() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        IpPermission allTraffic = new IpPermission();
+        allTraffic.setIpProtocol("-1");
+        allTraffic.setFromPort(0);
+        allTraffic.setToPort(0);
+        allTraffic.getIpRanges().add(new IpRange("0.0.0.0/0", null));
+
+        Ec2Service.SecurityGroupRuleRevocation revocation =
+                service.revokeSecurityGroupEgress("us-east-1", groupId, List.of(allTraffic));
+
+        assertEquals(1, revocation.revokedRules().size());
+        assertTrue(revocation.unknownPermissions().isEmpty());
+        assertTrue(service.describeSecurityGroups("us-east-1", List.of(groupId), List.of(), Map.of())
+                .getFirst().getIpPermissionsEgress().isEmpty());
+        assertTrue(securityGroupRuleIds(service, Map.of("group-id", List.of(groupId))).isEmpty());
+    }
+
+    @Test
+    void deletingASecurityGroupDropsItsRulesAndTheirTags() {
+        Ec2Service service = prefixListService();
+        String groupId = service.createSecurityGroup("us-east-1", "web", "web", null).getGroupId();
+        String ruleId = authorizeTcpFromPrivateRange(service, groupId, 443);
+        service.createTags("us-east-1", List.of(groupId, ruleId), List.of(new Tag("app", "web")));
+
+        service.deleteSecurityGroup("us-east-1", groupId);
+
+        assertTrue(securityGroupRuleIds(service, Map.of("group-id", List.of(groupId))).isEmpty());
+        assertTrue(securityGroupRuleIds(service, Map.of("tag:app", List.of("web"))).isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(groupId, ruleId))).isEmpty());
+    }
+
+    @Test
+    void volumeTagsFromCreateTagsReachDescribeVolumesAndItsTagFilters() {
+        Ec2Service service = prefixListService();
+        String tagged = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of()).getVolumeId();
+        String untagged = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of()).getVolumeId();
+
+        service.createTags("us-east-1", List.of(tagged), List.of(new Tag("env", "prod")));
+
+        Volume described = service.describeVolumes("us-east-1", List.of(tagged), Map.of()).getFirst();
+        assertEquals("env", described.getTags().getFirst().getKey());
+        assertEquals("prod", described.getTags().getFirst().getValue());
+        assertEquals(List.of(tagged), volumeIds(service, Map.of("tag:env", List.of("prod"))));
+        assertEquals(List.of(tagged), volumeIds(service, Map.of("tag-key", List.of("env"))));
+        assertEquals(List.of(tagged), volumeIds(service, Map.of("tag-value", List.of("pr*"))));
+        assertTrue(volumeIds(service, Map.of()).contains(untagged));
+
+        service.deleteTags("us-east-1", List.of(tagged), List.of(new Tag("env", null)));
+
+        assertTrue(volumeIds(service, Map.of("tag-key", List.of("env"))).isEmpty());
+        assertTrue(service.describeVolumes("us-east-1", List.of(tagged), Map.of()).getFirst().getTags().isEmpty());
+    }
+
+    @Test
+    void deletingAVolumeDropsItsTags() {
+        Ec2Service service = prefixListService();
+        String volumeId = service.createVolume("us-east-1", "us-east-1a", "gp3", 8,
+                false, 0, null, null, List.of()).getVolumeId();
+        service.createTags("us-east-1", List.of(volumeId), List.of(new Tag("env", "prod")));
+
+        service.deleteVolume("us-east-1", volumeId);
+
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(volumeId))).isEmpty());
+    }
+
+    @Test
+    void networkAclTagsAreTypedAsNetworkAclInDescribeTags() {
+        Ec2Service service = prefixListService();
+        String vpcId = service.createVpc("us-east-1", "10.82.0.0/16", false).getVpcId();
+        String aclId = service.createNetworkAcl("us-east-1", vpcId).getNetworkAclId();
+        service.createTags("us-east-1", List.of(aclId), List.of(new Tag("tier", "private")));
+
+        List<Map<String, String>> described =
+                service.describeTags("us-east-1", Map.of("resource-type", List.of("network-acl")));
+
+        assertEquals(List.of(aclId), described.stream().map(tag -> tag.get("resourceId")).toList());
+    }
+
+    private static List<String> volumeIds(Ec2Service service, Map<String, List<String>> filters) {
+        return service.describeVolumes("us-east-1", List.of(), filters).stream().map(Volume::getVolumeId).toList();
+    }
+
     private static String authorizeTcpFromPrivateRange(Ec2Service service, String groupId, int port) {
         IpPermission perm = tcpPermission(port);
         perm.getIpRanges().add(new IpRange("10.0.0.0/8", null));

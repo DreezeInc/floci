@@ -3249,15 +3249,47 @@ public class Ec2QueryHandler {
     private Response handleRevokeSecurityGroupIngress(MultivaluedMap<String, String> p, String region) {
         String groupId = p.getFirst("GroupId");
         List<IpPermission> perms = parseIpPermissions(p, "IpPermissions");
-        service.revokeSecurityGroupIngress(region, groupId, perms);
-        return booleanResponse("RevokeSecurityGroupIngress");
+        Ec2Service.SecurityGroupRuleRevocation revocation = service.revokeSecurityGroupIngress(
+                region, groupId, perms, getList(p, "SecurityGroupRuleId"));
+        return revocationResponse("RevokeSecurityGroupIngressResponse", revocation);
     }
 
     private Response handleRevokeSecurityGroupEgress(MultivaluedMap<String, String> p, String region) {
         String groupId = p.getFirst("GroupId");
         List<IpPermission> perms = parseIpPermissions(p, "IpPermissions");
-        service.revokeSecurityGroupEgress(region, groupId, perms);
-        return booleanResponse("RevokeSecurityGroupEgress");
+        Ec2Service.SecurityGroupRuleRevocation revocation = service.revokeSecurityGroupEgress(
+                region, groupId, perms, getList(p, "SecurityGroupRuleId"));
+        return revocationResponse("RevokeSecurityGroupEgressResponse", revocation);
+    }
+
+    private Response revocationResponse(String responseTag, Ec2Service.SecurityGroupRuleRevocation revocation) {
+        XmlBuilder xml = new XmlBuilder()
+                .start(responseTag, AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("return", "true")
+                .start("revokedSecurityGroupRuleSet");
+        for (SecurityGroupRule rule : revocation.revokedRules()) {
+            xml.start("item")
+                    .elem("securityGroupRuleId", rule.getSecurityGroupRuleId())
+                    .elem("groupId", rule.getGroupId())
+                    .elem("isEgress", String.valueOf(rule.isEgress()))
+                    .elem("ipProtocol", rule.getIpProtocol());
+            if (rule.getFromPort() != null) xml.elem("fromPort", String.valueOf(rule.getFromPort()));
+            if (rule.getToPort() != null) xml.elem("toPort", String.valueOf(rule.getToPort()));
+            xml.elem("cidrIpv4", rule.getCidrIpv4())
+                    .elem("cidrIpv6", rule.getCidrIpv6())
+                    .elem("prefixListId", rule.getPrefixListId())
+                    .elem("referencedGroupId", rule.getReferencedGroupInfo() == null
+                            ? null : rule.getReferencedGroupInfo().getGroupId())
+                    .elem("description", rule.getDescription())
+                    .end("item");
+        }
+        xml.end("revokedSecurityGroupRuleSet");
+        if (!revocation.unknownPermissions().isEmpty()) {
+            xml.raw(ipPermissionsXml(revocation.unknownPermissions(), "unknownIpPermissionSet"));
+        }
+        xml.end(responseTag);
+        return xmlResponse(xml.build());
     }
 
     private Response handleDescribeSecurityGroupRules(MultivaluedMap<String, String> p, String region) {
@@ -4179,7 +4211,9 @@ public class Ec2QueryHandler {
     // ─── Network ACL handlers ─────────────────────────────────────────────────
 
     private Response handleCreateNetworkAcl(MultivaluedMap<String, String> p, String region) {
+        List<Tag> resourceTags = parseTagsForResource(p, "network-acl");
         NetworkAcl acl = service.createNetworkAcl(region, p.getFirst("VpcId"));
+        applyResourceTags(resourceTags, region, acl.getNetworkAclId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateNetworkAclResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())

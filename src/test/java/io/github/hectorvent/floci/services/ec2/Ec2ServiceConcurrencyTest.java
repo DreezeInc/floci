@@ -161,6 +161,31 @@ class Ec2ServiceConcurrencyTest {
     }
 
     @Test
+    void concurrentTaggingNeverBringsBackADeletedVolume() throws Exception {
+        for (int trial = 0; trial < TRIALS; trial++) {
+            String region = "race-vol-" + trial;
+            Ec2Service service = newService();
+            List<String> volumeIds = new java.util.ArrayList<>();
+            for (int i = 0; i < N / 2; i++) {
+                volumeIds.add(service.createVolume(region, region + "a", "gp3", 8,
+                        false, 0, null, null, List.of()).getVolumeId());
+            }
+
+            runRaceAllowing(i -> {
+                String volumeId = volumeIds.get(i / 2);
+                if (i % 2 == 0) {
+                    service.deleteVolume(region, volumeId);
+                } else {
+                    service.createTags(region, List.of(volumeId), List.of(new Tag("k", "v")));
+                }
+            });
+
+            assertTrue(service.describeVolumes(region, List.of(), Map.of()).isEmpty(),
+                    "trial " + trial + ": a tag write brought back a deleted volume");
+        }
+    }
+
+    @Test
     void concurrentReplaceNetworkAclAssociationMovesTheSubnetOnce() throws Exception {
         for (int trial = 0; trial < TRIALS; trial++) {
             String region = "race-aclassoc-" + trial;

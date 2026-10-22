@@ -4018,6 +4018,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             volumeBlockDeviceManager.deleteVolume(inst.getRootVolumeId());
                         }
                         volumes.delete(key(region, inst.getRootVolumeId()));
+                        tags.delete(inst.getRootVolumeId());
                     }
                 }
             }
@@ -4827,14 +4828,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             // Same lock the authorize/revoke paths hold while they read and re-save a group; without
             // it, one of them can save the group back after this delete and resurrect it.
             synchronized (lockFor(key(region, group.getGroupId()))) {
-                List<String> ruleIds = securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
-                        .filter(rule -> group.getGroupId().equals(rule.getGroupId()))
-                        .map(SecurityGroupRule::getSecurityGroupRuleId)
-                        .toList();
-                ruleIds.forEach(ruleId -> {
-                    securityGroupRules.delete(key(region, ruleId));
-                    tags.delete(ruleId);
-                });
+                deleteRuleRecordsOf(region, group.getGroupId());
                 securityGroups.delete(key(region, group.getGroupId()));
                 tags.delete(group.getGroupId());
             }
@@ -6055,10 +6049,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     public void deleteSecurityGroup(String region, String groupId) {
         ensureDefaultResources(region);
-        if (securityGroups.get(key(region, groupId)).isEmpty()) {
-            throw new AwsException("InvalidGroup.NotFound", "The security group '" + groupId + "' does not exist", 400);
+        synchronized (lockFor(key(region, groupId))) {
+            getRequiredSecurityGroup(region, groupId);
+            deleteRuleRecordsOf(region, groupId);
+            securityGroups.delete(key(region, groupId));
+            tags.delete(groupId);
         }
-        securityGroups.delete(key(region, groupId));
     }
 
     public List<SecurityGroupRule> authorizeSecurityGroupIngress(String region, String groupId, List<IpPermission> permissions) {
@@ -6213,34 +6209,159 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    public void revokeSecurityGroupIngress(String region, String groupId, List<IpPermission> permissions) {
+    public record SecurityGroupRuleRevocation(List<SecurityGroupRule> revokedRules,
+                                              List<IpPermission> unknownPermissions) {}
+
+    public SecurityGroupRuleRevocation revokeSecurityGroupIngress(String region, String groupId,
+                                                                  List<IpPermission> permissions) {
+        return revokeSecurityGroupIngress(region, groupId, permissions, List.of());
+    }
+
+    public SecurityGroupRuleRevocation revokeSecurityGroupIngress(String region, String groupId,
+                                                                  List<IpPermission> permissions,
+                                                                  List<String> ruleIds) {
+        SecurityGroupRuleRevocation revocation = revokeRules(region, groupId, permissions, ruleIds, false);
+        reconcilePublishedPortsForGroup(region, groupId);
+        return revocation;
+    }
+
+    public SecurityGroupRuleRevocation revokeSecurityGroupEgress(String region, String groupId,
+                                                                 List<IpPermission> permissions) {
+        return revokeSecurityGroupEgress(region, groupId, permissions, List.of());
+    }
+
+    public SecurityGroupRuleRevocation revokeSecurityGroupEgress(String region, String groupId,
+                                                                 List<IpPermission> permissions,
+                                                                 List<String> ruleIds) {
+        SecurityGroupRuleRevocation revocation = revokeRules(region, groupId, permissions, ruleIds, true);
+        reconcileFirewallPolicies(region);
+        return revocation;
+    }
+
+    private SecurityGroupRuleRevocation revokeRules(String region, String groupId, List<IpPermission> permissions,
+                                                    List<String> ruleIds, boolean egress) {
         ensureDefaultResources(region);
         synchronized (lockFor(key(region, groupId))) {
             SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+            List<SecurityGroupRule> named = requireGroupRules(region, groupId, ruleIds, egress);
             // Authorize stores a group reference by id, so a revoke naming it by name alone has to
             // resolve the same way before the sources can be compared.
             for (IpPermission perm : permissions) {
                 resolveGroupReferences(region, sg.getVpcId(), perm);
             }
-            List<IpPermission> next = revokeSources(new ArrayList<>(sg.getIpPermissions()), permissions);
-            sg.setIpPermissions(next);
+            List<IpPermission> current = new ArrayList<>(egress ? sg.getIpPermissionsEgress() : sg.getIpPermissions());
+            // Read before revokeSources, which can empty a removal that is the stored instance itself.
+            List<IpPermission> unknown = unknownPermissions(current, permissions);
+            Map<String, SecurityGroupRule> revoked = new LinkedHashMap<>();
+            named.forEach(rule -> revoked.put(rule.getSecurityGroupRuleId(), rule));
+            rulesMatching(groupRules(region, groupId, egress), permissions)
+                    .forEach(rule -> revoked.putIfAbsent(rule.getSecurityGroupRuleId(), rule));
+            List<IpPermission> next = revokeSources(current, permissions);
+            for (SecurityGroupRule rule : named) {
+                removeRecordedPermission(next, rule);
+            }
+            revoked.keySet().forEach(ruleId -> deleteRuleRecord(region, ruleId));
+            if (egress) {
+                sg.setIpPermissionsEgress(next);
+            } else {
+                sg.setIpPermissions(next);
+            }
             securityGroups.put(key(region, groupId), sg);
+            return new SecurityGroupRuleRevocation(List.copyOf(revoked.values()), unknown);
         }
-        reconcilePublishedPortsForGroup(region, groupId);
     }
 
-    public void revokeSecurityGroupEgress(String region, String groupId, List<IpPermission> permissions) {
-        ensureDefaultResources(region);
-        synchronized (lockFor(key(region, groupId))) {
-            SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
-            for (IpPermission perm : permissions) {
-                resolveGroupReferences(region, sg.getVpcId(), perm);
-            }
-            List<IpPermission> next = revokeSources(new ArrayList<>(sg.getIpPermissionsEgress()), permissions);
-            sg.setIpPermissionsEgress(next);
-            securityGroups.put(key(region, groupId), sg);
+    // Every id is resolved before anything is written, so one unknown id fails the whole call.
+    private List<SecurityGroupRule> requireGroupRules(String region, String groupId, List<String> ruleIds,
+                                                      boolean egress) {
+        List<SecurityGroupRule> rules = new ArrayList<>();
+        for (String ruleId : new LinkedHashSet<>(ruleIds)) {
+            SecurityGroupRule rule = securityGroupRules.get(key(region, ruleId))
+                    .filter(r -> groupId.equals(r.getGroupId()) && r.isEgress() == egress)
+                    .orElseThrow(() -> new AwsException("InvalidSecurityGroupRuleId.NotFound",
+                            "The security group rule ID '" + ruleId + "' does not exist", 400));
+            rules.add(rule);
         }
-        reconcileFirewallPolicies(region);
+        return rules;
+    }
+
+    private List<SecurityGroupRule> groupRules(String region, String groupId, boolean egress) {
+        return securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(rule -> groupId.equals(rule.getGroupId()) && rule.isEgress() == egress)
+                .toList();
+    }
+
+    private List<SecurityGroupRule> rulesMatching(List<SecurityGroupRule> rules, List<IpPermission> removals) {
+        return rules.stream()
+                .filter(rule -> removals.stream().anyMatch(removal ->
+                        samePortScope(rule.getIpProtocol(), rule.getFromPort(), rule.getToPort(), removal)
+                                && (!hasSources(removal) || namesSourceOf(removal, rule))))
+                .toList();
+    }
+
+    private static boolean namesSourceOf(IpPermission removal, SecurityGroupRule rule) {
+        String referencedGroupId = rule.getReferencedGroupInfo() == null
+                ? null : rule.getReferencedGroupInfo().getGroupId();
+        return removal.getIpRanges().stream().anyMatch(r -> Objects.equals(r.getCidrIp(), rule.getCidrIpv4()))
+                || removal.getIpv6Ranges().stream()
+                        .anyMatch(r -> Objects.equals(r.getCidrIpv6(), rule.getCidrIpv6()))
+                || removal.getPrefixListIds().stream()
+                        .anyMatch(l -> Objects.equals(l.getPrefixListId(), rule.getPrefixListId()))
+                || removal.getUserIdGroupPairs().stream()
+                        .anyMatch(p -> p.getGroupId() != null && p.getGroupId().equals(referencedGroupId));
+    }
+
+    // AWS reports each requested source the group lacks, and a sourceless request only if nothing matched.
+    private List<IpPermission> unknownPermissions(List<IpPermission> existing, List<IpPermission> removals) {
+        List<IpPermission> unknown = new ArrayList<>();
+        for (IpPermission removal : removals) {
+            List<IpPermission> candidates = existing.stream()
+                    .filter(perm -> sameProtocolAndPorts(perm, removal))
+                    .toList();
+            IpPermission missing = new IpPermission();
+            missing.setIpProtocol(removal.getIpProtocol());
+            missing.setFromPort(removal.getFromPort());
+            missing.setToPort(removal.getToPort());
+            if (!hasSources(removal)) {
+                if (candidates.isEmpty()) {
+                    unknown.add(missing);
+                }
+                continue;
+            }
+            removal.getIpRanges().stream()
+                    .filter(range -> candidates.stream().noneMatch(perm -> perm.getIpRanges().stream()
+                            .anyMatch(r -> Objects.equals(r.getCidrIp(), range.getCidrIp()))))
+                    .forEach(missing.getIpRanges()::add);
+            removal.getIpv6Ranges().stream()
+                    .filter(range -> candidates.stream().noneMatch(perm -> perm.getIpv6Ranges().stream()
+                            .anyMatch(r -> Objects.equals(r.getCidrIpv6(), range.getCidrIpv6()))))
+                    .forEach(missing.getIpv6Ranges()::add);
+            removal.getPrefixListIds().stream()
+                    .filter(list -> candidates.stream().noneMatch(perm -> perm.getPrefixListIds().stream()
+                            .anyMatch(l -> Objects.equals(l.getPrefixListId(), list.getPrefixListId()))))
+                    .forEach(missing.getPrefixListIds()::add);
+            removal.getUserIdGroupPairs().stream()
+                    .filter(pair -> candidates.stream().noneMatch(perm -> perm.getUserIdGroupPairs().stream()
+                            .anyMatch(p -> Objects.equals(p.getGroupId(), pair.getGroupId()))))
+                    .forEach(missing.getUserIdGroupPairs()::add);
+            if (hasSources(missing)) {
+                unknown.add(missing);
+            }
+        }
+        return unknown;
+    }
+
+    private void deleteRuleRecord(String region, String ruleId) {
+        securityGroupRules.delete(key(region, ruleId));
+        tags.delete(ruleId);
+    }
+
+    private void deleteRuleRecordsOf(String region, String groupId) {
+        securityGroupRules.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(rule -> groupId.equals(rule.getGroupId()))
+                .map(SecurityGroupRule::getSecurityGroupRuleId)
+                .toList()
+                .forEach(ruleId -> deleteRuleRecord(region, ruleId));
     }
 
     /**
@@ -6293,9 +6414,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         String referencedGroupId = rule.getReferencedGroupInfo() == null
                 ? null : rule.getReferencedGroupInfo().getGroupId();
         for (IpPermission perm : perms) {
-            if (!Objects.equals(perm.getIpProtocol(), rule.getIpProtocol())
-                    || !Objects.equals(perm.getFromPort(), rule.getFromPort())
-                    || !Objects.equals(perm.getToPort(), rule.getToPort())) {
+            if (!samePortScope(rule.getIpProtocol(), rule.getFromPort(), rule.getToPort(), perm)) {
                 continue;
             }
             if (rule.getCidrIpv6() != null) {
@@ -6331,9 +6450,19 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 dropIfEmpty(perms, perm);
                 return true;
             }
+            if (rule.getPrefixListId() != null) {
+                PrefixListId matchList = perm.getPrefixListIds().stream()
+                        .filter(l -> rule.getPrefixListId().equals(l.getPrefixListId()))
+                        .findFirst().orElse(null);
+                if (matchList == null) {
+                    continue;
+                }
+                perm.getPrefixListIds().remove(matchList);
+                dropIfEmpty(perms, perm);
+                return true;
+            }
             // A record naming no peer matches only a permission that names none either.
-            if (perm.getIpRanges().isEmpty() && perm.getIpv6Ranges().isEmpty()
-                    && perm.getUserIdGroupPairs().isEmpty()) {
+            if (!hasSources(perm)) {
                 perms.remove(perm);
                 return true;
             }
@@ -6341,9 +6470,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return false;
     }
 
-    private static void dropIfEmpty(List<IpPermission> perms, IpPermission perm) {
-        if (perm.getIpRanges().isEmpty() && perm.getIpv6Ranges().isEmpty()
-                && perm.getUserIdGroupPairs().isEmpty()) {
+    private void dropIfEmpty(List<IpPermission> perms, IpPermission perm) {
+        if (!hasSources(perm)) {
             perms.remove(perm);
         }
     }
@@ -6400,9 +6528,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private boolean sameProtocolAndPorts(IpPermission a, IpPermission b) {
-        return Objects.equals(a.getIpProtocol(), b.getIpProtocol())
-                && Objects.equals(a.getFromPort(), b.getFromPort())
-                && Objects.equals(a.getToPort(), b.getToPort());
+        return samePortScope(a.getIpProtocol(), a.getFromPort(), a.getToPort(), b);
+    }
+
+    // Protocol -1 allows every port, so any port range given with it names the same permission.
+    private static boolean samePortScope(String protocol, Integer fromPort, Integer toPort, IpPermission perm) {
+        if (!Objects.equals(protocol, perm.getIpProtocol())) {
+            return false;
+        }
+        return "-1".equals(protocol)
+                || (Objects.equals(fromPort, perm.getFromPort()) && Objects.equals(toPort, perm.getToPort()));
     }
 
     private boolean hasSources(IpPermission perm) {
@@ -8483,7 +8618,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public void createSystemTags(String region, List<String> resourceIds, List<Tag> tagList) {
         ensureDefaultResources(region);
         for (String resourceId : resourceIds) {
-            withTopologyLockIfNeeded(region, resourceId, () -> {
+            withDeleteLockIfNeeded(region, resourceId, () -> {
                 synchronized (lockFor(key(region, resourceId))) {
                     List<Tag> existing = new ArrayList<>(tags.get(resourceId).orElseGet(() -> {
                         Instance ext = findExternalInstance(callerAccountId(), region, resourceId).orElse(null);
@@ -8502,16 +8637,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /**
-     * Runs a tag change with the topology lock already held when the resource is one a transit
-     * gateway delete can remove. Order matters as much as the lock does: the deletes take the
-     * topology lock and then a striped resource lock, so tagging has to take them the same way
-     * round or the two deadlock.
+     * Runs a tag change under the lock that deletes a resource of this kind: the topology lock for
+     * the transit gateway family and the volume lock for a volume. Order matters as much as the
+     * lock does: those deletes and modifies take that lock before any striped resource lock, so
+     * tagging has to take them the same way round or the two deadlock.
      */
-    private void withTopologyLockIfNeeded(String region, String resourceId, Runnable change) {
+    private void withDeleteLockIfNeeded(String region, String resourceId, Runnable change) {
         if (resourceId != null && resourceId.startsWith("tgw-")) {
             synchronized (attachmentTopologyLock(region)) {
                 change.run();
             }
+            return;
+        }
+        if (resourceId != null && resourceId.startsWith("vol-")) {
+            withVolumeLock(resourceId, change);
             return;
         }
         change.run();
@@ -8521,7 +8660,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         validateUserTagKeys(tagList);
         ensureDefaultResources(region);
         for (String resourceId : resourceIds) {
-            withTopologyLockIfNeeded(region, resourceId, () -> {
+            withDeleteLockIfNeeded(region, resourceId, () -> {
             synchronized (lockFor(key(region, resourceId))) {
                 List<Tag> stored = tags.get(resourceId).orElseGet(() -> {
                     Instance ext = findExternalInstance(callerAccountId(), region, resourceId).orElse(null);
@@ -8601,6 +8740,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (prefixList != null) {
             prefixList.setTags(new ArrayList<>(tagList));
             managedPrefixLists.put(storeKey, prefixList);
+            return;
+        }
+        if (resourceId.startsWith("vol-")) {
+            Volume volume = volumes.get(storeKey).orElse(null);
+            if (volume != null) {
+                volume.setTags(new ArrayList<>(tagList));
+                volumes.put(storeKey, volume);
+            }
             return;
         }
         if (resourceId.startsWith("snap-")) {
@@ -8736,6 +8883,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         if (resourceId.startsWith("rtb-")) {
             return "route-table";
+        }
+        if (resourceId.startsWith("acl-")) {
+            return "network-acl";
         }
         if (resourceId.startsWith("key-")) {
             return "key-pair";
@@ -10922,6 +11072,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
             volumes.delete(key(region, volumeId));
+            tags.delete(volumeId);
         });
     }
 
@@ -11778,6 +11929,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             volumeBlockDeviceManager.deleteVolume(vol.getVolumeId());
                         }
                         volumes.delete(k);
+                        tags.delete(vol.getVolumeId());
                         modified = false;
                         break;
                     } else {
