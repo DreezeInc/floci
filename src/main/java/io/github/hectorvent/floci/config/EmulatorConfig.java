@@ -3401,6 +3401,16 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean emulateEbsStorage();
 
+        /**
+         * When true, starts k3s without its bundled service load balancer and plays the EKS in-tree
+         * cloud provider for {@code LoadBalancer} Services annotated
+         * {@code service.beta.kubernetes.io/aws-load-balancer-type: nlb}: each gets a network load
+         * balancer in the cluster's account whose targets are the cluster's Ready nodes on the
+         * Service's node ports, and its DNS name in the Service status.
+         */
+        @WithDefault("false")
+        boolean loadBalancerServices();
+
         /** The port Floci serves the EBS CSI driver's gRPC services on when {@link #emulateEbsStorage()} is on. */
         @WithDefault("4591")
         int ebsCsiPort();

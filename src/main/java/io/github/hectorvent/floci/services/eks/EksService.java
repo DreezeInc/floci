@@ -120,6 +120,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final Set<String> restoringClusters = ConcurrentHashMap.newKeySet();
     private final Map<String, Set<String>> awsAuthMappedRoles = new ConcurrentHashMap<>();
 
+    /** Left null by the unit tests that construct this service directly. */
+    @Inject
+    EksServiceLoadBalancers serviceLoadBalancers;
+
     @Inject
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
@@ -1669,6 +1673,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                     }
                     if (cluster.getStatus() == ClusterStatus.ACTIVE) {
                         mapNodeGroupRolesInAwsAuth(entry.accountId(), cluster);
+                        if (serviceLoadBalancers != null) {
+                            serviceLoadBalancers.requestReconcile(cluster);
+                        }
                     }
                 }
             } catch (Exception e) {

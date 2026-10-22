@@ -742,6 +742,7 @@ floci:
       default-storage-class: false # start k3s without its bundled local-path provisioner to match EKS
       emulate-ebs-storage: false   # define the stock gp2 StorageClass and serve ebs.csi.aws.com claims as EC2 volumes kept on the node's disk
       ebs-csi-port: 4591           # the port Floci serves the EBS CSI driver on; cluster nodes reach it on the Docker host address
+      load-balancer-services: false # give nlb-annotated LoadBalancer Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does
       imds: false                  # expose link-local IMDS (169.254.169.254) inside the cluster container
       imds-pod-network: false      # route link-local IMDS traffic from ordinary pod network namespaces (requires imds: true)
       irsa-signing-key: true       # sign k3s service account tokens with the cluster OIDC key

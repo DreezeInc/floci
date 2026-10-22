@@ -645,6 +645,26 @@ The gp2 StorageClass names the CSI driver rather than the in-tree `kubernetes.io
 
 The AWS Load Balancer Controller registers pod addresses as `ip` targets. Pod addresses exist only inside the cluster's k3s container, so the ELBv2 data plane cannot connect to them directly. When a request or a health check goes to an `ip` target, Floci looks for a running cluster in the target group's account, region and VPC whose pod CIDR holds the address. If it finds one, Floci adds an iptables DNAT rule in the `FLOCI-ELB-TARGETS` chain of the node container. The rule forwards one node port, from 20000 up, to the pod address and port. Floci then connects to that node port. Each pod address and port keeps its node port while Floci runs. Floci must be able to reach the node container's address, so it has to run in Docker or on a Linux host.
 
+#### Network load balancers for Services
+
+With `floci.services.eks.load-balancer-services: true` (or `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES=true`), Floci plays the EKS in-tree cloud provider for network load balancers. New clusters start k3s with `--disable=servicelb`, so k3s does not answer `LoadBalancer` Services with the node's own address. About every 10 seconds, Floci reads each running cluster's Services. Each `LoadBalancer` Service annotated `service.beta.kubernetes.io/aws-load-balancer-type: nlb`, with no `spec.loadBalancerClass`, gets the following in the cluster's account:
+
+- **Load balancer:** a `network` load balancer named `a` plus the Service UID without dashes, cut to 32 characters. It is `internal` when `service.beta.kubernetes.io/aws-load-balancer-internal` is set to anything but `false`, and `internet-facing` otherwise.
+- **Subnets:** one subnet per Availability Zone from the cluster's VPC. Floci takes the subnets tagged `kubernetes.io/role/elb` (`kubernetes.io/role/internal-elb` for an internal one), or the cluster's own subnets when none is tagged. It skips subnets tagged for another cluster, and prefers a subnet tagged `kubernetes.io/cluster/<cluster>`, then the lowest subnet id.
+- **Tags:** the pairs in `service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags`, then `kubernetes.io/cluster/<cluster>=owned` and `kubernetes.io/service-name=<namespace>/<name>`. Floci adds them again when they go missing.
+- **Per Service port:** a listener on the Service port and an `instance` target group named `k8s-<namespace>-<name>-<hash>`. The target group uses the port's protocol and node port, with a TCP health check on the traffic port. It registers every Ready node whose provider ID is `aws:///<zone>/<instance-id>` and that is not labelled `node.kubernetes.io/exclude-from-external-load-balancers`.
+- **Service status:** the load balancer's DNS name goes to `status.loadBalancer.ingress[0].hostname`.
+
+Floci adds the `service.kubernetes.io/load-balancer-cleanup` finalizer to the Service before it creates anything. When the Service is deleted, loses the annotation or stops being a `LoadBalancer` Service, Floci deletes the load balancer and its target groups and removes the finalizer. A changed node port or protocol replaces that port's listener and target group.
+
+Limits:
+
+- `LoadBalancer` Services without the `nlb` annotation get no load balancer, where EKS would give them a Classic Load Balancer.
+- The data plane serves HTTP, so a TCP listener answers HTTP traffic only, and the health checker probes targets over HTTP.
+- Only the type, internal and additional-tags annotations are read. Others, such as target type, subnets, EIP allocations and health check settings, are ignored.
+- Nodes that Floci registers for joined EC2 instances have no kubelet and never report Ready, so they are not registered as targets.
+- If the setting is turned off while Services still hold the finalizer, their deletion waits until it is turned back on or the finalizer is removed by hand.
+
 ## Joining EC2 instances as cluster nodes
 
 Floci allows EC2 instances to join an EKS cluster as Kubernetes worker nodes. Launching an instance via `RunInstances` with user data targeting a cluster automatically registers a matching Kubernetes node.
@@ -693,6 +713,7 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS` | `false` | Retain k3s bundled local-path provisioner and default StorageClass (default false matches EKS with no default class) |
 | `FLOCI_SERVICES_EKS_EMULATE_EBS_STORAGE` | `false` | Define the stock `gp2` StorageClass and serve `ebs.csi.aws.com` claims as EC2 volumes whose data stays on the node's filesystem |
 | `FLOCI_SERVICES_EKS_EBS_CSI_PORT` | `4591` | Port Floci serves the EBS CSI driver on; cluster nodes reach it on the Docker host address |
+| `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Start k3s without its service load balancer and give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
 | `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
 | `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |

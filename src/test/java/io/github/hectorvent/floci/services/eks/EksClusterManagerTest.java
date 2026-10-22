@@ -317,6 +317,16 @@ class EksClusterManagerTest {
     }
 
     @Test
+    void serverArgsDisableServiceLoadBalancerOnlyWhenFlociServesLoadBalancers() {
+        assertFalse(EksClusterManager.buildServerArgs(false).contains("--disable=servicelb"));
+
+        List<String> args = EksClusterManager.buildServerArgs(false, false, true, null, null, Optional.empty());
+
+        assertTrue(args.contains("--disable=servicelb"));
+        assertTrue(args.contains("--disable=traefik"));
+    }
+
+    @Test
     void serverArgsAddTheEndpointHostAsASecondTlsSan() {
         List<String> args = EksClusterManager.buildServerArgs(false, false, null, null,
                 Optional.of("floci-service.floci-pr-1.svc.cluster.local"));

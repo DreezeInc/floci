@@ -5725,6 +5725,7 @@ class Ec2ServiceTest {
         nodeInstance.setPlacement(new Placement("us-east-1a"));
         nodeInstance.setState(InstanceState.running());
         nodeInstance.setInstanceType("m5.large");
+        nodeInstance.setContainerBridgeIp("172.30.0.2");
         nodeInstance.setTags(List.of(new Tag("Name", "test-cluster-node")));
 
         service.setClusterNodeInstanceProvider(new ClusterNodeInstanceProvider() {
@@ -5763,6 +5764,7 @@ class Ec2ServiceTest {
         Instance foundById = service.findInstanceById("i-node1234567890abc");
         assertNotNull(foundById);
         assertEquals("i-node1234567890abc", foundById.getInstanceId());
+        assertEquals("172.30.0.2", foundById.getContainerBridgeIp());
     }
 
     @Test
