@@ -36,8 +36,8 @@ import java.util.function.Supplier;
  * {@code AWS_ENDPOINT_URL} pointing at Floci, so the SDKs inside the cluster call the emulator
  * instead of AWS without each chart being told where Floci is.
  *
- * <p>Nothing answers {@link #CREDENTIALS_FULL_URI} yet: for pod identity this class injects the
- * plumbing only, so an injected pod still cannot obtain credentials that way.
+ * <p>Each node routes {@link #CREDENTIALS_FULL_URI} to {@link EksPodIdentityCredentialsController},
+ * which tells pods apart by the token they present (see {@link EksPodNetworkRouting}).
  *
  * <p>Every path here admits the pod. A cluster that is gone, an addon that is not installed, a
  * malformed review and an internal error all return {@code allowed: true} with no patch, which is

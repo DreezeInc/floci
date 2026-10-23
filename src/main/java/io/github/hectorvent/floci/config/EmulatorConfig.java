@@ -3422,15 +3422,15 @@ public interface EmulatorConfig {
         int ebsCsiPort();
 
         /**
-         * When true, exposes an IMDS link-local proxy (169.254.169.254:80) inside the cluster container's
-         * network namespace that relays to Floci's EC2 metadata service.
+         * When true, routes the link-local IMDS address (169.254.169.254:80) in the cluster container's
+         * network namespace to Floci's EC2 metadata service.
          */
         @WithDefault("false")
         boolean imds();
 
         /**
-         * When true, routes link-local IMDS traffic from ordinary pod network namespaces to the node's
-         * link-local listener. Requires {@code imds()} to be enabled.
+         * When true, also routes link-local IMDS traffic from ordinary pod network namespaces to Floci's
+         * EC2 metadata service. Requires {@code imds()} to be enabled.
          */
         @WithDefault("false")
         boolean imdsPodNetwork();
@@ -3445,11 +3445,12 @@ public interface EmulatorConfig {
         /**
          * When true, registers a {@code MutatingWebhookConfiguration} in each new cluster so pods
          * whose service account has an EKS Pod Identity association are mutated at admission with a
-         * projected pod identity token and the container credentials environment variables.
+         * projected pod identity token and the container credentials environment variables, and routes
+         * the pod identity credentials endpoint (169.254.170.23:80) on the node to Floci.
          *
          * <p>Requires {@link EmulatorConfig#tls()} to be enabled: Kubernetes rejects an admission
-         * webhook URL that is not {@code https}. With TLS off the webhook is skipped with a warning
-         * and pods start unmutated.
+         * webhook URL that is not {@code https}. With TLS off the webhook is skipped with a warning,
+         * pods start unmutated and the endpoint is not routed.
          */
         @WithDefault("true")
         boolean podIdentityWebhook();

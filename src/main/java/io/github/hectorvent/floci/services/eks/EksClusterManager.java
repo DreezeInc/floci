@@ -824,7 +824,7 @@ public class EksClusterManager
         applyEndpoints(cluster, containerName, hostPort, info);
         registerClusterNodeInstance(cluster, containerId);
         configureLinkLocalMetadataEndpoint(cluster, containerId);
-        configurePodIdentityRelay(cluster, containerId);
+        configureLinkLocalRouting(cluster, containerId);
         activeClusters.put(clusterResourceName(cluster), cluster);
         configureVpcRoutes(cluster, containerId);
         attachClusterLogs(cluster);
@@ -912,7 +912,7 @@ public class EksClusterManager
         applyEndpoints(cluster, cluster.getDockerName(), hostPort, info);
         registerClusterNodeInstance(cluster, info.containerId());
         configureLinkLocalMetadataEndpoint(cluster, info.containerId());
-        configurePodIdentityRelay(cluster, info.containerId());
+        configureLinkLocalRouting(cluster, info.containerId());
         activeClusters.put(clusterResourceName(cluster), cluster);
         configureVpcRoutes(cluster, info.containerId());
         attachClusterLogsFromNow(cluster);
@@ -2719,88 +2719,64 @@ public class EksClusterManager
             if (metadataServer != null) {
                 metadataServer.reconcileContainerAddresses(containerIps.allIps(), nodeInstance);
             }
-
-            ContainerExec.Result install = execInContainerForResult(containerId,
-                    Ec2MetadataProxy.installCommand(), 180);
-            if (install.exitCode() != 0) {
-                LOG.warnv("Could not install IMDS proxy dependencies for EKS cluster {0}: {1}",
-                        cluster.getName(), install.summary());
-                return;
-            }
-
-            String flociHost = dockerHostResolver.resolve();
-            int imdsPort = config.services().ec2().imdsPort();
-
-            ContainerExec.Result start = execInContainerForResult(containerId,
-                    Ec2MetadataProxy.startCommand(flociHost, imdsPort), 30);
-            if (start.exitCode() != 0) {
-                LOG.warnv("Could not start link-local IMDS proxy for EKS cluster {0}: {1}",
-                        cluster.getName(), start.summary());
-                return;
-            }
-
-            if (config.services().eks().imdsPodNetwork()) {
-                configurePodNetworkRouting(cluster, containerId);
-            }
-
-            LOG.infov("Configured link-local IMDS endpoint for EKS cluster {0}", cluster.getName());
         } catch (Exception e) {
             LOG.warnv("Could not configure link-local IMDS endpoint for EKS cluster {0}: {1}",
                     cluster.getName(), e.getMessage());
         }
     }
 
-    void configurePodIdentityRelay(Cluster cluster, String containerId) {
-        if (!config.services().eks().podIdentityWebhook() || !config.tls().enabled()) {
+    /**
+     * Answers the node's link-local endpoints from Floci with iptables DNAT rules in the node
+     * container (see {@link EksPodNetworkRouting}): IMDS when {@code imds} is on, reaching pods
+     * too with {@code imds-pod-network}, and the EKS Pod Identity endpoint whenever the pod
+     * identity webhook can inject pods. Each call rebuilds the rules for Floci's current address.
+     */
+    void configureLinkLocalRouting(Cluster cluster, String containerId) {
+        boolean imds = config.services().eks().imds();
+        boolean podIdentity = config.services().eks().podIdentityWebhook() && config.tls().enabled();
+        if (!imds && !podIdentity) {
             return;
         }
         try {
-            ContainerExec.Result install = execInContainerForResult(containerId,
-                    Ec2MetadataProxy.installCommand(), 180);
-            if (install.exitCode() != 0) {
-                LOG.warnv("Could not install Pod Identity relay dependencies for EKS cluster {0}: {1}",
-                        cluster.getName(), install.summary());
-                return;
-            }
-
             String flociHost = dockerHostResolver.resolve();
-            int flociPort = config.port();
-
-            ContainerExec.Result start = execInContainerForResult(containerId,
-                    Ec2MetadataProxy.podIdentityStartCommand(flociHost, flociPort), 30);
-            if (start.exitCode() != 0) {
-                LOG.warnv("Could not start link-local Pod Identity relay for EKS cluster {0}: {1}",
-                        cluster.getName(), start.summary());
+            Optional<String> flociIp = resolveFromNode(containerId, flociHost);
+            if (flociIp.isEmpty()) {
+                LOG.warnv("Could not route link-local endpoints for EKS cluster {0}: the node cannot resolve "
+                        + "Floci''s address {1}", cluster.getName(), flociHost);
                 return;
             }
-
-            configurePodNetworkRouting(cluster, containerId, List.of(EksPodNetworkRouting.POD_IDENTITY_ENDPOINT));
-
-            LOG.infov("Configured link-local Pod Identity relay for EKS cluster {0}", cluster.getName());
-        } catch (Exception e) {
-            LOG.warnv("Could not configure link-local Pod Identity relay for EKS cluster {0}: {1}",
-                    cluster.getName(), e.getMessage());
-        }
-    }
-
-    void configurePodNetworkRouting(Cluster cluster, String containerId) {
-        configurePodNetworkRouting(cluster, containerId, EksPodNetworkRouting.DEFAULT_ENDPOINTS);
-    }
-
-    void configurePodNetworkRouting(Cluster cluster, String containerId, List<LinkLocalEndpoint> endpoints) {
-        try {
-            String[] routingCmd = EksPodNetworkRouting.buildRoutingCommand(
-                    EksPodNetworkRouting.DEFAULT_POD_CIDR,
-                    endpoints);
-            ContainerExec.Result routing = execInContainerForResult(containerId, routingCmd, 15);
-            if (routing.exitCode() != 0) {
-                LOG.warnv("Could not configure link-local pod network routing for EKS cluster {0}: {1}",
-                        cluster.getName(), routing.summary());
+            List<EksPodNetworkRouting.Route> routes = new ArrayList<>();
+            if (imds) {
+                routes.add(new EksPodNetworkRouting.Route(EksPodNetworkRouting.IMDS_ENDPOINT, flociIp.get(),
+                        config.services().ec2().imdsPort(), config.services().eks().imdsPodNetwork()));
             }
+            if (podIdentity) {
+                routes.add(new EksPodNetworkRouting.Route(EksPodNetworkRouting.POD_IDENTITY_ENDPOINT,
+                        flociIp.get(), config.port(), true));
+            }
+            ContainerExec.Result routing = execInContainerForResult(containerId,
+                    EksPodNetworkRouting.buildRoutingCommand(EksPodNetworkRouting.DEFAULT_POD_CIDR, routes), 15);
+            if (routing.exitCode() != 0) {
+                LOG.warnv("Could not route link-local endpoints for EKS cluster {0}: {1}",
+                        cluster.getName(), routing.summary());
+                return;
+            }
+            LOG.infov("Routed link-local endpoints of EKS cluster {0} to Floci at {1} (IMDS: {2}, Pod Identity: {3})",
+                    cluster.getName(), flociIp.get(), imds, podIdentity);
         } catch (Exception e) {
-            LOG.warnv("Could not configure link-local pod network routing for EKS cluster {0}: {1}",
+            LOG.warnv("Could not route link-local endpoints for EKS cluster {0}: {1}",
                     cluster.getName(), e.getMessage());
         }
+    }
+
+    /** iptables only takes an address, so a host name is resolved the way the node resolves it. */
+    private Optional<String> resolveFromNode(String containerId, String host) {
+        if (LinkLocalEndpoint.isValidIpv4Literal(host)) {
+            return Optional.of(host);
+        }
+        ContainerExec.Result resolved = execInContainerForResult(containerId,
+                EksPodNetworkRouting.buildResolveCommand(host), 15);
+        return EksPodNetworkRouting.parseResolvedAddress(resolved.stdout());
     }
 
     void configureVpcRoutes(Cluster cluster, String containerId) {

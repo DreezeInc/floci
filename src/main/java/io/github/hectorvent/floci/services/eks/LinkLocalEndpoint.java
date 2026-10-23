@@ -4,7 +4,7 @@ import java.util.Objects;
 
 /**
  * Represents a link-local network endpoint (IP address and TCP port)
- * routed from pod network namespaces to local node listeners.
+ * that a cluster node routes to Floci.
  */
 public record LinkLocalEndpoint(String ip, int port) {
 
@@ -22,7 +22,7 @@ public record LinkLocalEndpoint(String ip, int port) {
         ip = ip.trim();
     }
 
-    private static boolean isValidIpv4Literal(String ip) {
+    static boolean isValidIpv4Literal(String ip) {
         String[] parts = ip.split("\\.", -1);
         if (parts.length != 4) {
             return false;

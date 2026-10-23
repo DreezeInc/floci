@@ -743,10 +743,10 @@ floci:
       emulate-ebs-storage: false   # define the stock gp2 StorageClass and serve ebs.csi.aws.com claims as EC2 volumes kept on the node's disk
       ebs-csi-port: 4591           # the port Floci serves the EBS CSI driver on; cluster nodes reach it on the Docker host address
       load-balancer-services: false # give nlb-annotated LoadBalancer Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does
-      imds: false                  # expose link-local IMDS (169.254.169.254) inside the cluster container
+      imds: false                  # route link-local IMDS (169.254.169.254) in the cluster container to Floci
       imds-pod-network: false      # route link-local IMDS traffic from ordinary pod network namespaces (requires imds: true)
       irsa-signing-key: true       # sign k3s service account tokens with the cluster OIDC key
-      pod-identity-webhook: true   # register a mutating webhook that injects pod identity credentials (needs floci.tls.enabled)
+      pod-identity-webhook: true   # register a mutating webhook that injects pod identity credentials and route 169.254.170.23 to Floci (needs floci.tls.enabled)
       inject-endpoint-url: false   # also set AWS_ENDPOINT_URL and AWS_CA_BUNDLE on the pods that webhook mutates, so in-cluster SDKs call Floci
       embedded-dns: true           # point cluster containers at Floci's embedded DNS to resolve Route 53 private zones
       vpc-route-programming: true  # program VPC routes into the cluster container for associated subnets

@@ -46,13 +46,8 @@ public final class Ec2MetadataProxy {
                 "curl -fsS --max-time 1 http://169.254.169.254/latest/meta-data/instance-id >/dev/null && exit 0");
     }
 
-    public static String[] podIdentityStartCommand(String flociHost, int flociPort) {
-        return startCommand("pod-identity", "169.254.170.23", 80, flociHost, flociPort,
-                "[ \"$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://169.254.170.23/v1/credentials)\" != \"000\" ] && exit 0");
-    }
-
-    public static String[] startCommand(String name, String bindIp, int bindPort,
-                                        String targetHost, int targetPort, String probeCommand) {
+    private static String[] startCommand(String name, String bindIp, int bindPort,
+                                         String targetHost, int targetPort, String probeCommand) {
         String pidFile = "/tmp/floci-" + name + "-proxy.pid";
         String logFile = "/tmp/floci-" + name + "-proxy.log";
         return new String[]{"sh", "-c", String.join("\n",

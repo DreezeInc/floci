@@ -194,7 +194,9 @@ The volume is a projected service account token with audience `pods.eks.amazonaw
 
 ### Credential endpoint
 
-Floci serves pod identity credentials through a link-local relay bound to `169.254.170.23:80` inside the cluster container, forwarding requests to Floci's credentials endpoint (`GET /v1/credentials`). Workloads reach this endpoint using the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variable, passing their projected token in the `Authorization` header (`Authorization: <token>` or `Authorization: Bearer <token>`).
+Every cluster node answers `169.254.170.23:80` with Floci's credentials endpoint (`GET /v1/credentials`). Floci adds iptables DNAT rules to the node container's `nat` table that send that address to Floci's port, both from the node's own network namespace (so `hostNetwork` pods too) and from the pod CIDR (`10.42.0.0/16`), and masquerades the traffic. The rules use only the `iptables` the k3s image ships: nothing is installed on the node and no agent pod runs in the cluster. The endpoint is plain HTTP on port 80, as on EKS. Workloads reach it using the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variable, passing their projected token in the `Authorization` header (`Authorization: <token>` or `Authorization: Bearer <token>`).
+
+Every request arrives from the node's address, so the token is the only thing that tells callers apart. Floci routes the endpoint whenever the webhook is on, whether or not the `eks-pod-identity-agent` addon is installed. The rules are rebuilt when Floci starts or adopts a cluster, so they follow Floci to a new address.
 
 The credentials endpoint performs the following validations:
 1. Validates token format and extracts the issuer URL without verifying signatures yet.
@@ -206,7 +208,7 @@ The credentials endpoint performs the following validations:
 
 #### TLS is required
 
-Kubernetes only accepts an `https` `clientConfig.url` on a `MutatingWebhookConfiguration`, together with a `caBundle` the API server trusts. Floci serves HTTP with the default `floci.tls.enabled=false`, so the webhook is skipped with a warning in that case and pods start unmutated. Set `FLOCI_TLS_ENABLED=true` to get injection; the `caBundle` is then Floci's local CA, the same one served at `GET /_floci/ca.pem`.
+Kubernetes only accepts an `https` `clientConfig.url` on a `MutatingWebhookConfiguration`, together with a `caBundle` the API server trusts. Floci serves HTTP with the default `floci.tls.enabled=false`, so the webhook is skipped with a warning in that case, pods start unmutated and `169.254.170.23` is not routed. Set `FLOCI_TLS_ENABLED=true` to get injection; the `caBundle` is then Floci's local CA, the same one served at `GET /_floci/ca.pem`.
 
 The webhook URL uses the hostname containers reach Floci on. When Floci runs natively that is `host.docker.internal`, which the self-signed certificate covers. When Floci itself runs in a container the hostname is its container IP, which the self-signed certificate does not cover by default, so the API server rejects the handshake. Pods still start, unmutated. Add that IP with `FLOCI_TLS_EXTRA_SANS` (for example from the pod IP through the downward API), or point `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` at a name the certificate covers (add it with `FLOCI_HOSTNAME`).
 
@@ -715,9 +717,9 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_EBS_CSI_PORT` | `4591` | Port Floci serves the EBS CSI driver on; cluster nodes reach it on the Docker host address |
 | `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Start k3s without its service load balancer and give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
-| `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
+| `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials, and route the pod identity endpoint (`169.254.170.23`) on each node to Floci. Needs `FLOCI_TLS_ENABLED=true` |
 | `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |
-| `FLOCI_SERVICES_EKS_IMDS` | `false` | Enable link-local IMDS (`169.254.169.254`) proxy in cluster containers |
+| `FLOCI_SERVICES_EKS_IMDS` | `false` | Route link-local IMDS (`169.254.169.254`) in cluster containers to Floci's IMDS server |
 | `FLOCI_SERVICES_EKS_EMBEDDED_DNS` | `true` | Inject Floci's embedded DNS server into cluster containers for Route 53 private hosted zones and internal name resolution |
 | `FLOCI_SERVICES_EKS_VPC_ROUTE_PROGRAMMING` | `true` | Program emulated VPC route table entries into k3s cluster containers |
 
@@ -874,7 +876,7 @@ services:
 ## Instance Metadata Service (IMDS)
 The cluster container is registered as a synthesized EC2 instance node (image `ami-eks-k3s`) regardless of whether IMDS is enabled, making it visible to the EC2 service (`DescribeInstances`, `DescribeInstanceStatus`, volume attachments, tagging). Its instance type is the same type used for the container limits.
 
-When IMDS is enabled (`FLOCI_SERVICES_EKS_IMDS=true`), each k3s cluster container exposes the AWS Instance Metadata Service on the link-local address `169.254.169.254:80`. Inside the container, Floci adds `169.254.169.254/32` to the loopback interface (`lo`) and runs a lightweight `socat` TCP relay forwarding metadata requests to Floci's IMDS server.
+When IMDS is enabled (`FLOCI_SERVICES_EKS_IMDS=true`), each k3s cluster container exposes the AWS Instance Metadata Service on the link-local address `169.254.169.254:80`. Floci adds iptables DNAT rules to the container's `nat` table that send that address to Floci's IMDS server (`FLOCI_SERVICES_EC2_IMDS_PORT`) and masquerade the traffic, so every request reaches Floci from the node's address and is answered as that node's instance. Nothing is installed or run in the container.
 
 Both IMDSv1 and IMDSv2 (`PUT /latest/api/token`) are supported. The cluster container is registered as a synthesized EC2 instance node associated with the cluster's IAM role:
 
@@ -890,23 +892,23 @@ curl -s -H "x-aws-ec2-metadata-token: $TOKEN" \
 
 ### Reachability and network namespaces
 
-The link-local proxy attaches to the loopback interface of the k3s container network namespace (the node network namespace).
+The rules live in three chains Floci owns, each jumped to first: `FLOCI-LINK-LOCAL-OUTPUT` in `OUTPUT`, `FLOCI-LINK-LOCAL` in `PREROUTING` and `FLOCI-LINK-LOCAL-SNAT` in `POSTROUTING`.
 
-- **Reachable from node network namespace:** Workloads configured with `hostNetwork: true` share the node network namespace and can reach `169.254.169.254:80`. This allows local testing of host-network security policies, intrusion-detection rules, and credential exfiltration defenses.
-- **Default isolation for ordinary pods:** By default, pods running in separate pod network namespaces cannot reach `169.254.169.254`. CNI portmap rules on the node intercept local traffic, preserving node credential isolation for multi-tenant or untrusted workloads.
-- **Opt-in pod network routing:** When `floci.services.eks.imds-pod-network=true` is set alongside `floci.services.eks.imds=true`, iptables DNAT rules are programmed in a custom `FLOCI-LINK-LOCAL` chain at the head of `PREROUTING`. Traffic originating from the pod CIDR (`10.42.0.0/16`) targeting `169.254.169.254:80` matches first and is routed directly to the local node listener, preempting CNI portmap rules. This enables standard AWS SDK credential resolution inside ordinary pods without requiring `hostNetwork: true`.
+- **Reachable from node network namespace:** The `OUTPUT` rule covers the k3s container network namespace (the node network namespace), so workloads configured with `hostNetwork: true` can reach `169.254.169.254:80`. This allows local testing of host-network security policies, intrusion-detection rules, and credential exfiltration defenses.
+- **Default isolation for ordinary pods:** By default, traffic from pods in their own network namespaces to `169.254.169.254` is not routed to Floci, so they get no answer from Floci's IMDS, preserving node credential isolation for multi-tenant or untrusted workloads.
+- **Opt-in pod network routing:** When `floci.services.eks.imds-pod-network=true` is set alongside `floci.services.eks.imds=true`, the `FLOCI-LINK-LOCAL` chain at the head of `PREROUTING` also sends traffic from the pod CIDR (`10.42.0.0/16`) to `169.254.169.254:80` to Floci, ahead of the CNI portmap and kube-proxy rules. Every pod on the node is answered as the node's instance, as on EC2. This enables standard AWS SDK credential resolution inside ordinary pods without requiring `hostNetwork: true`.
 
 ### Configuration
 
-IMDS proxy initialization is disabled by default (`floci.services.eks.imds=false`). Set `FLOCI_SERVICES_EKS_IMDS=true` to enable the proxy setup inside the k3s container.
+IMDS routing is disabled by default (`floci.services.eks.imds=false`). Set `FLOCI_SERVICES_EKS_IMDS=true` to route the address inside the k3s container.
 
-Pod network reachability is also disabled by default (`floci.services.eks.imds-pod-network=false`) to maintain pod isolation. Set `FLOCI_SERVICES_EKS_IMDS_POD_NETWORK=true` together with `FLOCI_SERVICES_EKS_IMDS=true` to route pod traffic to the link-local proxy.
+Pod network reachability is also disabled by default (`floci.services.eks.imds-pod-network=false`) to maintain pod isolation. Set `FLOCI_SERVICES_EKS_IMDS_POD_NETWORK=true` together with `FLOCI_SERVICES_EKS_IMDS=true` to route pod traffic to Floci's IMDS server.
 
-A failure to configure the proxy (for example on custom minimal images lacking network utilities) logs a warning and allows cluster startup to continue.
+A failure to program the rules (for example a node image without `iptables`, or a Floci address the node cannot resolve) logs a warning and allows cluster startup to continue.
 
 ### Hop limits
 
-EC2 metadata options store `HttpPutResponseHopLimit`, but the userspace TCP proxy relay terminates the incoming connection and opens a new connection to Floci, regenerating the IP packet TTL. Hop limits are recorded on the instance metadata options model but are not enforced by the userspace proxy.
+EC2 metadata options store `HttpPutResponseHopLimit`, but Floci's IMDS server does not check the IP TTL of the requests it receives. Hop limits are recorded on the instance metadata options model but are not enforced, so a pod reaches IMDS through the pod network routing whatever the hop limit.
 
 ## IRSA (IAM Roles for Service Accounts)
 

@@ -117,6 +117,7 @@ class EksImdsDockerIntegrationTest {
                 "command -v curl >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 || apk add --no-cache curl iptables iproute2"});
 
         eksClusterManager.configureLinkLocalMetadataEndpoint(cluster, containerId);
+        eksClusterManager.configureLinkLocalRouting(cluster, containerId);
 
         // IMDSv2 token test
         String tokenCmd = "curl -s -f -X PUT http://169.254.169.254/latest/api/token -H 'x-aws-ec2-metadata-token-ttl-seconds: 21600'";
@@ -139,6 +140,7 @@ class EksImdsDockerIntegrationTest {
         // via the rules programmed for the pod CIDR (10.42.0.0/16).
         String podNetworkSetupCmd = """
                 set -e
+                sysctl -w net.ipv4.ip_forward=1
                 ip link add cni0 type bridge 2>/dev/null || true
                 ip addr add 10.42.0.1/24 dev cni0 2>/dev/null || true
                 ip link set cni0 up
@@ -151,13 +153,12 @@ class EksImdsDockerIntegrationTest {
                 ip netns exec pod-test ip link set eth0 up
                 ip netns exec pod-test ip route replace default via 10.42.0.1
 
-                # Stand-in CNI portmap rule: k3s/flannel installs CNI-HOSTPORT-DNAT matching dst-type LOCAL.
-                # Simulate a hostPort/ingress binding or redirect on port 80 that intercepts LOCAL traffic.
+                # Stand-in for a later PREROUTING nat rule (k3s adds CNI-HOSTPORT-DNAT) claiming port 80.
                 iptables -t nat -N CNI-HOSTPORT-DNAT 2>/dev/null || true
                 iptables -t nat -F CNI-HOSTPORT-DNAT 2>/dev/null || true
                 iptables -t nat -A CNI-HOSTPORT-DNAT -p tcp --dport 80 -j REDIRECT --to-ports 9999
-                iptables -t nat -D PREROUTING -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT 2>/dev/null || true
-                iptables -t nat -A PREROUTING -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT
+                iptables -t nat -D PREROUTING -j CNI-HOSTPORT-DNAT 2>/dev/null || true
+                iptables -t nat -A PREROUTING -j CNI-HOSTPORT-DNAT
                 """;
         execInContainer(containerId, new String[]{"sh", "-c", podNetworkSetupCmd});
 
@@ -176,9 +177,7 @@ class EksImdsDockerIntegrationTest {
             assertTrue(podIamInfo.contains(clusterName + "-node-profile"),
                     "Pod IAM info should contain instance profile: " + podIamInfo);
 
-            // Prove the FLOCI-LINK-LOCAL rule is strictly required:
-            // Temporarily detach FLOCI-LINK-LOCAL from PREROUTING. The pod request now hits CNI-HOSTPORT-DNAT
-            // and fails because port 80 is redirected to 9999.
+            // Without FLOCI-LINK-LOCAL ahead of it, the stand-in redirects the pod request to a closed port.
             execInContainer(containerId, new String[]{"sh", "-c",
                     "iptables -t nat -D PREROUTING -j FLOCI-LINK-LOCAL"});
             ContainerExec.Result intercepted = execInContainerWithExitCode(containerId, new String[]{"sh", "-c",
@@ -197,7 +196,7 @@ class EksImdsDockerIntegrationTest {
                     ip netns del pod-test 2>/dev/null || true
                     ip link del cni0 2>/dev/null || true
                     iptables -t nat -D PREROUTING -j FLOCI-LINK-LOCAL 2>/dev/null || true
-                    iptables -t nat -D PREROUTING -m addrtype --dst-type LOCAL -j CNI-HOSTPORT-DNAT 2>/dev/null || true
+                    iptables -t nat -D PREROUTING -j CNI-HOSTPORT-DNAT 2>/dev/null || true
                     iptables -t nat -F CNI-HOSTPORT-DNAT 2>/dev/null || true
                     iptables -t nat -X CNI-HOSTPORT-DNAT 2>/dev/null || true
                     """});

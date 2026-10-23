@@ -20,6 +20,7 @@ import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
 import com.github.dockerjava.api.model.NetworkSettings;
+import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -90,6 +91,7 @@ import java.util.logging.Level;
 import java.util.logging.LogRecord;
 
 import static io.github.hectorvent.floci.testing.InlineMocks.inlineMock;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -1404,7 +1406,7 @@ class EksClusterManagerTest {
 
             metadataServer = Mockito.mock(Ec2MetadataServer.class);
             dockerHostResolver = Mockito.mock(DockerHostResolver.class);
-            when(dockerHostResolver.resolve()).thenReturn("floci-host");
+            when(dockerHostResolver.resolve()).thenReturn("172.17.0.9");
 
             regionResolver = Mockito.mock(RegionResolver.class);
             when(regionResolver.getAccountId()).thenReturn("000000000000");
@@ -1593,48 +1595,45 @@ class EksClusterManagerTest {
         }
 
         @Test
-        void configuresMetadataProxyWhenEnabled() {
+        void registersTheNodeWithTheMetadataServerWithoutInstallingAnythingOnIt() {
             Cluster cluster = new Cluster();
             cluster.setName("test-cluster");
 
             manager.configureLinkLocalMetadataEndpoint(cluster, "container-42");
 
             verify(metadataServer).reconcileContainerAddresses(any(), any());
-            // imds=true, imdsPodNetwork=false (default): 2 commands (install probe, start proxy)
-            assertEquals(2, capturedCmds.size());
-            // First command: install probe
-            assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
-            // Second command: start command with 169.254.169.254
-            assertTrue(capturedCmds.get(1)[2].contains("169.254.169.254"));
-            assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:9169"));
-
+            assertTrue(capturedCmds.isEmpty(), "the node needs no package or relay process for IMDS");
             assertNotNull(manager.getRegisteredClusterNodeInstance(cluster));
         }
 
         @Test
-        void configuresPodNetworkRoutingWhenImdsPodNetworkEnabled() {
+        void routesImdsToFlociFromTheNodeOnlyByDefault() {
+            Cluster cluster = new Cluster();
+            cluster.setName("test-cluster");
+
+            manager.configureLinkLocalRouting(cluster, "container-42");
+
+            assertEquals(1, capturedCmds.size());
+            assertArrayEquals(EksPodNetworkRouting.buildRoutingCommand(EksPodNetworkRouting.DEFAULT_POD_CIDR,
+                    List.of(new EksPodNetworkRouting.Route(EksPodNetworkRouting.IMDS_ENDPOINT, "172.17.0.9", 9169,
+                            false))), capturedCmds.getFirst());
+        }
+
+        @Test
+        void routesImdsToFlociFromPodsTooWhenImdsPodNetworkEnabled() {
             when(eks.imdsPodNetwork()).thenReturn(true);
 
             Cluster cluster = new Cluster();
             cluster.setName("test-cluster");
 
-            manager.configureLinkLocalMetadataEndpoint(cluster, "container-42");
+            manager.configureLinkLocalRouting(cluster, "container-42");
 
-            verify(metadataServer).reconcileContainerAddresses(any(), any());
-            assertEquals(3, capturedCmds.size());
-            // First command: install probe
-            assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
-            // Second command: start command with 169.254.169.254
-            assertTrue(capturedCmds.get(1)[2].contains("169.254.169.254"));
-            assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:9169"));
-            // Third command: pod network routing with iptables
-            assertTrue(capturedCmds.get(2)[2].contains("FLOCI-LINK-LOCAL"));
-            assertTrue(capturedCmds.get(2)[2].contains("10.42.0.0/16"));
-            assertTrue(capturedCmds.get(2)[2].contains("169.254.169.254"));
-            assertFalse(capturedCmds.get(2)[2].contains("169.254.170.23"),
-                    "IMDS pod routing must not route Pod Identity traffic");
-
-            assertNotNull(manager.getRegisteredClusterNodeInstance(cluster));
+            assertEquals(1, capturedCmds.size());
+            assertArrayEquals(EksPodNetworkRouting.buildRoutingCommand(EksPodNetworkRouting.DEFAULT_POD_CIDR,
+                    List.of(new EksPodNetworkRouting.Route(EksPodNetworkRouting.IMDS_ENDPOINT, "172.17.0.9", 9169,
+                            true))), capturedCmds.getFirst());
+            assertFalse(capturedCmds.getFirst()[2].contains("169.254.170.23"),
+                    "IMDS routing must not route Pod Identity traffic while pod identity is off");
         }
 
         @Test
@@ -1646,6 +1645,7 @@ class EksClusterManagerTest {
             cluster.setName("test-cluster");
 
             manager.configureLinkLocalMetadataEndpoint(cluster, "container-42");
+            manager.configureLinkLocalRouting(cluster, "container-42");
 
             verifyNoInteractions(metadataServer);
             verifyNoInteractions(dockerClient);
@@ -1841,14 +1841,13 @@ class EksClusterManagerTest {
         }
 
         @Test
-        void failureToWireLogsAndDoesNotAbort() {
+        void failureToRouteLogsAndDoesNotAbort() {
             when(dockerClient.execCreateCmd(anyString())).thenThrow(new RuntimeException("docker exec failed"));
 
             Cluster cluster = new Cluster();
             cluster.setName("test-cluster");
 
-            // Failure to wire proxy should log warning and continue without throwing
-            manager.configureLinkLocalMetadataEndpoint(cluster, "container-42");
+            assertDoesNotThrow(() -> manager.configureLinkLocalRouting(cluster, "container-42"));
         }
 
         @Test
@@ -1857,18 +1856,17 @@ class EksClusterManagerTest {
 
             InspectExecCmd inspectExec = Mockito.mock(InspectExecCmd.class);
             InspectExecResponse inspectResponse = Mockito.mock(InspectExecResponse.class);
-            // Simulate install and start succeeding (0), but routing failing (1)
-            when(inspectResponse.getExitCodeLong()).thenReturn(0L, 0L, 1L);
+            when(inspectResponse.getExitCodeLong()).thenReturn(1L);
             when(inspectExec.exec()).thenReturn(inspectResponse);
             when(dockerClient.inspectExecCmd(anyString())).thenReturn(inspectExec);
 
             Cluster cluster = new Cluster();
             cluster.setName("test-cluster");
 
-            // Pod network routing failure logs warning and continues without throwing
             manager.configureLinkLocalMetadataEndpoint(cluster, "container-42");
+            assertDoesNotThrow(() -> manager.configureLinkLocalRouting(cluster, "container-42"));
 
-            assertEquals(3, capturedCmds.size());
+            assertEquals(1, capturedCmds.size());
             assertNotNull(manager.getRegisteredClusterNodeInstance(cluster));
         }
 
@@ -1921,7 +1919,7 @@ class EksClusterManagerTest {
     }
 
     @Nested
-    class ConfigurePodIdentityRelay {
+    class RoutePodIdentityEndpoint {
 
         private EmulatorConfig config;
         private EmulatorConfig.EksServiceConfig eks;
@@ -1931,6 +1929,7 @@ class EksClusterManagerTest {
         private DockerHostResolver dockerHostResolver;
         private EksClusterManager manager;
         private List<String[]> capturedCmds;
+        private String nodeResolvesTo;
 
         @BeforeEach
         void setUp() {
@@ -1950,7 +1949,8 @@ class EksClusterManagerTest {
             when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
 
             dockerHostResolver = Mockito.mock(DockerHostResolver.class);
-            when(dockerHostResolver.resolve()).thenReturn("floci-host");
+            when(dockerHostResolver.resolve()).thenReturn("host.docker.internal");
+            nodeResolvesTo = "192.168.65.254\n";
 
             capturedCmds = new ArrayList<>();
             ExecCreateCmd execCreate = Mockito.mock(ExecCreateCmd.class, Mockito.withSettings().defaultAnswer(Mockito.RETURNS_SELF));
@@ -1972,6 +1972,9 @@ class EksClusterManagerTest {
             when(dockerClient.execStartCmd(anyString())).thenReturn(execStart);
             when(execStart.exec(any())).thenAnswer(inv -> {
                 ResultCallback<Frame> cb = inv.getArgument(0);
+                if (EksPodNetworkRouting.RESOLVE_SCRIPT.equals(capturedCmds.getLast()[2])) {
+                    cb.onNext(new Frame(StreamType.STDOUT, nodeResolvesTo.getBytes(StandardCharsets.UTF_8)));
+                }
                 cb.onComplete();
                 return cb;
             });
@@ -1989,44 +1992,91 @@ class EksClusterManagerTest {
                     config, Mockito.mock(RegionResolver.class), null);
         }
 
-        @Test
-        void configuresRelayWhenPodIdentityEnabled() {
-            Cluster cluster = new Cluster();
-            cluster.setName("test-cluster");
-
-            manager.configurePodIdentityRelay(cluster, "cid-1");
-
-            assertEquals(3, capturedCmds.size());
-            assertTrue(capturedCmds.get(0)[2].contains("command -v socat"));
-            assertTrue(capturedCmds.get(1)[2].contains("169.254.170.23"));
-            assertTrue(capturedCmds.get(1)[2].contains("TCP:floci-host:4566"));
-            assertTrue(capturedCmds.get(1)[2].contains("floci-pod-identity-proxy.pid"));
-            assertTrue(capturedCmds.get(2)[2].contains("FLOCI-LINK-LOCAL"));
-            assertTrue(capturedCmds.get(2)[2].contains("169.254.170.23"));
-            assertFalse(capturedCmds.get(2)[2].contains("169.254.169.254"),
-                    "Pod identity relay must not route IMDS traffic");
+        private String[] podIdentityRouteTo(String flociIp) {
+            return EksPodNetworkRouting.buildRoutingCommand(EksPodNetworkRouting.DEFAULT_POD_CIDR, List.of(
+                    new EksPodNetworkRouting.Route(EksPodNetworkRouting.POD_IDENTITY_ENDPOINT, flociIp, 4566, true)));
         }
 
         @Test
-        void skipsRelayWhenPodIdentityDisabled() {
+        void routesTheEndpointToFlociAtTheAddressTheNodeResolves() {
+            Cluster cluster = new Cluster();
+            cluster.setName("test-cluster");
+
+            manager.configureLinkLocalRouting(cluster, "cid-1");
+
+            assertEquals(2, capturedCmds.size());
+            assertArrayEquals(EksPodNetworkRouting.buildResolveCommand("host.docker.internal"), capturedCmds.get(0));
+            assertArrayEquals(podIdentityRouteTo("192.168.65.254"), capturedCmds.get(1));
+            assertFalse(capturedCmds.get(1)[2].contains("169.254.169.254"),
+                    "pod identity routing must not route IMDS traffic while IMDS is off");
+        }
+
+        @Test
+        void routesToAFlociAddressWithoutResolvingIt() {
+            when(dockerHostResolver.resolve()).thenReturn("172.17.0.4");
+
+            Cluster cluster = new Cluster();
+            cluster.setName("test-cluster");
+
+            manager.configureLinkLocalRouting(cluster, "cid-1");
+
+            assertEquals(1, capturedCmds.size());
+            assertArrayEquals(podIdentityRouteTo("172.17.0.4"), capturedCmds.getFirst());
+        }
+
+        @Test
+        void routesImdsAndPodIdentityInOneRuleSet() {
+            EmulatorConfig.Ec2ServiceConfig ec2 = Mockito.mock(EmulatorConfig.Ec2ServiceConfig.class);
+            when(config.services().ec2()).thenReturn(ec2);
+            when(ec2.imdsPort()).thenReturn(9169);
+            when(eks.imds()).thenReturn(true);
+            when(eks.imdsPodNetwork()).thenReturn(true);
+
+            Cluster cluster = new Cluster();
+            cluster.setName("test-cluster");
+
+            manager.configureLinkLocalRouting(cluster, "cid-1");
+
+            assertEquals(2, capturedCmds.size());
+            assertArrayEquals(EksPodNetworkRouting.buildRoutingCommand(EksPodNetworkRouting.DEFAULT_POD_CIDR, List.of(
+                    new EksPodNetworkRouting.Route(EksPodNetworkRouting.IMDS_ENDPOINT, "192.168.65.254", 9169, true),
+                    new EksPodNetworkRouting.Route(EksPodNetworkRouting.POD_IDENTITY_ENDPOINT, "192.168.65.254",
+                            4566, true))), capturedCmds.get(1));
+        }
+
+        @Test
+        void doesNotRouteWhenTheNodeCannotResolveFloci() {
+            nodeResolvesTo = "";
+
+            Cluster cluster = new Cluster();
+            cluster.setName("test-cluster");
+
+            assertDoesNotThrow(() -> manager.configureLinkLocalRouting(cluster, "cid-1"));
+
+            assertEquals(1, capturedCmds.size());
+            assertArrayEquals(EksPodNetworkRouting.buildResolveCommand("host.docker.internal"), capturedCmds.getFirst());
+        }
+
+        @Test
+        void skipsRoutingWhenPodIdentityDisabled() {
             when(eks.podIdentityWebhook()).thenReturn(false);
 
             Cluster cluster = new Cluster();
             cluster.setName("test-cluster");
 
-            manager.configurePodIdentityRelay(cluster, "cid-1");
+            manager.configureLinkLocalRouting(cluster, "cid-1");
 
             assertTrue(capturedCmds.isEmpty());
         }
 
         @Test
-        void skipsRelayWhenTlsDisabled() {
+        void skipsRoutingWhenTlsDisabled() {
             when(tls.enabled()).thenReturn(false);
 
             Cluster cluster = new Cluster();
             cluster.setName("test-cluster");
 
-            manager.configurePodIdentityRelay(cluster, "cid-1");
+            manager.configureLinkLocalRouting(cluster, "cid-1");
 
             assertTrue(capturedCmds.isEmpty());
         }
@@ -2042,7 +2092,8 @@ class EksClusterManagerTest {
             Cluster cluster = new Cluster();
             cluster.setName("test-cluster");
 
-            assertDoesNotThrow(() -> manager.configurePodIdentityRelay(cluster, "cid-1"));
+            assertDoesNotThrow(() -> manager.configureLinkLocalRouting(cluster, "cid-1"));
+            assertEquals(2, capturedCmds.size());
         }
     }
 

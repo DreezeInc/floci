@@ -158,9 +158,9 @@ class EksPodIdentityDockerIntegrationTest {
         containerId = lifecycleManager.createAndStart(spec).containerId();
         assertNotNull(containerId, "Container ID must not be null");
 
-        execInContainer(containerId, "command -v curl >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 || apk add --no-cache curl iptables iproute2");
+        execInContainer(containerId, "command -v curl >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1 || apk add --no-cache curl iptables");
 
-        eksClusterManager.configurePodIdentityRelay(cluster, containerId);
+        eksClusterManager.configureLinkLocalRouting(cluster, containerId);
 
         String validToken = oidcService.mintServiceAccountToken(clusterName, issuer, "default", "workload-sa",
                 "pods.eks.amazonaws.com", 3600);
