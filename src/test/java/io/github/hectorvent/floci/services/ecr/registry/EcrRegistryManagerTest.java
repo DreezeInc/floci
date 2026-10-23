@@ -283,8 +283,33 @@ class EcrRegistryManagerTest {
     @Test
     void httpClient_usesRegistryContainerDnsWhenRunningInsideDocker() {
         when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(currentContainerNetworkResolver.resolveNetworkName()).thenReturn(Optional.of("floci-net"));
 
         assertEquals("http://" + REGISTRY_NAME + ":5000", manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void httpClient_usesRegistryContainerDnsOnTheConfiguredNetwork() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(ecr.dockerNetwork()).thenReturn(Optional.of("shared-net"));
+
+        assertEquals("http://" + REGISTRY_NAME + ":5000", manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void httpClient_usesThePublishedLoopbackPortWhenTheDaemonDoesNotRunFlocisContainer() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(currentContainerNetworkResolver.resolveNetworkName()).thenReturn(Optional.empty());
+
+        assertEquals("http://localhost:" + BASE_PORT, manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void httpClient_usesThePublishedLoopbackPortOutsideAContainer() {
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(ecr.dockerNetwork()).thenReturn(Optional.of("shared-net"));
+
+        assertEquals("http://localhost:" + BASE_PORT, manager.httpClient().baseUrl());
     }
 
     @Test
@@ -375,6 +400,7 @@ class EcrRegistryManagerTest {
     @Test
     void httpClient_usesNamespacedRegistryContainerDnsWhenConfigured() {
         when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(currentContainerNetworkResolver.resolveNetworkName()).thenReturn(Optional.of("floci-net"));
         when(docker.resourceNamespace()).thenReturn(Optional.of("run/one"));
 
         assertEquals("http://floci-aws-run-one-test-ecr-registry:5000", manager.httpClient().baseUrl());

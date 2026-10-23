@@ -228,9 +228,14 @@ public class EcrRegistryManager {
         return "http://" + name + ":" + CONTAINER_INTERNAL_PORT;
     }
 
-    /** Returns a {@link RegistryHttpClient} bound to the current registry endpoint. */
+    /**
+     * Returns a {@link RegistryHttpClient} bound to the current registry endpoint: the container
+     * name when Floci runs in a container on the registry's Docker network, and otherwise the
+     * published loopback port, which also serves a Docker daemon that shares Floci's network
+     * namespace without running Floci's container, such as a sidecar daemon in the same pod.
+     */
     public RegistryHttpClient httpClient() {
-        if (containerDetector.isRunningInContainer()) {
+        if (containerDetector.isRunningInContainer() && resolveRegistryDockerNetwork().isPresent()) {
             return new RegistryHttpClient(internalEndpoint());
         }
         return new RegistryHttpClient("http://localhost:" + effectivePort());
