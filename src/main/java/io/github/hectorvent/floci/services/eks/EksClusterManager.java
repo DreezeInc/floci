@@ -186,6 +186,7 @@ public class EksClusterManager
     private static final long K3S_PLATFORM_RBAC_WAIT_MILLIS = 60_000;
     private static final long K3S_PLATFORM_RBAC_POLL_MILLIS = 500;
     private static final int K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS = 15;
+    private static final Duration REPLACED_NODE_EXIT_WAIT = Duration.ofSeconds(120);
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -963,7 +964,7 @@ public class EksClusterManager
         try {
             docker.renameContainerCmd(oldId).withName(backupName).exec();
             renamed = true;
-            docker.stopContainerCmd(oldId).exec();
+            stopReplacedNode(docker, oldId);
             unregisterMetadataEndpoint(cluster);
             closeQuietly(clusterLogHandles.remove(clusterResourceName(cluster)));
             cluster.setContainerId(null);
@@ -996,6 +997,22 @@ public class EksClusterManager
                     cluster.getName(), cleanup.getMessage());
         }
         return true;
+    }
+
+    /**
+     * Docker can fail a stop because the k3s node's exit event comes late, while the node is
+     * already exiting. Such a node is not adopted again: the replacement waits for it to exit.
+     */
+    private void stopReplacedNode(DockerClient docker, String containerId) {
+        try {
+            docker.stopContainerCmd(containerId).exec();
+        } catch (RuntimeException stop) {
+            if (!lifecycleManager.awaitNotRunning(containerId, REPLACED_NODE_EXIT_WAIT)) {
+                throw stop;
+            }
+            LOG.infov("EKS node container {0} exited after Docker reported a failed stop: {1}",
+                    containerId, stop.getMessage());
+        }
     }
 
     private static void restorePreviousNodeType(Cluster cluster, String previousType) {

@@ -14,6 +14,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -89,6 +90,23 @@ class ContainerLifecycleManagerLivenessTest {
         when(inspectCmd.exec()).thenThrow(new UncheckedIOException(new IOException("Broken pipe")));
 
         assertEquals(ContainerLiveness.UNKNOWN, manager.probeContainer("c1"));
+    }
+
+    @Test
+    void awaitNotRunningReturnsOnceTheContainerStops() {
+        InspectContainerResponse running = inspectResponse(true);
+        InspectContainerResponse stopped = inspectResponse(false);
+        when(inspectCmd.exec()).thenReturn(running, stopped);
+
+        assertTrue(manager.awaitNotRunning("c1", Duration.ofSeconds(30)));
+    }
+
+    @Test
+    void awaitNotRunningGivesUpOnAContainerStillRunningAtTheDeadline() {
+        InspectContainerResponse response = inspectResponse(true);
+        when(inspectCmd.exec()).thenReturn(response);
+
+        assertFalse(manager.awaitNotRunning("c1", Duration.ZERO));
     }
 
     @Test

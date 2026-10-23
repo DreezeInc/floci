@@ -16,6 +16,7 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.InspectVolumeCmd;
+import com.github.dockerjava.api.exception.InternalServerErrorException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
@@ -971,6 +972,47 @@ class EksClusterManagerTest {
             verify(portAllocator, never()).allocate(6440, 6499);
             verify(portAllocator, never()).release(6441);
             verify(lifecycleManager, never()).removeVolume(anyString());
+        }
+
+        @Test
+        void replacementWaitsForANodeWhoseStopMissedTheExitEvent() {
+            when(dockerClient.stopContainerCmd("cid-old").exec()).thenThrow(new InternalServerErrorException(
+                    "cannot stop container: cid-old: tried to kill container, but did not receive an exit event"));
+            when(lifecycleManager.awaitNotRunning(eq("cid-old"), any())).thenReturn(true);
+            when(lifecycleManager.create(any())).thenReturn("cid-new");
+            when(lifecycleManager.startCreated(any(), any()))
+                    .thenReturn(new ContainerInfo("cid-new", Map.of()));
+            Cluster cluster = cluster();
+            cluster.setDockerName("floci-eks-demo");
+            cluster.setContainerId("cid-old");
+            cluster.setHostPort(6441);
+            cluster.setNodeInstanceType("t3.medium");
+
+            assertTrue(manager.restartForNodeCapacity(cluster, "m5.large"));
+
+            assertEquals("cid-new", cluster.getContainerId());
+            assertEquals("t3.medium", cluster.getNodeInstanceType());
+            verify(lifecycleManager, never()).adopt(anyString(), any());
+        }
+
+        @Test
+        void aNodeStillRunningAfterAFailedStopIsRestored() {
+            when(dockerClient.stopContainerCmd("cid-old").exec()).thenThrow(new InternalServerErrorException(
+                    "cannot stop container: cid-old: tried to kill container, but did not receive an exit event"));
+            when(lifecycleManager.awaitNotRunning(eq("cid-old"), any())).thenReturn(false);
+            when(lifecycleManager.adopt("cid-old", List.of(6443)))
+                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(6443, 6441)));
+            Cluster cluster = cluster();
+            cluster.setDockerName("floci-eks-demo");
+            cluster.setContainerId("cid-old");
+            cluster.setHostPort(6441);
+            cluster.setNodeInstanceType("t3.medium");
+
+            assertFalse(manager.restartForNodeCapacity(cluster, "m5.large"));
+
+            assertEquals("cid-old", cluster.getContainerId());
+            assertEquals("m5.large", cluster.getNodeInstanceType());
+            verify(lifecycleManager, never()).create(any());
         }
 
         @Test
