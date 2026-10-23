@@ -682,13 +682,26 @@ For workloads written for EBS, set `floci.services.eks.emulate-ebs-storage: true
 
 The gp2 StorageClass names the CSI driver rather than the in-tree `kubernetes.io/aws-ebs` EKS ships: CSI migration makes the controller manager annotate every in-tree EBS claim for `ebs.csi.aws.com`, and an external provisioner only serves classes that name it. Both `Immediate` and `WaitForFirstConsumer` binding work. Volumes carry no topology, so a PV does not pin its pods to a zone. Raw block volumes, multi-node access modes, volume expansion and CSI VolumeSnapshots are not supported.
 
+#### k3s platform objects
+
+k3s applies the manifests packaged with it on every server start. Two of them create RBAC that an EKS cluster does not have, bound to subjects without a reserved prefix such as `system:` or `eks:`:
+
+- `rolebindings`: the ClusterRoleBinding `kube-apiserver-kubelet-admin` (User `kube-apiserver`), and a ClusterRole and ClusterRoleBinding each named `system:k3s-controller` and `clustercidrs-node`.
+- `ccm`: the ClusterRole `k3s-cloud-controller-manager`, the ClusterRoleBindings `k3s-cloud-controller-manager` and `k3s-cloud-controller-manager-auth-delegator`, and the RoleBinding `kube-system/k3s-cloud-controller-manager-authentication-reader` (User `k3s-cloud-controller-manager`).
+
+Before a cluster turns `ACTIVE`, on creation and on every start Floci drives, Floci labels every object of these two manifests `kubernetes.io/bootstrapping: rbac-defaults`, the label the API server puts on its own bootstrap policy. Tools that tell platform RBAC from customer RBAC by that label then treat them as the platform's. k3s reconciles these objects on every start, as the API server does its defaults, and its merge keeps a label that its manifest does not set, so the label also survives a restart of the cluster container. Subjects and client certificate identities stay as k3s issues them.
+
+With `load-balancer-services: true`, new clusters run without k3s's cloud controller manager, so the `ccm` objects do not exist. The kubelet then sets the node's addresses itself: the `Hostname` address is the node name rather than the container ID, and the node carries no `node.kubernetes.io/instance-type: k3s` or `failure-domain.beta.kubernetes.io/*` labels. A node group still sets the instance type label. `floci:kube-cloud-controller-manager-arg:*` tags have no effect in this mode.
+
+New clusters also start k3s with `--disable=runtimes`: the RuntimeClasses it would create (`nvidia`, `crun`, `wasmedge` and others) have no EKS counterpart. A restored container keeps the k3s arguments it was created with.
+
 #### Load balancer targets
 
 The AWS Load Balancer Controller registers pod addresses as `ip` targets. Pod addresses exist only inside the cluster's k3s container, so the ELBv2 data plane cannot connect to them directly. When a request or a health check goes to an `ip` target, Floci looks for a running cluster in the target group's account, region and VPC whose pod CIDR holds the address. If it finds one, Floci adds an iptables DNAT rule in the `FLOCI-ELB-TARGETS` chain of the node container. The rule forwards one node port, from 20000 up, to the pod address and port. Floci then connects to that node port. Each pod address and port keeps its node port while Floci runs. Floci must be able to reach the node container's address, so it has to run in Docker or on a Linux host.
 
 #### Network load balancers for Services
 
-With `floci.services.eks.load-balancer-services: true` (or `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES=true`), Floci plays the EKS in-tree cloud provider for network load balancers. New clusters start k3s with `--disable=servicelb`, so k3s does not answer `LoadBalancer` Services with the node's own address. About every 10 seconds, Floci reads each running cluster's Services. Each `LoadBalancer` Service annotated `service.beta.kubernetes.io/aws-load-balancer-type: nlb`, with no `spec.loadBalancerClass`, gets the following in the cluster's account:
+With `floci.services.eks.load-balancer-services: true` (or `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES=true`), Floci plays the EKS in-tree cloud provider for network load balancers. New clusters start k3s with `--disable=servicelb`, so k3s does not answer `LoadBalancer` Services with the node's own address, and with `--disable-cloud-controller`, since servicelb runs inside k3s's cloud controller manager (see [k3s platform objects](#k3s-platform-objects)). About every 10 seconds, Floci reads each running cluster's Services. Each `LoadBalancer` Service annotated `service.beta.kubernetes.io/aws-load-balancer-type: nlb`, with no `spec.loadBalancerClass`, gets the following in the cluster's account:
 
 - **Load balancer:** a `network` load balancer named `a` plus the Service UID without dashes, cut to 32 characters. It is `internal` when `service.beta.kubernetes.io/aws-load-balancer-internal` is set to anything but `false`, and `internet-facing` otherwise.
 - **Subnets:** one subnet per Availability Zone from the cluster's VPC. Floci takes the subnets tagged `kubernetes.io/role/elb` (`kubernetes.io/role/internal-elb` for an internal one), or the cluster's own subnets when none is tagged. It skips subnets tagged for another cluster, and prefers a subnet tagged `kubernetes.io/cluster/<cluster>`, then the lowest subnet id.

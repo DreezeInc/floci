@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
@@ -79,6 +80,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -106,6 +108,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
@@ -383,13 +386,24 @@ class EksClusterManagerTest {
     }
 
     @Test
-    void serverArgsDisableServiceLoadBalancerOnlyWhenFlociServesLoadBalancers() {
-        assertFalse(EksClusterManager.buildServerArgs(false).contains("--disable=servicelb"));
+    void serverArgsDisableServiceLoadBalancerAndCloudControllerOnlyWhenFlociServesLoadBalancers() {
+        List<String> defaults = EksClusterManager.buildServerArgs(false);
+        assertFalse(defaults.contains("--disable=servicelb"));
+        assertFalse(defaults.contains("--disable-cloud-controller"));
 
         List<String> args = EksClusterManager.buildServerArgs(false, false, true, null, null, Optional.empty());
 
         assertTrue(args.contains("--disable=servicelb"));
+        assertTrue(args.contains("--disable-cloud-controller"));
         assertTrue(args.contains("--disable=traefik"));
+    }
+
+    @Test
+    void serverArgsAlwaysDisableK3sRuntimeClasses() {
+        assertTrue(EksClusterManager.buildServerArgs(false).contains("--disable=runtimes"));
+        assertTrue(EksClusterManager.buildServerArgs(true).contains("--disable=runtimes"));
+        assertTrue(EksClusterManager.buildServerArgs(false, true, true, null, null, Optional.empty())
+                .contains("--disable=runtimes"));
     }
 
     @Test
@@ -4229,6 +4243,109 @@ class EksClusterManagerTest {
             assertTrue(manager.ensureAwsAuthNodeRoles(stopped, List.of(ROLE)));
             assertTrue(manager.ensureAwsAuthNodeRoles(cluster, List.of()));
             Mockito.verify(manager, Mockito.never()).execInContainerForResult(any(), any(), anyInt());
+        }
+    }
+
+    @Nested
+    class LabelK3sPlatformRbac {
+
+        private static final String CONTAINER = "rbac-container";
+        private static final String ADDON = "k3s.cattle.io/v1, Kind=Addon";
+        private static final String CHECKSUM = Digests.sha256Hex(EksK3sPlatformRbacTest.MANIFEST);
+        private EksClusterManager manager;
+        private final List<String[]> listings = new ArrayList<>();
+        private ArgumentCaptor<String[]> labels;
+
+        @BeforeEach
+        void setUp() {
+            EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+            EmulatorConfig.ServicesConfig services = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+            when(config.services()).thenReturn(services);
+            when(services.eks()).thenReturn(Mockito.mock(EmulatorConfig.EksServiceConfig.class));
+            manager = Mockito.spy(new EksClusterManager(Mockito.mock(ContainerBuilder.class),
+                    Mockito.mock(ContainerLifecycleManager.class), Mockito.mock(ContainerDetector.class),
+                    Mockito.mock(PortAllocator.class), Mockito.mock(DockerHostResolver.class),
+                    Mockito.mock(EcrRegistryManager.class), config, new RegionResolver("us-east-1", "000000000000"),
+                    Mockito.mock(Ec2MetadataServer.class), Mockito.mock(EksOidcService.class),
+                    inlineMock(FlociCertificateAuthority.class), Mockito.mock(ContainerLogStreamer.class),
+                    new InMemoryStorage<>()));
+            labels = ArgumentCaptor.forClass(String[].class);
+        }
+
+        private void listingReturns(ContainerExec.Result... results) {
+            Iterator<ContainerExec.Result> next = Arrays.asList(results).iterator();
+            doAnswer(invocation -> {
+                String[] command = invocation.getArgument(1);
+                if (Arrays.equals(command, EksK3sPlatformRbac.READ_ROLEBINDINGS_MANIFEST_COMMAND)) {
+                    return ok(EksK3sPlatformRbacTest.MANIFEST);
+                }
+                listings.add(command);
+                return next.hasNext() ? next.next() : results[results.length - 1];
+            }).when(manager).execInContainerForStdout(eq(CONTAINER), any(), anyInt());
+            doReturn(ok("labeled")).when(manager)
+                    .execInContainerForResult(eq(CONTAINER), labels.capture(), anyInt());
+        }
+
+        private static ContainerExec.Result ok(String stdout) {
+            return new ContainerExec.Result(0L, stdout, "", false);
+        }
+
+        private static String listing(String checksum, String bootstrapping) {
+            return EksK3sPlatformRbacTest.listing(
+                    EksK3sPlatformRbacTest.item("ClusterRoleBinding", "kube-apiserver-kubelet-admin", null,
+                            "rolebindings", ADDON, bootstrapping),
+                    EksK3sPlatformRbacTest.item("ClusterRoleBinding", "system:metrics-server", null,
+                            "resource-reader", ADDON, null),
+                    EksK3sPlatformRbacTest.rolebindingsAddon(checksum));
+        }
+
+        @Test
+        void labelsK3sRbacOnceItsRoleBindingsAreApplied() {
+            listingReturns(ok(listing(CHECKSUM, null)));
+
+            manager.labelK3sPlatformRbac(CONTAINER, "demo-cluster", 0);
+
+            assertEquals(1, listings.size());
+            assertArrayEquals(EksK3sPlatformRbac.LIST_COMMAND, listings.getFirst());
+            assertEquals(List.of(List.of("kubectl", "label", "--overwrite",
+                    "clusterrolebinding.rbac.authorization.k8s.io/kube-apiserver-kubelet-admin",
+                    "kubernetes.io/bootstrapping=rbac-defaults")),
+                    labels.getAllValues().stream().map(Arrays::asList).toList());
+        }
+
+        @Test
+        void waitsUntilK3sRecordsTheRoleBindingsChecksum() {
+            listingReturns(new ContainerExec.Result(1L, "", "the server is currently unable to handle the request",
+                    false), ok(listing("", null)), ok(listing(CHECKSUM, null)));
+
+            manager.labelK3sPlatformRbac(CONTAINER, "demo-cluster", 30_000);
+
+            assertEquals(3, listings.size());
+            assertEquals(1, labels.getAllValues().size());
+        }
+
+        @Test
+        void sendsNoLabelWhenEverythingIsAlreadyLabelled() {
+            listingReturns(ok(listing(CHECKSUM, "rbac-defaults")));
+
+            manager.labelK3sPlatformRbac(CONTAINER, "demo-cluster", 0);
+
+            assertEquals(1, listings.size());
+            assertTrue(labels.getAllValues().isEmpty());
+        }
+
+        @Test
+        void warnsAndGivesUpAtTheDeadline() {
+            listingReturns(ok(listing("", null)));
+
+            List<LogRecord> logs = LogCapture.capture(EksClusterManager.class,
+                    () -> manager.labelK3sPlatformRbac(CONTAINER, "demo-cluster", 0));
+
+            assertEquals(1, listings.size());
+            assertTrue(labels.getAllValues().isEmpty());
+            assertTrue(logs.stream().anyMatch(record -> record.getLevel().intValue() >= Level.WARNING.intValue()
+                            && String.valueOf(record.getMessage()).contains("reads as customer RBAC")),
+                    () -> logs.stream().map(LogRecord::getMessage).toList().toString());
         }
     }
 

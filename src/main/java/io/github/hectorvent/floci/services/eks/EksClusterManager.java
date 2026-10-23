@@ -183,6 +183,10 @@ public class EksClusterManager
     static final String AUDIT_LOG_MAXBACKUP = "10";
     static final String AUDIT_LOG_MAXSIZE = "100";
 
+    private static final long K3S_PLATFORM_RBAC_WAIT_MILLIS = 60_000;
+    private static final long K3S_PLATFORM_RBAC_POLL_MILLIS = 500;
+    private static final int K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS = 15;
+
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final ContainerDetector containerDetector;
@@ -1081,6 +1085,8 @@ public class EksClusterManager
                 cluster.setCertificateAuthority(new CertificateAuthority(caData.trim()));
             }
 
+            labelK3sPlatformRbac(containerId, cluster.getName(), K3S_PLATFORM_RBAC_WAIT_MILLIS);
+
             pruneLegacyClusterNodes(cluster, containerId);
 
             registerAllJoinedNodes(cluster, containerId);
@@ -1089,6 +1095,48 @@ public class EksClusterManager
         } catch (Exception e) {
             LOG.warnv("Could not extract kubeconfig for cluster {0}: {1}",
                     cluster.getName(), e.getMessage());
+        }
+    }
+
+    /** Waits for k3s's packaged RBAC so the cluster never turns ACTIVE before it is labelled. */
+    void labelK3sPlatformRbac(String containerId, String clusterName, long waitMillis) {
+        long deadline = System.currentTimeMillis() + waitMillis;
+        String lastFailure = "k3s has not applied its rolebindings manifest yet";
+        try {
+            while (true) {
+                ContainerExec.Result manifest = execInContainerForStdout(containerId,
+                        EksK3sPlatformRbac.READ_ROLEBINDINGS_MANIFEST_COMMAND,
+                        K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS);
+                ContainerExec.Result listed = manifest.timedOut() || manifest.exitCode() != 0 ? manifest
+                        : execInContainerForStdout(containerId, EksK3sPlatformRbac.LIST_COMMAND,
+                                K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS);
+                if (!listed.timedOut() && listed.exitCode() == 0) {
+                    EksK3sPlatformRbac.Listing listing = EksK3sPlatformRbac.parse(listed.stdout(), manifest.stdout());
+                    if (listing.applied()) {
+                        for (String[] command : listing.labelCommands()) {
+                            ContainerExec.Result labelled = execInContainerForResult(containerId, command,
+                                    K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS);
+                            if (labelled.timedOut() || labelled.exitCode() != 0) {
+                                LOG.warnv("Could not label the k3s platform RBAC of EKS cluster {0}: {1}",
+                                        clusterName, labelled.summary());
+                            }
+                        }
+                        return;
+                    }
+                } else {
+                    lastFailure = listed.summary();
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    LOG.warnv("EKS cluster {0} keeps the k3s RBAC unlabelled, so it reads as customer RBAC: {1}",
+                            clusterName, lastFailure);
+                    return;
+                }
+                Thread.sleep(K3S_PLATFORM_RBAC_POLL_MILLIS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not label the k3s platform RBAC of EKS cluster {0}: {1}", clusterName, e.getMessage());
         }
     }
 
@@ -1551,6 +1599,7 @@ public class EksClusterManager
             boolean loadBalancerServices, String serviceCidr, String clusterCidr, Optional<String> endpointHost) {
         List<String> serverArgs = new ArrayList<>(List.of("server",
                 "--disable=traefik",
+                "--disable=runtimes",
                 "--tls-san=localhost"));
         endpointHost.filter(host -> !host.isBlank()).ifPresent(host -> serverArgs.add("--tls-san=" + host));
         if (!defaultStorageClass) {
@@ -1558,6 +1607,8 @@ public class EksClusterManager
         }
         if (loadBalancerServices) {
             serverArgs.add("--disable=servicelb");
+            // servicelb runs inside k3s's cloud controller manager, so the manager can only go with it.
+            serverArgs.add("--disable-cloud-controller");
         }
         if (disableCni) {
             serverArgs.add("--flannel-backend=none");
@@ -3598,6 +3649,10 @@ public class EksClusterManager
 
     ContainerExec.Result execInContainerForResult(String containerId, String[] cmd, int timeoutSeconds) {
         return ContainerExec.runMerged(lifecycleManager.getDockerClient(), containerId, cmd, timeoutSeconds);
+    }
+
+    ContainerExec.Result execInContainerForStdout(String containerId, String[] cmd, int timeoutSeconds) {
+        return ContainerExec.run(lifecycleManager.getDockerClient(), containerId, cmd, timeoutSeconds);
     }
 
     /**
