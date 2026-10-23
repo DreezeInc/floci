@@ -663,6 +663,20 @@ public class EcrService implements ResourceProvider {
                 .orElseGet(() -> registryManager.internalRepoName(account, region, repositoryName));
     }
 
+    /** The accounts owning at least one repository in the partition, across every caller, in ascending order. */
+    public List<String> repositoryOwnerAccounts(String partition) {
+        List<Repository> repositories = repoStore instanceof AccountAwareStorageBackend<Repository> accountAware
+                ? accountAware.scanAllAccounts()
+                : repoStore.scan(k -> true);
+        return repositories.stream()
+                .filter(repo -> repo.getRegistryId() != null
+                        && partition.equals(AwsArnUtils.partitionOrDefault(repo.getRepositoryArn(), null)))
+                .map(Repository::getRegistryId)
+                .distinct()
+                .sorted()
+                .toList();
+    }
+
     public void tagResource(String repoName, String registryId, Map<String, String> tags, String region) {
         Repository repo = requireRepo(repoName, registryId, region);
         if (tags != null) {

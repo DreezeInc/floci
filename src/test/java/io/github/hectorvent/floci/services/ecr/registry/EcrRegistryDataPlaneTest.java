@@ -132,6 +132,59 @@ class EcrRegistryDataPlaneTest {
     }
 
     @Test
+    void awsShapedHostAddressesTheSameStorageAsTheFlociHost() {
+        EcrRegistryDataPlane.RegistryRequest floci = EcrRegistryDataPlane.requestFor(
+                "123456789012.dkr.ecr.eu-west-1.localhost:4566", "/v2/team/app/manifests/v1", null,
+                "hostname").orElseThrow();
+
+        for (String host : List.of("123456789012.dkr.ecr.eu-west-1.amazonaws.com",
+                "123456789012.dkr.ecr.eu-west-1.amazonaws.com:443")) {
+            assertEquals(floci, EcrRegistryDataPlane.requestFor(host, "/v2/team/app/manifests/v1", null,
+                    "hostname").orElseThrow(), host);
+            assertEquals(floci, EcrRegistryDataPlane.requestFor(host, "/v2/team/app/manifests/v1", null,
+                    "path").orElseThrow(), host);
+        }
+        assertEquals("/v2/123456789012/eu-west-1/team/app/manifests/v1", floci.backendUri());
+    }
+
+    @Test
+    void awsShapedMirrorNamespaceRoutesAnInNetworkK3sPullThroughTheSameDataPlane() {
+        EcrRegistryDataPlane.RegistryRequest floci = EcrRegistryDataPlane.requestFor("floci:4566",
+                "/v2/platform/api/manifests/v1", "ns=000000000000.dkr.ecr.us-east-1.localhost%3A4566",
+                "hostname").orElseThrow();
+
+        for (String namespace : List.of("000000000000.dkr.ecr.us-east-1.amazonaws.com",
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com%3A443")) {
+            assertEquals(floci, EcrRegistryDataPlane.requestFor("floci:4566", "/v2/platform/api/manifests/v1",
+                    "ns=" + namespace, "hostname").orElseThrow(), namespace);
+        }
+    }
+
+    @Test
+    void awsShapedChinaRegistryHostKeepsItsRegion() {
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("floci:4566",
+                "/v2/team/app/blobs/sha256:abc", "ns=123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
+                "hostname").orElseThrow();
+
+        assertEquals("123456789012", request.accountId());
+        assertEquals("cn-north-1", request.region());
+        assertEquals("team/app", request.repositoryName());
+        assertEquals("/v2/123456789012/cn-north-1/team/app/blobs/sha256:abc", request.backendUri());
+    }
+
+    @Test
+    void nonEcrAwsHostsAreNotClaimed() {
+        for (String host : List.of("s3.us-east-1.amazonaws.com", "ecr.us-east-1.amazonaws.com",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com.example.org",
+                "123456789012.dkr.ecr.us-east-1.example.org")) {
+            assertFalse(EcrRegistryDataPlane.requestFor(host, "/v2/repo/manifests/latest", null, "hostname")
+                    .isPresent(), host);
+            assertFalse(EcrRegistryDataPlane.requestFor("floci:4566", "/v2/repo/manifests/latest", "ns=" + host,
+                    "hostname").isPresent(), host);
+        }
+    }
+
+    @Test
     void unrelatedV2RouteDoesNotClaimTheRequest() {
         assertFalse(EcrRegistryDataPlane.requestFor("localhost:4566", "/v2/apis", null, "hostname").isPresent());
         assertTrue(EcrRegistryDataPlane.requestFor("000000000000.dkr.ecr.us-east-1.localhost:4566", "/v2/", null,

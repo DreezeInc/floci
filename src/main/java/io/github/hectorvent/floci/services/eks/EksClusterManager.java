@@ -51,6 +51,7 @@ import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.eks.csi.EbsCsiNode;
 import io.github.hectorvent.floci.services.eks.csi.EbsCsiNodes;
@@ -2061,15 +2062,20 @@ public class EksClusterManager
         }
     }
 
+    @Inject
+    EcrService ecrService;
+
     /**
      * Generates and injects {@code /etc/rancher/k3s/registries.yaml} into the (created,
      * not-yet-started) k3s container so its containerd can pull images pushed to the Floci ECR
-     * registry. Mirrors every repository hostname the cluster can pull from Floci: its own account
-     * and the default account, across every region of the cluster's partition, plus the path-style
+     * registry. Mirrors every repository hostname the cluster can pull from Floci: its own account,
+     * the default account and every account owning a repository in the cluster's partition, across
+     * every region of that partition, in both the Floci and the AWS-shaped form, plus the path-style
      * {@code localhost:<port>} form, including {@code localhost.floci.io} aliases when TLS registry
-     * URIs are enabled, to Floci's in-network data plane. Public registries are never matched. A
-     * failure disables the mirror for this cluster but does not abort its startup, matching the
-     * webhook contract.
+     * URIs are enabled, to Floci's in-network data plane. Public registries are never matched. k3s
+     * reads the file once at start, so an account whose first repository appears later is not
+     * mirrored into an already-running cluster. A failure disables the mirror for this cluster but
+     * does not abort its startup, matching the webhook contract.
      */
     void injectEcrRegistryMirror(String containerId, Cluster cluster) {
         String clusterName = cluster.getName();
@@ -2086,14 +2092,20 @@ public class EksClusterManager
         String region = AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion());
         String endpoint = "http://" + dockerHostResolver.resolve() + ":" + config.port();
         boolean tlsUri = config.services().ecr().tlsUri() && config.tls().enabled();
-        String content = buildRegistriesYaml(mirrorAccounts(resolveClusterAccountId(cluster), config.defaultAccountId()),
-                mirrorRegions(region), ecrRegistryManager.advertisedPort(), endpoint, tlsUri);
+        List<String> repositoryOwners = ecrService != null
+                ? ecrService.repositoryOwnerAccounts(AwsRegions.partitionFor(region))
+                : List.of();
+        List<String> accounts = mirrorAccounts(resolveClusterAccountId(cluster), config.defaultAccountId(),
+                repositoryOwners);
+        String content = buildRegistriesYaml(accounts, mirrorRegions(region), ecrRegistryManager.advertisedPort(),
+                endpoint, tlsUri);
         writeLocalCopy(Paths.get(config.services().eks().dataPath(), "registries", clusterName,
                 "registries.yaml"), content, clusterName);
         try {
             RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, "/etc",
                     REGISTRIES_TAR_ENTRY, content.getBytes(StandardCharsets.UTF_8), 0644);
-            LOG.infov("Injected ECR registry mirror ({0}) into k3s cluster {1}", endpoint, clusterName);
+            LOG.infov("Injected ECR registry mirror ({0}) for accounts {1} into k3s cluster {2}",
+                    endpoint, accounts, clusterName);
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no ECR registry mirror: could not copy registries.yaml "
                     + "into the k3s container: {1}", clusterName, e.getMessage());
@@ -2576,24 +2588,28 @@ public class EksClusterManager
         return regions;
     }
 
-    /** The cluster's account first, then the default account when it differs. */
-    static List<String> mirrorAccounts(String clusterAccountId, String defaultAccountId) {
+    /** The cluster's account, then the default account, then the other repository owners in ascending order. */
+    static List<String> mirrorAccounts(String clusterAccountId, String defaultAccountId,
+                                       Collection<String> repositoryOwnerAccounts) {
         Set<String> accounts = new LinkedHashSet<>();
         accounts.add(clusterAccountId);
         if (defaultAccountId != null && !defaultAccountId.isBlank()) {
             accounts.add(defaultAccountId);
         }
+        repositoryOwnerAccounts.stream().sorted().forEach(accounts::add);
         return List.copyOf(accounts);
     }
 
     /**
-     * Builds the k3s registries.yaml content. One mirror entry per hostname-style repository URI
-     * ({@code <account>.dkr.ecr.<region>.localhost:<port>}) plus one for the path-style form
-     * ({@code localhost:<port>}), all pointing at Floci's in-network data plane. The port is the
-     * one the repository URIs advertise, which differs from the endpoint's port when Floci's
-     * container publishes its port on another host port. The TLS URI mode adds the corresponding
-     * {@code localhost.floci.io} aliases. k3s supports no partial wildcards and a {@code "*"}
-     * catch-all would also intercept public registries, so the hostnames are enumerated explicitly.
+     * Builds the k3s registries.yaml content. Two mirror entries per account and region, the
+     * hostname-style repository URI ({@code <account>.dkr.ecr.<region>.localhost:<port>}) and the
+     * AWS-shaped registry host ({@code <account>.dkr.ecr.<region>.<dnsSuffix>}, no port) that
+     * manifests written for AWS carry, plus one for the path-style form ({@code localhost:<port>}),
+     * all pointing at Floci's in-network data plane. The port is the one the repository URIs
+     * advertise, which differs from the endpoint's port when Floci's container publishes its port
+     * on another host port. The TLS URI mode adds the corresponding {@code localhost.floci.io}
+     * aliases. k3s supports no partial wildcards and a {@code "*"} catch-all would also intercept
+     * public registries, so the hostnames are enumerated explicitly.
      */
     static String buildRegistriesYaml(String accountId, List<String> regions, int advertisedPort, String endpoint) {
         return buildRegistriesYaml(accountId, regions, advertisedPort, endpoint, false);
@@ -2614,6 +2630,7 @@ public class EksClusterManager
                     appendMirror(yaml, accountId + ".dkr.ecr." + region + ".localhost.floci.io:" + advertisedPort,
                             endpoint);
                 }
+                appendMirror(yaml, accountId + ".dkr.ecr." + region + "." + AwsRegions.dnsSuffixFor(region), endpoint);
             }
         }
         appendMirror(yaml, "localhost:" + advertisedPort, endpoint);

@@ -585,6 +585,43 @@ class EcrServiceTest {
         verify(registryManager, never()).pruneStorage();
     }
 
+    @Test
+    void repositoryOwnerAccounts_listsEveryOwningAccountOfThePartitionInOrder() {
+        AccountAwareStorageBackend<Repository> repositories = AccountAwareStorageBackend.inMemory(ACCOUNT);
+        EcrService accountAwareService = new EcrService(
+                repositories,
+                new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
+                registryManager,
+                Mockito.mock(EmulatorConfig.class),
+                new RegionResolver(REGION, ACCOUNT));
+        accountAwareService.createRepository(REPO, null, null, null, null, null, null, REGION);
+        accountAwareService.createRepository(REPO, "999999999999", null, null, null, null, null, "eu-west-1");
+        accountAwareService.createRepository("other", ACCOUNT, null, null, null, null, null, "eu-west-1");
+        accountAwareService.createRepository(REPO, "777788889999", null, null, null, null, null, "cn-north-1");
+        Repository otherCallers = new Repository();
+        otherCallers.setRepositoryName("shared");
+        otherCallers.setRegistryId("444455556666");
+        otherCallers.setRepositoryArn("arn:aws:ecr:us-west-2:444455556666:repository/shared");
+        repositories.putForAccount("444455556666", "us-west-2::444455556666::shared", otherCallers);
+        repositories.putForAccount("111111111111", REGION + "::111111111111::legacy", new Repository());
+
+        assertEquals(List.of(ACCOUNT, "444455556666", "999999999999"),
+                accountAwareService.repositoryOwnerAccounts("aws"));
+        assertEquals(List.of("777788889999"), accountAwareService.repositoryOwnerAccounts("aws-cn"));
+        assertEquals(List.of(), accountAwareService.repositoryOwnerAccounts("aws-us-gov"));
+    }
+
+    @Test
+    void repositoryOwnerAccounts_dropsAnAccountOnceItsLastRepositoryIsDeleted() {
+        service.createRepository(REPO, "999999999999", null, null, null, null, null, REGION);
+        assertEquals(List.of("999999999999"), service.repositoryOwnerAccounts("aws"));
+
+        service.deleteRepository(REPO, "999999999999", true, REGION);
+
+        assertEquals(List.of(), service.repositoryOwnerAccounts("aws"));
+    }
+
     // ------------------------------------------------------------
     // GetAuthorizationToken
     // ------------------------------------------------------------

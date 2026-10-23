@@ -186,7 +186,8 @@ and restart Docker Desktop, following [Docker's CA certificate instructions](htt
 !!! note "Pulling from other containers (EKS, same-network consumers)"
     The `localhost`-based repository URI only works from the host. [Floci EKS](eks.md#pulling-images-from-floci-ecr)
     configures a containerd mirror to reach Floci's data plane, so Helm charts can reference the
-    pushed URI as-is.
+    pushed URI as-is, or its AWS-shaped form `<account>.dkr.ecr.<region>.amazonaws.com/<repo>`,
+    which the data plane resolves to the same stored image.
 
     When TLS URI advertising is enabled, newly configured EKS registry mirrors accept both
     the loopback and TLS names and forward them to the same internal HTTP endpoint. Recreate

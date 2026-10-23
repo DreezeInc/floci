@@ -783,9 +783,9 @@ pull from the registry even though `docker push` from the host works.
 
 Floci solves this at cluster creation: each new k3s container gets a generated
 `/etc/rancher/k3s/registries.yaml` that mirrors every repository hostname the cluster
-can pull: the cluster's own account and the default account, across every region of the
-cluster's partition, plus the path-style
-`localhost:<port>` form used by `FLOCI_SERVICES_ECR_URI_STYLE=path`, to Floci's
+can pull: the cluster's own account, the default account and every account that owns an
+ECR repository in the cluster's partition, across every region of that partition, plus the
+path-style `localhost:<port>` form used by `FLOCI_SERVICES_ECR_URI_STYLE=path`, to Floci's
 in-network data plane. The same image
 reference then works for the host-side push and the in-cluster pull, with no retagging
 and no manual containerd configuration:
@@ -801,17 +801,38 @@ helm install my-app ./chart \
   --set image.tag=v1
 ```
 
+Each mirrored account and region also covers the AWS-shaped registry host
+`<account>.dkr.ecr.<region>.<dnsSuffix>`, with the region's partition DNS suffix
+(`amazonaws.com`, `amazonaws.com.cn` in the China regions, and so on) and no port. A chart
+or manifest written for AWS therefore pulls, unchanged, the image pushed through the URI
+Floci returned: the AWS-shaped reference and the `localhost` one name the same account,
+region, repository and tag, so they resolve to the same stored image:
+
+```bash
+helm install my-app ./chart \
+  --set image.repository=000000000000.dkr.ecr.us-east-1.amazonaws.com/my-repo \
+  --set image.tag=v1
+```
+
+This includes cross-account pulls: a cluster in account `111122223333` pulls
+`000000000000.dkr.ecr.us-east-1.amazonaws.com/my-repo:v1` when `000000000000` owns an
+ECR repository in the cluster's partition. Floci stores repository policies without
+enforcing them, so the pull does not require the policy that AWS checks.
+
 Requirements and limits:
 
 - The k3s container must reach Floci's Docker-network address. Set the global
   `FLOCI_SERVICES_DOCKER_NETWORK` as in the standard `docker-compose.yml` or the
   EKS service network variable.
-- Only Floci-mintable hostnames are mirrored; public registries (docker.io, ghcr.io, …)
-  are never touched.
-- Mirrored hostnames carry the port the repository URIs advertise, which is the host port
+- Only ECR registry hostnames are mirrored; public registries (docker.io, ghcr.io, …)
+  are never touched. k3s accepts no partial wildcards, so the hostnames are listed one by
+  one: two per mirrored account and region (three with TLS URIs), in a fixed order.
+- Mirrored `localhost` hostnames carry the port the repository URIs advertise, which is the host port
   when Floci's container publishes `4566` on another one (see [ECR](ecr.md#docker-compose-port-mapping)).
-- Repository URIs using a non-default `registryId` (account) are not covered.
-- The mirror set is snapshotted when the cluster is created. Clusters created before this
+- The mirror set is snapshotted when the k3s container is created, because k3s reads
+  `registries.yaml` only at start. An account whose first repository in the partition is
+  created after that is not mirrored into the running cluster; create the repository
+  before the cluster, or recreate the cluster. Clusters created before this
   feature can be fixed manually because the k3s container filesystem survives a restart:
 
   ```bash

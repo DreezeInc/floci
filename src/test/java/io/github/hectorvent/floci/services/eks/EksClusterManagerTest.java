@@ -44,6 +44,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
+import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
@@ -193,12 +194,44 @@ class EksClusterManagerTest {
         for (String region : AwsRegions.advertised("aws")) {
             assertTrue(yaml.contains("\"000000000000.dkr.ecr." + region + ".localhost:4566\":"),
                     "should mirror the " + region + " hostname");
+            assertTrue(yaml.contains("\"000000000000.dkr.ecr." + region + ".amazonaws.com\":"),
+                    "should mirror the " + region + " AWS-shaped registry host");
         }
         assertTrue(yaml.contains("\"localhost:4566\":"), "should mirror the path-style form");
         assertFalse(yaml.contains("\"*\""), "must not catch-all public registries");
         long endpoints = yaml.lines().filter(l -> l.contains("- \"http://floci:4566\"")).count();
-        assertEquals(AwsRegions.advertised("aws").size() + 1, endpoints,
+        assertEquals(2L * AwsRegions.advertised("aws").size() + 1, endpoints,
                 "every mirror should point at Floci's in-network data plane");
+    }
+
+    @Test
+    void registriesYamlMirrorsTheAwsShapedHostOfEveryMirroredAccountAndRegion() {
+        List<String> accounts = EksClusterManager.mirrorAccounts(
+                "111122223333", "000000000000", List.of("444455556666"));
+        String yaml = EksClusterManager.buildRegistriesYaml(
+                accounts, List.of("us-east-1", "eu-west-1"), 4566, "http://floci:4566", false);
+
+        for (String account : accounts) {
+            for (String region : List.of("us-east-1", "eu-west-1")) {
+                assertTrue(yaml.contains("\"" + account + ".dkr.ecr." + region + ".amazonaws.com\":"),
+                        account + " " + region);
+                assertTrue(yaml.contains("\"" + account + ".dkr.ecr." + region + ".localhost:4566\":"),
+                        account + " " + region);
+            }
+        }
+        assertFalse(yaml.contains("amazonaws.com:"), "AWS-shaped registry hosts carry no port");
+        assertFalse(yaml.contains("\"*\""), "must not catch-all public registries");
+        assertFalse(yaml.contains("docker.io"));
+        assertEquals(3L * 2 * 2 + 1, yaml.lines().filter(line -> line.contains("- \"http://floci:4566\"")).count());
+    }
+
+    @Test
+    void mirrorAccountsAppendRepositoryOwnersInAscendingOrderAfterTheClusterAndDefaultAccounts() {
+        assertEquals(List.of("111122223333", "000000000000", "444455556666", "999999999999"),
+                EksClusterManager.mirrorAccounts("111122223333", "000000000000",
+                        List.of("999999999999", "000000000000", "444455556666", "111122223333")));
+        assertEquals(List.of("000000000000"),
+                EksClusterManager.mirrorAccounts("000000000000", "000000000000", List.of()));
     }
 
     @Test
@@ -220,22 +253,22 @@ class EksClusterManagerTest {
         for (String region : AwsRegions.advertised("aws")) {
             assertTrue(yaml.contains("\"111122223333.dkr.ecr." + region + ".localhost:4577\":"));
             assertTrue(yaml.contains("\"111122223333.dkr.ecr." + region + ".localhost.floci.io:4577\":"));
+            assertTrue(yaml.contains("\"111122223333.dkr.ecr." + region + ".amazonaws.com\":"));
         }
         assertTrue(yaml.contains("\"localhost:4577\":"));
         assertTrue(yaml.contains("\"localhost.floci.io:4577\":"));
         assertFalse(yaml.contains("*"), "mirrors must not intercept unrelated registries");
-        assertFalse(yaml.contains("amazonaws.com"));
         assertFalse(yaml.contains("docker.io"));
         assertFalse(yaml.contains("ghcr.io"));
         assertFalse(yaml.contains("https://"), "internal pulls still use the HTTP data plane");
         long endpoints = yaml.lines().filter(line -> line.contains("- \"" + endpoint + "\"")).count();
-        assertEquals(2L * (AwsRegions.advertised("aws").size() + 1), endpoints);
+        assertEquals(3L * AwsRegions.advertised("aws").size() + 2, endpoints);
     }
 
     @Test
     void registriesYamlForACommercialClusterInTheDefaultAccountIsUnchanged() {
         String yaml = EksClusterManager.buildRegistriesYaml(
-                EksClusterManager.mirrorAccounts("000000000000", "000000000000"),
+                EksClusterManager.mirrorAccounts("000000000000", "000000000000", List.of()),
                 EksClusterManager.mirrorRegions("us-east-1"), 4566, "http://floci:4566", false);
 
         assertEquals(EksClusterManager.buildRegistriesYaml(
@@ -245,23 +278,24 @@ class EksClusterManagerTest {
     @Test
     void registriesYamlForAChinaClusterMirrorsTheChinaRegions() {
         String yaml = EksClusterManager.buildRegistriesYaml(
-                EksClusterManager.mirrorAccounts("000000000000", "000000000000"),
+                EksClusterManager.mirrorAccounts("000000000000", "000000000000", List.of()),
                 EksClusterManager.mirrorRegions("cn-north-1"), 4566, "http://floci:4566", false);
 
         for (String region : AwsRegions.advertised("aws-cn")) {
             assertTrue(yaml.contains("\"000000000000.dkr.ecr." + region + ".localhost:4566\":"), region);
+            assertTrue(yaml.contains("\"000000000000.dkr.ecr." + region + ".amazonaws.com.cn\":"), region);
         }
         assertTrue(yaml.contains("\"000000000000.dkr.ecr.cn-north-1.localhost:4566\":"));
         assertFalse(yaml.contains(".us-east-1."));
-        assertFalse(yaml.contains("amazonaws"), "repository URIs are Floci's localhost hosts in every partition");
-        assertEquals(AwsRegions.advertised("aws-cn").size() + 1,
+        assertFalse(yaml.contains(".amazonaws.com\":"), "China registry hosts use the China partition's DNS suffix");
+        assertEquals(2L * AwsRegions.advertised("aws-cn").size() + 1,
                 yaml.lines().filter(line -> line.contains("- \"http://floci:4566\"")).count());
     }
 
     @Test
     void registriesYamlForANonDefaultAccountMirrorsBothAccounts() {
         String yaml = EksClusterManager.buildRegistriesYaml(
-                EksClusterManager.mirrorAccounts("111122223333", "000000000000"),
+                EksClusterManager.mirrorAccounts("111122223333", "000000000000", List.of()),
                 List.of("eu-central-1"), 4566, "http://floci:4566", false);
 
         assertEquals("""
@@ -269,7 +303,13 @@ class EksClusterManagerTest {
                   "111122223333.dkr.ecr.eu-central-1.localhost:4566":
                     endpoint:
                       - "http://floci:4566"
+                  "111122223333.dkr.ecr.eu-central-1.amazonaws.com":
+                    endpoint:
+                      - "http://floci:4566"
                   "000000000000.dkr.ecr.eu-central-1.localhost:4566":
+                    endpoint:
+                      - "http://floci:4566"
+                  "000000000000.dkr.ecr.eu-central-1.amazonaws.com":
                     endpoint:
                       - "http://floci:4566"
                   "localhost:4566":
@@ -286,6 +326,9 @@ class EksClusterManagerTest {
         assertEquals("""
                 mirrors:
                   "111122223333.dkr.ecr.eu-central-1.localhost:4566":
+                    endpoint:
+                      - "http://floci:4566"
+                  "111122223333.dkr.ecr.eu-central-1.amazonaws.com":
                     endpoint:
                       - "http://floci:4566"
                   "localhost:4566":
@@ -1212,6 +1255,38 @@ class EksClusterManagerTest {
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
             assertTrue(yaml.contains("\"111122223333.dkr.ecr.eu-west-1.localhost:4566\":"));
             assertTrue(yaml.contains("\"000000000000.dkr.ecr.eu-west-1.localhost:4566\":"));
+        }
+
+        @Test
+        void aClusterMirrorsEveryAccountOwningARepositoryInItsPartition() throws Exception {
+            EcrService ecrService = Mockito.mock(EcrService.class);
+            when(ecrService.repositoryOwnerAccounts("aws")).thenReturn(List.of("444455556666"));
+            manager.ecrService = ecrService;
+            Cluster cluster = clusterWithArn("arn:aws:eks:eu-west-1:111122223333:cluster/demo");
+            cluster.setAccountId("111122223333");
+
+            manager.injectEcrRegistryMirror("container-1", cluster);
+
+            String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
+            assertEquals(EksClusterManager.buildRegistriesYaml(
+                    List.of("111122223333", "000000000000", "444455556666"), AwsRegions.advertised("aws"),
+                    4566, "http://floci:4566", false), yaml);
+            assertTrue(yaml.contains("\"444455556666.dkr.ecr.us-east-1.amazonaws.com\":"),
+                    "a cross-account repository is pullable through its AWS-shaped URI");
+        }
+
+        @Test
+        void aChinaClusterMirrorsTheRepositoryOwnersOfItsOwnPartition() throws Exception {
+            EcrService ecrService = Mockito.mock(EcrService.class);
+            when(ecrService.repositoryOwnerAccounts("aws-cn")).thenReturn(List.of("444455556666"));
+            manager.ecrService = ecrService;
+
+            manager.injectEcrRegistryMirror("container-1",
+                    clusterWithArn("arn:aws-cn:eks:cn-north-1:000000000000:cluster/demo"));
+
+            verify(ecrService).repositoryOwnerAccounts("aws-cn");
+            String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
+            assertTrue(yaml.contains("\"444455556666.dkr.ecr.cn-northwest-1.amazonaws.com.cn\":"));
         }
 
         @Test
