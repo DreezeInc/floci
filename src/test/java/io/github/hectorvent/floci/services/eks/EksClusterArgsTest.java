@@ -119,6 +119,8 @@ class EksClusterArgsTest {
             "kube-reserved",
             "eviction-hard",
             "register-with-taints",
+            "serialize-image-pulls",
+            "serializeImagePulls=true",
             "--provider-id=custom-id",
             "providerId=custom-id",
             "node-labels=topology.kubernetes.io/zone=custom",

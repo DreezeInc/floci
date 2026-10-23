@@ -407,10 +407,11 @@ class EksClusterManagerTest {
         labels.put("karpenter.sh/nodepool", "default");
 
         List<String> args = EksClusterManager.buildAgentArgs("ip-10-0-0-5.ec2.internal", "aws:///us-east-1a/i-0abc",
-                labels, List.of("karpenter.sh/unregistered:NoExecute", "team=a:NoSchedule"));
+                labels, List.of("karpenter.sh/unregistered:NoExecute", "team=a:NoSchedule"), false);
 
         assertEquals(List.of("agent", "--node-name=ip-10-0-0-5.ec2.internal",
                 "--kubelet-arg=provider-id=aws:///us-east-1a/i-0abc",
+                "--kubelet-arg=serialize-image-pulls=false",
                 "--node-label=topology.kubernetes.io/zone=us-east-1a", "--node-label=karpenter.sh/nodepool=default",
                 "--node-taint=karpenter.sh/unregistered:NoExecute", "--node-taint=team=a:NoSchedule"), args);
     }
@@ -2689,6 +2690,22 @@ class EksClusterManagerTest {
             String expectedProviderId = manager.deriveClusterNodeProviderId(cluster);
             assertEquals("aws:///us-west-2a/i-0e413a1bfb5c3cd79", expectedProviderId);
             assertTrue(cmd.contains("--kubelet-arg=provider-id=" + expectedProviderId));
+        }
+
+        @Test
+        void startClusterPullsImagesInParallelLikeTheEksAmi() {
+            Cluster cluster = new Cluster();
+            cluster.setName("prod-cluster");
+            cluster.setAccountId("123456789012");
+            cluster.setArn("arn:aws:eks:us-west-2:123456789012:cluster/prod-cluster");
+
+            manager.startCluster(cluster);
+
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<String>> cmdCaptor = ArgumentCaptor.forClass(List.class);
+            verify(builder).withCmd(cmdCaptor.capture());
+
+            assertTrue(cmdCaptor.getValue().contains("--kubelet-arg=serialize-image-pulls=false"));
         }
 
         @Test

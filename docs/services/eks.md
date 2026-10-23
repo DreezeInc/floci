@@ -331,7 +331,7 @@ The supported component prefixes correspond to k3s server argument flags:
 
 Floci manages a specific set of flags required for container networking, IAM authentication, audit logging, and topology emulation. Passing a conflicting value or modifier (such as `+=` or `-=`) for any of these flags causes `CreateCluster` to reject the request with `InvalidParameterException` (HTTP 400).
 
-Floci manages the following 21 flags:
+Floci manages the following 22 flags:
 - Kubelet:
   - `provider-id`: manages EC2 worker node identity.
   - `node-labels`: manages topology zones, instance types, and nodegroup labels. Nodegroup labels merge directly into this managed argument rather than through the passthrough.
@@ -339,6 +339,7 @@ Floci manages the following 21 flags:
   - `kube-reserved`: manages kubelet resource allocations.
   - `eviction-hard`: manages memory pressure thresholds.
   - `register-with-taints`: manages worker node taints configured on managed nodegroups.
+  - `serialize-image-pulls`: matches the EKS AMI's parallel image pulls; `FLOCI_SERVICES_EKS_SERIALIZE_IMAGE_PULLS` keeps k3s's one at a time.
 - API server:
   - `authentication-token-webhook-config-file`: manages worker IAM authentication.
   - `authentication-token-webhook-version`: token webhook protocol version.
@@ -791,6 +792,7 @@ With `floci.services.eks.agent-nodes: true` (or `FLOCI_SERVICES_EKS_AGENT_NODES=
 | `FLOCI_SERVICES_EKS_EBS_CSI_PORT` | `4591` | Port Floci serves the EBS CSI driver on; cluster nodes reach it on the Docker host address |
 | `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Start k3s without its service load balancer and give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
 | `FLOCI_SERVICES_EKS_AGENT_NODES` | `false` | Run a k3s agent container for each EC2 instance that joins a cluster, so its node has a kubelet, reports Ready and runs pods |
+| `FLOCI_SERVICES_EKS_SERIALIZE_IMAGE_PULLS` | `false` | Have each node's kubelet pull one image at a time, k3s's default; the default pulls in parallel, as the EKS AMI's kubelet does |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
 | `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials, and route the pod identity endpoint (`169.254.170.23`) on each node to Floci. Needs `FLOCI_TLS_ENABLED=true` |
 | `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |

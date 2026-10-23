@@ -683,6 +683,7 @@ public class EksClusterManager
         if (nodeLimits != null) {
             nodeLimits.addKubeletArgs(serverArgs);
         }
+        serverArgs.add(serializeImagePullsArg(config.services().eks().serializeImagePulls()));
 
         try {
             String nodeName = deriveClusterNodePrivateDnsName(cluster);
@@ -3714,7 +3715,8 @@ public class EksClusterManager
                 nodeName,
                 deriveInstanceNodeProviderId(instance, region),
                 instanceNodeLabels(instance, region, request),
-                request != null ? request.taints() : List.of());
+                request != null ? request.taints() : List.of(),
+                config.services().eks().serializeImagePulls());
         Map<String, String> labels = new LinkedHashMap<>(ContainerStorageHelper.resourceIdentityLabels(
                 "eks", cluster.getName(), resolveClusterAccountId(cluster), clusterRegion(cluster)));
         labels.put(AGENT_NODE_INSTANCE_LABEL, instance.getInstanceId());
@@ -3798,13 +3800,19 @@ public class EksClusterManager
         return labels;
     }
 
+    /** k3s's kubelet pulls one image at a time; the EKS AMI's kubelet config sets serializeImagePulls false. */
+    static String serializeImagePullsArg(boolean serializeImagePulls) {
+        return "--kubelet-arg=serialize-image-pulls=" + serializeImagePulls;
+    }
+
     /** The k3s {@code agent} args of a joined instance; the server URL and token travel as env vars. */
     static List<String> buildAgentArgs(String nodeName, String providerId, Map<String, String> labels,
-            List<String> taints) {
+            List<String> taints, boolean serializeImagePulls) {
         List<String> args = new ArrayList<>();
         args.add("agent");
         args.add("--node-name=" + nodeName);
         args.add("--kubelet-arg=provider-id=" + providerId);
+        args.add(serializeImagePullsArg(serializeImagePulls));
         for (Map.Entry<String, String> label : labels.entrySet()) {
             args.add("--node-label=" + label.getKey() + "=" + label.getValue());
         }

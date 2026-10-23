@@ -62,7 +62,8 @@ public final class EksClusterArgs {
             "systemreserved",
             "kubereserved",
             "evictionhard",
-            "registerwithtaints"
+            "registerwithtaints",
+            "serializeimagepulls"
     );
 
     /**

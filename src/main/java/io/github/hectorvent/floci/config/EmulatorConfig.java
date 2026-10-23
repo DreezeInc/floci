@@ -3433,6 +3433,14 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean agentNodes();
 
+        /**
+         * When true, each node's kubelet pulls one image at a time, k3s's default. The EKS AMI runs
+         * its kubelet with {@code serializeImagePulls: false}, so the default pulls the images of a
+         * node's pods in parallel, as an EKS node does.
+         */
+        @WithDefault("false")
+        boolean serializeImagePulls();
+
         /** The port Floci serves the EBS CSI driver's gRPC services on when {@link #emulateEbsStorage()} is on. */
         @WithDefault("4591")
         int ebsCsiPort();
