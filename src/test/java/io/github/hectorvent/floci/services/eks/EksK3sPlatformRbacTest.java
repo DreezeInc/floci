@@ -75,6 +75,23 @@ class EksK3sPlatformRbacTest {
     }
 
     @Test
+    void isNotAppliedUntilEveryObjectTheRoleBindingsManifestDeclaresIsListed() {
+        String manifest = "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n"
+                + "  name: system:k3s-controller\n---\napiVersion: rbac.authorization.k8s.io/v1\n"
+                + "kind: ClusterRoleBinding\nmetadata:\n  name: kube-apiserver-kubelet-admin\n";
+        ObjectNode addon = rolebindingsAddon(Digests.sha256Hex(manifest));
+        ObjectNode labelledRole = item("ClusterRole", "system:k3s-controller", null, "rolebindings", ADDON,
+                "rbac-defaults");
+        ObjectNode binding = item("ClusterRoleBinding", "kube-apiserver-kubelet-admin", null, "rolebindings", ADDON,
+                null);
+        ObjectNode namesake = item("ClusterRoleBinding", "kube-apiserver-kubelet-admin", null, "ccm", ADDON, null);
+
+        assertFalse(EksK3sPlatformRbac.parse(listing(labelledRole, addon), manifest).applied());
+        assertFalse(EksK3sPlatformRbac.parse(listing(labelledRole, namesake, addon), manifest).applied());
+        assertTrue(EksK3sPlatformRbac.parse(listing(labelledRole, binding, addon), manifest).applied());
+    }
+
+    @Test
     void ignoresAnOwnerOutsideKubeSystem() {
         ObjectNode foreign = item("ClusterRoleBinding", "kube-apiserver-kubelet-admin", null, "rolebindings", ADDON,
                 null);
