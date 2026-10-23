@@ -598,6 +598,13 @@ fails, the cluster becomes `FAILED` instead of waiting indefinitely for readines
 Groups remain `CREATING` while launch-template user data runs. Later groups wait for the first
 group's result before accepting its node type as the shared capacity.
 
+With `floci.services.eks.fixed-node-capacity: true` (or `FLOCI_SERVICES_EKS_FIXED_NODE_CAPACITY=true`),
+the shared node keeps the capacity it started with. The first node group still records its instance
+type, which the synthesized EC2 instance reports, but the container is not recreated: the cluster
+stays `ACTIVE` and its API keeps serving while node groups are created. The running node keeps the
+kubelet reservations and node labels of the type it started with, and the first group's labels and
+taints are not applied to it.
+
 The container receives a hard CPU quota equal to the selected type's vCPUs and a memory limit
 equal to its catalog memory plus 10% headroom (at least 128 MiB). Both are capped by Docker's host
 capacity. Memory is capped at 80% of the Docker host's memory so other processes can continue to

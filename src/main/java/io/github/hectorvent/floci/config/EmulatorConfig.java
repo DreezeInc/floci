@@ -3306,6 +3306,14 @@ public interface EmulatorConfig {
         @WithDefault("0")
         int maxVcpus();
 
+        /**
+         * When true, the shared node keeps the capacity it started with: creating the first node
+         * group records its instance type but does not recreate the node's container, so the
+         * cluster stays ACTIVE and its API keeps serving while node groups are created.
+         */
+        @WithDefault("false")
+        boolean fixedNodeCapacity();
+
         @WithDefault("k3s")
         String provider();
 

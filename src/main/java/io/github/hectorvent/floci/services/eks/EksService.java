@@ -1182,23 +1182,33 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         String previousType = EksClusterManager.nodeInstanceType(currentCluster);
         currentCluster.setNodeInstanceType(selectedType);
         if (currentCluster.getContainerId() != null && !selectedType.equals(previousType)) {
-            currentCluster.setStatus(ClusterStatus.CREATING);
-            try {
-                if (!clusterManager.restartForNodeCapacity(currentCluster, previousType)) {
-                    nodeGroup.setStatus(NodegroupStatus.CREATE_FAILED);
-                    nodeGroup.setHealth(failedNodeGroupHealth(nodegroupName,
-                            "Could not apply node capacity; the previous node was restored"));
-                }
-            } catch (RuntimeException e) {
-                currentCluster.setNodeInstanceType(previousType);
-                currentCluster.setStatus(ClusterStatus.FAILED);
-                nodeGroup.setStatus(NodegroupStatus.CREATE_FAILED);
-                nodeGroup.setHealth(failedNodeGroupHealth(nodegroupName, e.getMessage()));
-                LOG.errorv("EKS cluster {0} could not recover after node capacity change: {1}",
-                        clusterName, e.getMessage());
+            if (config.services().eks().fixedNodeCapacity()) {
+                LOG.infov("EKS cluster {0} keeps its {1} node capacity; nodegroup {2} selected {3}",
+                        clusterName, previousType, nodegroupName, selectedType);
+            } else {
+                replaceSharedNode(clusterName, nodegroupName, currentCluster, nodeGroup, previousType);
             }
         }
         storage.put(clusterName, currentCluster);
+    }
+
+    private void replaceSharedNode(String clusterName, String nodegroupName, Cluster currentCluster,
+                                   Nodegroup nodeGroup, String previousType) {
+        currentCluster.setStatus(ClusterStatus.CREATING);
+        try {
+            if (!clusterManager.restartForNodeCapacity(currentCluster, previousType)) {
+                nodeGroup.setStatus(NodegroupStatus.CREATE_FAILED);
+                nodeGroup.setHealth(failedNodeGroupHealth(nodegroupName,
+                        "Could not apply node capacity; the previous node was restored"));
+            }
+        } catch (RuntimeException e) {
+            currentCluster.setNodeInstanceType(previousType);
+            currentCluster.setStatus(ClusterStatus.FAILED);
+            nodeGroup.setStatus(NodegroupStatus.CREATE_FAILED);
+            nodeGroup.setHealth(failedNodeGroupHealth(nodegroupName, e.getMessage()));
+            LOG.errorv("EKS cluster {0} could not recover after node capacity change: {1}",
+                    clusterName, e.getMessage());
+        }
     }
 
     private String selectedNodeInstanceType(Nodegroup group) {

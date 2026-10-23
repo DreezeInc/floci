@@ -120,11 +120,17 @@ class EksServiceTest {
     }
 
     private EmulatorConfig testConfig(boolean mock, boolean keepRunningOnShutdown) {
+        return testConfig(mock, keepRunningOnShutdown, false);
+    }
+
+    private EmulatorConfig testConfig(boolean mock, boolean keepRunningOnShutdown,
+                                      boolean fixedNodeCapacity) {
         EmulatorConfig.EksServiceConfig eksConfig = proxy(EmulatorConfig.EksServiceConfig.class,
                 (proxy, method, args) -> switch (method.getName()) {
                     case "enabled" -> true;
                     case "mock" -> mock;
                     case "keepRunningOnShutdown" -> keepRunningOnShutdown;
+                    case "fixedNodeCapacity" -> fixedNodeCapacity;
                     case "apiServerBasePort" -> 6500;
                     default -> defaultValue(method);
                 });
@@ -1011,6 +1017,27 @@ class EksServiceTest {
     }
 
     @Test
+    void firstNodeGroupKeepsTheSharedNodeWhenItsCapacityIsFixed() {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.tryStartCluster(any())).thenReturn(true);
+        when(clusterManager.selectNodeInstanceType("t3.medium")).thenReturn("t3.medium");
+        EksService service = newService(clusterManager, false, true);
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName("fixed-capacity-cluster");
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        Cluster cluster = service.createCluster(request);
+        cluster.setContainerId("existing-container");
+        cluster.setStatus(ClusterStatus.ACTIVE);
+
+        Nodegroup nodeGroup = service.createNodeGroup("fixed-capacity-cluster", nodeGroupRequest("first"));
+
+        assertEquals(NodegroupStatus.ACTIVE, nodeGroup.getStatus());
+        assertEquals(ClusterStatus.ACTIVE, cluster.getStatus());
+        assertEquals("t3.medium", cluster.getNodeInstanceType());
+        verify(clusterManager, never()).restartForNodeCapacity(any(), anyString());
+    }
+
+    @Test
     void concurrentFirstNodeGroupsChooseOnlyOneCapacity() throws Exception {
         EksClusterManager clusterManager = mock(EksClusterManager.class);
         when(clusterManager.tryStartCluster(any())).thenReturn(true);
@@ -1369,6 +1396,10 @@ class EksServiceTest {
     }
 
     private EksService newService(EksClusterManager clusterManager, boolean mock) {
+        return newService(clusterManager, mock, false);
+    }
+
+    private EksService newService(EksClusterManager clusterManager, boolean mock, boolean fixedNodeCapacity) {
         StorageFactory storageFactory = new StorageFactory(null, null) {
             @Override
             public <V> AccountAwareStorageBackend<V> create(String serviceName, String fileName,
@@ -1376,7 +1407,7 @@ class EksServiceTest {
                 return AccountAwareStorageBackend.inMemory("000000000000");
             }
         };
-        return new EksService(storageFactory, testConfig(mock),
+        return new EksService(storageFactory, testConfig(mock, false, fixedNodeCapacity),
                 new RegionResolver("us-east-1", "000000000000"), clusterManager, null,
                 new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class));
     }
