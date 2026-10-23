@@ -209,6 +209,7 @@ public class EksClusterManager
     private final Map<String, ClusterNodeRecord> clusterNodeInstances = new ConcurrentHashMap<>();
     private final Map<String, Map<String, Instance>> joinedClusterInstances = new ConcurrentHashMap<>();
     private final Map<String, Closeable> clusterLogHandles = new ConcurrentHashMap<>();
+    private final Map<String, Closeable> agentNodeLogHandles = new ConcurrentHashMap<>();
     private final List<Consumer<Instance>> nodeRegistrationListeners = new CopyOnWriteArrayList<>();
     private final Map<String, Cluster> activeClusters = new ConcurrentHashMap<>();
 
@@ -3680,7 +3681,8 @@ public class EksClusterManager
     /**
      * Starts a k3s agent container for a joined instance, so the cluster gets a node with a
      * kubelet: Ready, carrying the labels and taints the instance's user data asked for, and
-     * running pods. A still-running container from an earlier Floci run is adopted as it is.
+     * running pods, and whose output reaches Floci's log as {@code eks:node:<instance id>}. A
+     * still-running container from an earlier Floci run is adopted as it is.
      */
     private void launchAgentNode(Cluster cluster, String serverContainerId, Instance instance) {
         String containerName = agentNodeContainerName(cluster, instance.getInstanceId());
@@ -3740,6 +3742,12 @@ public class EksClusterManager
             lifecycleManager.removeIfExists(containerName);
             throw e;
         }
+        if (logStreamer != null) {
+            Closeable logHandle = logStreamer.attachConsoleOnly(agentContainerId, "eks:node:" + instance.getInstanceId());
+            if (logHandle != null) {
+                closeQuietly(agentNodeLogHandles.put(containerName, logHandle));
+            }
+        }
         LOG.infov("k3s agent container {0} started for instance {1} in cluster {2}",
                 containerName, instance.getInstanceId(), cluster.getName());
     }
@@ -3786,8 +3794,13 @@ public class EksClusterManager
             return;
         }
         for (String instanceId : cluster.getJoinedInstanceIds().keySet()) {
-            lifecycleManager.removeIfExists(agentNodeContainerName(cluster, instanceId));
+            removeAgentNodeContainer(agentNodeContainerName(cluster, instanceId));
         }
+    }
+
+    private void removeAgentNodeContainer(String containerName) {
+        closeQuietly(agentNodeLogHandles.remove(containerName));
+        lifecycleManager.removeIfExists(containerName);
     }
 
     /** Takes a terminated instance out of its cluster: its agent container, if any, and its Node. */
@@ -3802,7 +3815,7 @@ public class EksClusterManager
             }
         }
         if (config.services().eks().agentNodes()) {
-            lifecycleManager.removeIfExists(agentNodeContainerName(cluster, instance.getInstanceId()));
+            removeAgentNodeContainer(agentNodeContainerName(cluster, instance.getInstanceId()));
         }
         String containerId = cluster.getContainerId();
         if (containerId == null || containerId.isBlank()) {
