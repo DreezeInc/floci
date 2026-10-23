@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MappingIterator;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
@@ -397,6 +398,14 @@ class EksClusterManagerTest {
         assertTrue(args.contains("--disable=servicelb"));
         assertTrue(args.contains("--disable-cloud-controller"));
         assertTrue(args.contains("--disable=traefik"));
+    }
+
+    @Test
+    void serverArgsAlwaysDisableK3sMetricsServer() {
+        assertTrue(EksClusterManager.buildServerArgs(false).contains("--disable=metrics-server"));
+        assertTrue(EksClusterManager.buildServerArgs(true).contains("--disable=metrics-server"));
+        assertTrue(EksClusterManager.buildServerArgs(false, true, true, null, null, Optional.empty())
+                .contains("--disable=metrics-server"));
     }
 
     @Test
@@ -1459,6 +1468,87 @@ class EksClusterManagerTest {
             when(copyCmd.exec()).thenThrow(new RuntimeException("copy failed"));
 
             manager.injectEcrRegistryMirror("container-1", demoCluster());
+
+            verify(copyCmd).exec();
+        }
+    }
+
+    @Nested
+    class RegisterEksControlPlaneObjects {
+
+        private CopyArchiveToContainerCmd copyCmd;
+        private EksClusterManager manager;
+
+        @BeforeEach
+        void setUp() {
+            ContainerLifecycleManager lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
+            DockerClient dockerClient = Mockito.mock(DockerClient.class);
+            copyCmd = Mockito.mock(CopyArchiveToContainerCmd.class, Mockito.RETURNS_SELF);
+            when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+            when(dockerClient.copyArchiveToContainerCmd(anyString())).thenReturn(copyCmd);
+            manager = new EksClusterManager(
+                    Mockito.mock(ContainerBuilder.class), lifecycleManager,
+                    Mockito.mock(ContainerDetector.class), Mockito.mock(PortAllocator.class),
+                    Mockito.mock(DockerHostResolver.class), Mockito.mock(EcrRegistryManager.class),
+                    Mockito.mock(EmulatorConfig.class), Mockito.mock(RegionResolver.class));
+        }
+
+        @Test
+        void writesTheEksKubeSystemObjectsIntoTheK3sManifestsDirectory() throws Exception {
+            manager.registerEksControlPlaneObjects("container-1", "demo");
+
+            verify(copyCmd).withRemotePath("/var/lib/rancher/k3s");
+            verify(copyCmd).exec();
+            ArgumentCaptor<InputStream> archive = ArgumentCaptor.forClass(InputStream.class);
+            verify(copyCmd).withTarInputStream(archive.capture());
+            List<String> objects = new ArrayList<>();
+            try (TarArchiveInputStream tar = new TarArchiveInputStream(archive.getValue())) {
+                TarArchiveEntry entry = tar.getNextEntry();
+                assertNotNull(entry);
+                assertEquals("server/manifests/floci-eks-control-plane.yaml", entry.getName());
+                try (MappingIterator<JsonNode> it = new ObjectMapper(new YAMLFactory()).readerFor(JsonNode.class)
+                        .readValues(new String(tar.readAllBytes(), StandardCharsets.UTF_8))) {
+                    while (it.hasNext()) {
+                        JsonNode object = it.next();
+                        objects.add(object.path("kind").asText() + " "
+                                + object.path("metadata").path("namespace").asText("") + "/"
+                                + object.path("metadata").path("name").asText());
+                    }
+                }
+            }
+
+            assertEquals(List.of(
+                    "ServiceAccount kube-system/aws-cloud-provider",
+                    "ServiceAccount kube-system/service-controller",
+                    "ServiceAccount kube-system/tagging-controller",
+                    "Service kube-system/eks-extension-metrics-api",
+                    "ClusterRole /eks:tagging-controller",
+                    "ClusterRoleBinding /eks:tagging-controller",
+                    "Role kube-system/eks-vpc-resource-controller-role",
+                    "RoleBinding kube-system/eks-vpc-resource-controller-rolebinding",
+                    "Role kube-system/eks:addon-manager",
+                    "RoleBinding kube-system/eks:addon-manager",
+                    "Role kube-system/eks:authenticator",
+                    "RoleBinding kube-system/eks:authenticator",
+                    "Role kube-system/eks:az-poller",
+                    "RoleBinding kube-system/eks:az-poller",
+                    "Role kube-system/eks:coredns-autoscaler",
+                    "RoleBinding kube-system/eks:coredns-autoscaler",
+                    "Role kube-system/eks:fargate-manager",
+                    "RoleBinding kube-system/eks:fargate-manager",
+                    "Role kube-system/eks:network-policy-controller",
+                    "RoleBinding kube-system/eks:network-policy-controller",
+                    "Role kube-system/eks:node-manager",
+                    "RoleBinding kube-system/eks:node-manager",
+                    "Role kube-system/eks:service-operations-configmaps",
+                    "RoleBinding kube-system/eks:service-operations"), objects);
+        }
+
+        @Test
+        void copyFailureLeavesTheClusterRunning() {
+            when(copyCmd.exec()).thenThrow(new RuntimeException("no such container"));
+
+            manager.registerEksControlPlaneObjects("container-1", "demo");
 
             verify(copyCmd).exec();
         }
@@ -4387,6 +4477,106 @@ class EksClusterManagerTest {
             assertTrue(labels.getAllValues().isEmpty());
             assertTrue(logs.stream().anyMatch(record -> record.getLevel().intValue() >= Level.WARNING.intValue()
                             && String.valueOf(record.getMessage()).contains("reads as customer RBAC")),
+                    () -> logs.stream().map(LogRecord::getMessage).toList().toString());
+        }
+    }
+
+    @Nested
+    class MarkEksManagedK3sObjects {
+
+        private static final String CONTAINER = "managed-container";
+        private EksClusterManager manager;
+        private final List<String[]> listings = new ArrayList<>();
+        private ArgumentCaptor<String[]> labels;
+
+        @BeforeEach
+        void setUp() {
+            EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+            EmulatorConfig.ServicesConfig services = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+            when(config.services()).thenReturn(services);
+            when(services.eks()).thenReturn(Mockito.mock(EmulatorConfig.EksServiceConfig.class));
+            manager = Mockito.spy(new EksClusterManager(Mockito.mock(ContainerBuilder.class),
+                    Mockito.mock(ContainerLifecycleManager.class), Mockito.mock(ContainerDetector.class),
+                    Mockito.mock(PortAllocator.class), Mockito.mock(DockerHostResolver.class),
+                    Mockito.mock(EcrRegistryManager.class), config, new RegionResolver("us-east-1", "000000000000"),
+                    Mockito.mock(Ec2MetadataServer.class), Mockito.mock(EksOidcService.class),
+                    inlineMock(FlociCertificateAuthority.class), Mockito.mock(ContainerLogStreamer.class),
+                    new InMemoryStorage<>()));
+            labels = ArgumentCaptor.forClass(String[].class);
+        }
+
+        private void listingReturns(ContainerExec.Result... results) {
+            Iterator<ContainerExec.Result> next = Arrays.asList(results).iterator();
+            doAnswer(invocation -> {
+                String[] command = invocation.getArgument(1);
+                if (Arrays.equals(command, EksK3sManagedObjects.READ_CHECKSUMS_COMMAND)) {
+                    return ok(EksK3sManagedObjectsTest.CHECKSUMS);
+                }
+                listings.add(command);
+                return next.hasNext() ? next.next() : results[results.length - 1];
+            }).when(manager).execInContainerForStdout(eq(CONTAINER), any(), anyInt());
+            doReturn(ok("labeled")).when(manager)
+                    .execInContainerForResult(eq(CONTAINER), labels.capture(), anyInt());
+        }
+
+        private static ContainerExec.Result ok(String stdout) {
+            return new ContainerExec.Result(0L, stdout, "", false);
+        }
+
+        private static String listing(String corednsChecksum, boolean tokenCleaner) {
+            List<ObjectNode> items = new ArrayList<>(List.of(
+                    EksK3sManagedObjectsTest.addon("coredns", corednsChecksum),
+                    EksK3sManagedObjectsTest.addon("floci-eks-control-plane", "2222"),
+                    EksK3sManagedObjectsTest.owned("apps/v1", "Deployment", "coredns", "kube-system", "coredns"),
+                    EksK3sManagedObjectsTest.plain("v1", "Secret", "k3s-serving"),
+                    EksK3sManagedObjectsTest.plain("v1", "Secret", "node-1.node-password.k3s"),
+                    EksK3sManagedObjectsTest.plain("v1", "ConfigMap", "cluster-dns")));
+            if (tokenCleaner) {
+                items.add(EksK3sManagedObjectsTest.plain("v1", "ServiceAccount", "token-cleaner"));
+            }
+            return EksK3sPlatformRbacTest.listing(items.toArray(ObjectNode[]::new));
+        }
+
+        @Test
+        void marksTheK3sObjectsOnceEveryManifestIsApplied() {
+            listingReturns(ok(listing("1111", true)));
+
+            manager.markEksManagedK3sObjects(CONTAINER, "demo-cluster", 0);
+
+            assertEquals(1, listings.size());
+            assertArrayEquals(EksK3sManagedObjects.LIST_COMMAND, listings.getFirst());
+            assertEquals(1, labels.getAllValues().size());
+            assertEquals(List.of("Addon kube-system/coredns=k3s", "Addon kube-system/floci-eks-control-plane=k3s",
+                    "Deployment kube-system/coredns=coredns", "Secret kube-system/k3s-serving=k3s",
+                    "Secret kube-system/node-1.node-password.k3s=k3s", "ConfigMap kube-system/cluster-dns=k3s",
+                    "ServiceAccount kube-system/token-cleaner=k3s"),
+                    EksK3sManagedObjectsTest.marked(new EksK3sManagedObjects.Listing(List.of(),
+                            Optional.of(labels.getValue()))));
+        }
+
+        @Test
+        void waitsUntilK3sHasAppliedItsManifestsAndCreatedItsObjects() {
+            listingReturns(new ContainerExec.Result(1L, "", "the server doesn't have a resource type \"addons\"",
+                    false), ok(listing("", true)), ok(listing("1111", false)), ok(listing("1111", true)));
+
+            manager.markEksManagedK3sObjects(CONTAINER, "demo-cluster", 30_000);
+
+            assertEquals(4, listings.size());
+            assertEquals(1, labels.getAllValues().size());
+        }
+
+        @Test
+        void marksWhatExistsAndWarnsAtTheDeadline() {
+            listingReturns(ok(listing("1111", false)));
+
+            List<LogRecord> logs = LogCapture.capture(EksClusterManager.class,
+                    () -> manager.markEksManagedK3sObjects(CONTAINER, "demo-cluster", 0));
+
+            assertEquals(1, listings.size());
+            assertEquals(1, labels.getAllValues().size());
+            assertTrue(logs.stream().anyMatch(record -> record.getLevel().intValue() >= Level.WARNING.intValue()
+                            && String.valueOf(record.getMessage()).contains("gave up waiting")
+                            && Arrays.toString(record.getParameters()).contains("ServiceAccount token-cleaner")),
                     () -> logs.stream().map(LogRecord::getMessage).toList().toString());
         }
     }

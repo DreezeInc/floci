@@ -3378,9 +3378,8 @@ public interface EmulatorConfig {
          * --disable-kube-proxy} instead of its bundled networking stack. k3s's default flannel CNI
          * and kube-proxy run embedded in the k3s server process itself (not separate, killable
          * DaemonSets), so a real CNI (e.g. Cilium) can only cleanly take over if k3s never starts
-         * its own in the first place: there is no way to evict them after the fact. CoreDNS,
-         * local-path-provisioner, and metrics-server are unaffected; they don't depend on which CNI
-         * is in place.
+         * its own in the first place: there is no way to evict them after the fact. CoreDNS and
+         * local-path-provisioner are unaffected; they don't depend on which CNI is in place.
          */
         @WithDefault("false")
         boolean disableCni();

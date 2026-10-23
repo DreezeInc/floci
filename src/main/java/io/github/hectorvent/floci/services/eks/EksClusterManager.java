@@ -143,6 +143,9 @@ public class EksClusterManager
     static final String POD_IDENTITY_MANIFEST_TAR_ENTRY = "server/manifests/" + POD_IDENTITY_MANIFEST_FILE;
     static final String EBS_STORAGE_MANIFEST_FILE = "floci-eks-ebs-storage.yaml";
     static final String EBS_STORAGE_MANIFEST_TAR_ENTRY = "server/manifests/" + EBS_STORAGE_MANIFEST_FILE;
+    static final String CONTROL_PLANE_MANIFEST_FILE = "floci-eks-control-plane.yaml";
+    static final String CONTROL_PLANE_MANIFEST_TAR_ENTRY = "server/manifests/" + CONTROL_PLANE_MANIFEST_FILE;
+    static final String CONTROL_PLANE_MANIFEST_RESOURCE = "eks/control-plane-objects.yaml";
     static final String EBS_CSI_PROVISIONER = "ebs.csi.aws.com";
     static final String EBS_CSI_SOCKET_IMAGE = "alpine/socat:1.8.0.3";
     static final String EBS_CSI_PROVISIONER_IMAGE = "registry.k8s.io/sig-storage/csi-provisioner:v5.2.0";
@@ -833,6 +836,7 @@ public class EksClusterManager
         linkContainerdCertsDir(containerId, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
         registerEbsStorageEmulation(containerId, cluster);
+        registerEksControlPlaneObjects(containerId, cluster.getName());
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
@@ -1103,6 +1107,7 @@ public class EksClusterManager
             }
 
             labelK3sPlatformRbac(containerId, cluster.getName(), K3S_PLATFORM_RBAC_WAIT_MILLIS);
+            markEksManagedK3sObjects(containerId, cluster.getName(), K3S_PLATFORM_RBAC_WAIT_MILLIS);
 
             pruneLegacyClusterNodes(cluster, containerId);
 
@@ -1154,6 +1159,44 @@ public class EksClusterManager
             Thread.currentThread().interrupt();
         } catch (RuntimeException e) {
             LOG.warnv("Could not label the k3s platform RBAC of EKS cluster {0}: {1}", clusterName, e.getMessage());
+        }
+    }
+
+    /** Waits for k3s's manifests and bookkeeping objects so the cluster never turns ACTIVE before they are marked. */
+    void markEksManagedK3sObjects(String containerId, String clusterName, long waitMillis) {
+        long deadline = System.currentTimeMillis() + waitMillis;
+        try {
+            while (true) {
+                ContainerExec.Result checksums = execInContainerForStdout(containerId,
+                        EksK3sManagedObjects.READ_CHECKSUMS_COMMAND, K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS);
+                ContainerExec.Result listed = execInContainerForStdout(containerId,
+                        EksK3sManagedObjects.LIST_COMMAND, K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS);
+                EksK3sManagedObjects.Listing listing = listed.timedOut() || listed.exitCode() != 0
+                        ? new EksK3sManagedObjects.Listing(List.of(listed.summary()), Optional.empty())
+                        : EksK3sManagedObjects.parse(listed.stdout(), checksums.stdout());
+                boolean expired = System.currentTimeMillis() >= deadline;
+                if (listing.complete() || expired) {
+                    if (!listing.complete()) {
+                        LOG.warnv("EKS cluster {0} gave up waiting for {1}; k3s objects that appear later read as "
+                                + "customer objects", clusterName, String.join(", ", listing.missing()));
+                    }
+                    if (listing.markCommand().isPresent()) {
+                        ContainerExec.Result marked = execInContainerForResult(containerId,
+                                listing.markCommand().get(), K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS);
+                        if (marked.timedOut() || marked.exitCode() != 0) {
+                            LOG.warnv("Could not mark the k3s objects of EKS cluster {0} as EKS-managed: {1}",
+                                    clusterName, marked.summary());
+                        }
+                    }
+                    return;
+                }
+                Thread.sleep(K3S_PLATFORM_RBAC_POLL_MILLIS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not mark the k3s objects of EKS cluster {0} as EKS-managed: {1}",
+                    clusterName, e.getMessage());
         }
     }
 
@@ -1617,6 +1660,7 @@ public class EksClusterManager
         List<String> serverArgs = new ArrayList<>(List.of("server",
                 "--disable=traefik",
                 "--disable=runtimes",
+                "--disable=metrics-server",
                 "--tls-san=localhost"));
         endpointHost.filter(host -> !host.isBlank()).ifPresent(host -> serverArgs.add("--tls-san=" + host));
         if (!defaultStorageClass) {
@@ -2420,6 +2464,30 @@ public class EksClusterManager
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no EBS storage emulation: could not copy {1} into the k3s "
                     + "container: {2}", clusterName, EBS_STORAGE_MANIFEST_FILE, e.getMessage());
+        }
+    }
+
+    /**
+     * Gives the cluster the kube-system ServiceAccounts, Service and RBAC that the EKS control plane
+     * creates. Floci's control plane does not act through them; their rules are minimal stand-ins.
+     */
+    void registerEksControlPlaneObjects(String containerId, String clusterName) {
+        try (InputStream manifest = Thread.currentThread().getContextClassLoader()
+                .getResourceAsStream(CONTROL_PLANE_MANIFEST_RESOURCE)) {
+            if (manifest == null) {
+                LOG.warnv("EKS cluster {0} gets no EKS control plane objects: resource {1} is missing",
+                        clusterName, CONTROL_PLANE_MANIFEST_RESOURCE);
+                return;
+            }
+            lifecycleManager.getDockerClient()
+                    .copyArchiveToContainerCmd(containerId)
+                    .withTarInputStream(new ByteArrayInputStream(tarSingleFile(CONTROL_PLANE_MANIFEST_TAR_ENTRY,
+                            new String(manifest.readAllBytes(), StandardCharsets.UTF_8))))
+                    .withRemotePath(K3S_DATA_DIR)
+                    .exec();
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} gets no EKS control plane objects: could not copy {1} into the k3s "
+                    + "container: {2}", clusterName, CONTROL_PLANE_MANIFEST_FILE, e.getMessage());
         }
     }
 

@@ -693,7 +693,16 @@ Before a cluster turns `ACTIVE`, on creation and on every start Floci drives, Fl
 
 With `load-balancer-services: true`, new clusters run without k3s's cloud controller manager, so the `ccm` objects do not exist. The kubelet then sets the node's addresses itself: the `Hostname` address is the node name rather than the container ID, and the node carries no `node.kubernetes.io/instance-type: k3s` or `failure-domain.beta.kubernetes.io/*` labels. A node group still sets the instance type label. `floci:kube-cloud-controller-manager-arg:*` tags have no effect in this mode.
 
-New clusters also start k3s with `--disable=runtimes`: the RuntimeClasses it would create (`nvidia`, `crun`, `wasmedge` and others) have no EKS counterpart. A restored container keeps the k3s arguments it was created with.
+New clusters also start k3s with `--disable=runtimes` and `--disable=metrics-server`: the RuntimeClasses it would create (`nvidia`, `crun`, `wasmedge` and others) and its metrics-server have no counterpart on a new EKS cluster. A restored container keeps the k3s arguments it was created with.
+
+EKS applies the objects of its add-ons, such as CoreDNS, server-side as the field manager `eks`. Tools use that manager to tell add-on objects from customer objects. Before a cluster turns `ACTIVE`, Floci waits until k3s has applied every manifest, and then applies the label `eks.amazonaws.com/component` server-side as the field manager `eks` to:
+
+- The objects of the manifests that stand in for EKS add-ons. The label value is `coredns` for the `coredns` manifest, `aws-ebs-csi-driver` for the EBS storage manifest and `pod-identity-webhook` for the Pod Identity manifest.
+- The objects of k3s that have no EKS counterpart, with the label value `k3s`. These are its `Addon` objects, the CRDs of the `k3s.cattle.io` and `helm.cattle.io` groups, the Secrets `k3s-serving` and `<node>.node-password.k3s`, the ConfigMap `cluster-dns`, the ServiceAccount `token-cleaner`, and the objects of the `local-storage` manifest.
+
+If these objects do not exist after 60 seconds, Floci marks the objects that exist and logs a warning.
+
+Floci also adds the `kube-system` objects that the EKS control plane creates: the ServiceAccounts `aws-cloud-provider`, `service-controller` and `tagging-controller`, the Service `eks-extension-metrics-api`, the ClusterRole and ClusterRoleBinding `eks:tagging-controller`, and a Role and RoleBinding for each of the users `eks:addon-manager`, `eks:authenticator`, `eks:az-poller`, `eks:coredns-autoscaler`, `eks:fargate-manager`, `eks:network-policy-controller`, `eks:node-manager`, `eks:service-operations` and `eks:vpc-resource-controller`. Floci's control plane does not act through them, and their rules are minimal stand-ins. As on EKS, they do not have the field manager `eks`.
 
 #### Load balancer targets
 
