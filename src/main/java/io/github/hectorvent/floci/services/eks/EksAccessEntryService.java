@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -34,8 +35,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Predicate;
 
-/** Access-entry and access-policy association metadata; Kubernetes authorization is handled separately. */
+/** Access entries and their access-policy associations, which the cluster webhooks authenticate and authorize by. */
 @ApplicationScoped
 public class EksAccessEntryService {
     private static final List<String> ACCESS_POLICY_NAMES = List.of(
@@ -49,6 +51,7 @@ public class EksAccessEntryService {
             "AmazonEKSLoadBalancingPolicy", "AmazonEKSNetworkingClusterPolicy", "AmazonEKSNetworkingPolicy",
             "AmazonEKSPodIdentityPolicy", "AmazonEKSSecretAdminPolicy", "AmazonEKSSecretReaderPolicy",
             "AmazonEKSViewPolicy");
+    static final String CLUSTER_ADMIN_POLICY = "AmazonEKSClusterAdminPolicy";
     private static final int MAX_PAGE_SIZE = 100;
 
     private final StorageBackend<String, StoredEntry> entries;
@@ -238,8 +241,102 @@ public class EksAccessEntryService {
                 "InvalidParameterException");
     }
 
-    private static String accessPolicyArn(String partition, String name) {
+    static String accessPolicyArn(String partition, String name) {
         return "arn:" + partition + ":eks::aws:cluster-access-policy/" + name;
+    }
+
+    /** The policy name of an access-policy ARN, or null when the ARN names no access policy. */
+    static String accessPolicyName(String policyArn) {
+        int slash = policyArn == null ? -1 : policyArn.indexOf(":cluster-access-policy/");
+        return slash < 0 ? null : policyArn.substring(slash + ":cluster-access-policy/".length());
+    }
+
+    /** The account root and IAM users and roles that signed the request; the root when none did. */
+    String callerPrincipalArn(String accessKeyId, String partition, String accountId) {
+        return Optional.ofNullable(accessKeyId).flatMap(iam::resolveCallerArns)
+                .map(IamService.CallerArns::principalArn)
+                .orElse(AwsArnUtils.Arn.global(partition, "iam", accountId, "root").toString());
+    }
+
+    /** The cluster creator's admin entry, which EKS creates whenever the cluster's mode includes API. */
+    synchronized void bootstrapCreator(Cluster cluster, String principal) {
+        String[] arn = principal == null ? new String[0] : principal.split(":", 6);
+        if (arn.length != 6 || !"iam".equals(arn[2]) || !arn[4].matches("[0-9]{12}")) {
+            return;
+        }
+        String key = prefix(cluster) + principal;
+        if (getIn(cluster, key).isPresent()) {
+            return;
+        }
+        String name = principal.substring(principal.lastIndexOf('/') + 1);
+        String kind;
+        String principalId;
+        String username;
+        if ("root".equals(arn[5])) {
+            kind = "root";
+            principalId = null;
+            username = principal;
+        } else if (arn[5].startsWith("role/")) {
+            kind = "role";
+            principalId = iam.findRole(arn[4], name).filter(value -> principal.equals(value.getArn()))
+                    .map(IamRole::getRoleId).orElse(null);
+            username = "arn:" + arn[1] + ":sts::" + arn[4] + ":assumed-role/" + name + "/{{SessionName}}";
+        } else if (arn[5].startsWith("user/")) {
+            kind = "user";
+            principalId = iam.findUser(arn[4], name).filter(value -> principal.equals(value.getArn()))
+                    .map(IamUser::getUserId).orElse(null);
+            username = principal;
+        } else {
+            return;
+        }
+        if (principalId == null && !"root".equals(kind)) {
+            return;
+        }
+        String[] clusterArn = cluster.getArn().split(":", 6);
+        double now = now();
+        AccessEntry entry = new AccessEntry("arn:" + clusterArn[1] + ":eks:" + clusterArn[3] + ":"
+                + clusterArn[4] + ":access-entry/" + cluster.getName() + "/" + kind + "/" + arn[4] + "/"
+                + ("root".equals(kind) ? "" : name + "/") + UUID.randomUUID(), cluster.getName(), principal,
+                "STANDARD", username, List.of(), Map.of(), now, now);
+        AssociatedAccessPolicy admin = new AssociatedAccessPolicy(
+                accessPolicyArn(partition(cluster), CLUSTER_ADMIN_POLICY), new AccessScope("cluster", List.of()),
+                now, now);
+        putIn(cluster, key, new StoredEntry(entry, principalId, null, List.of(admin)));
+    }
+
+    /** The entry of this principal, provided it was created for the same IAM principal id. */
+    synchronized Optional<StoredEntry> principalEntry(Cluster cluster, String principal, String principalId) {
+        return getIn(cluster, prefix(cluster) + principal)
+                .filter(stored -> Objects.equals(stored.principalId(), principalId));
+    }
+
+    synchronized Optional<StoredEntry> standardEntryById(Cluster cluster, String principalId) {
+        String prefix = prefix(cluster);
+        return scanIn(cluster, key -> key.startsWith(prefix)).stream()
+                .filter(stored -> principalId.equals(stored.principalId()))
+                .filter(stored -> "STANDARD".equals(stored.entry().type())).findFirst();
+    }
+
+    private Optional<StoredEntry> getIn(Cluster cluster, String key) {
+        return entries instanceof AccountAwareStorageBackend<StoredEntry> aware
+                ? aware.getForAccount(account(cluster), key) : entries.get(key);
+    }
+
+    private List<StoredEntry> scanIn(Cluster cluster, Predicate<String> keys) {
+        return entries instanceof AccountAwareStorageBackend<StoredEntry> aware
+                ? aware.scanForAccount(account(cluster), keys) : entries.scan(keys);
+    }
+
+    private void putIn(Cluster cluster, String key, StoredEntry value) {
+        if (entries instanceof AccountAwareStorageBackend<StoredEntry> aware) {
+            aware.putForAccount(account(cluster), key, value);
+        } else {
+            entries.put(key, value);
+        }
+    }
+
+    private static String account(Cluster cluster) {
+        return cluster.getArn().split(":", 6)[4];
     }
 
     synchronized Optional<AccessEntry> workerEntry(Cluster cluster, String accountId, String principal, String roleId) {

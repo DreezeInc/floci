@@ -101,6 +101,35 @@ class EksAccessEntryIntegrationTest {
         }
     }
 
+    @Test
+    void creatorEntryIsVisibleInApiModesWhileTheCreatorStaysOffTheClusterShape() {
+        String account = "135791357913";
+        String name = "creator-" + UUID.randomUUID().toString().substring(0, 8);
+        String root = "arn:aws:iam::" + account + ":root";
+        String path = "/clusters/" + name + "/access-entries";
+        given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + account + ":role/cluster",
+                        "accessConfig", Map.of("authenticationMode", "API")))
+                .post("/clusters").then().statusCode(200)
+                .body("cluster.accessConfig.bootstrapClusterCreatorAdminPermissions", equalTo(true))
+                .body("cluster", not(hasKey("creatorPrincipalArn")));
+        try {
+            given().header("Authorization", auth(account, "eks")).get(path).then().statusCode(200)
+                    .body("accessEntries", contains(root));
+            given().header("Authorization", auth(account, "eks")).urlEncodingEnabled(false)
+                    .get(path + "/" + URLEncoder.encode(root, StandardCharsets.UTF_8) + "/access-policies")
+                    .then().statusCode(200)
+                    .body("associatedAccessPolicies.policyArn",
+                            contains("arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"))
+                    .body("associatedAccessPolicies[0].accessScope.type", equalTo("cluster"));
+            given().header("Authorization", auth(account, "eks")).get("/clusters/" + name).then()
+                    .statusCode(200).body("cluster", not(hasKey("creatorPrincipalArn")));
+        } finally {
+            given().header("Authorization", auth(account, "eks")).delete("/clusters/" + name)
+                    .then().statusCode(200);
+        }
+    }
+
     private static void createCluster(String account, String name, String mode) {
         given().header("Authorization", auth(account, "eks")).contentType("application/json")
                 .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + account + ":role/cluster",

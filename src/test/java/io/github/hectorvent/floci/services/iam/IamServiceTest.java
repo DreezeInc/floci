@@ -3468,5 +3468,60 @@ class IamServiceTest {
         Optional<String> nullOpt = iamService.resolveCallerUserId("ASIATOKENCHECKKEY", null);
         assertTrue(nullOpt.isEmpty());
     }
+
+    @Test
+    void eksPrincipalOfALongTermKeyIsItsUserInTheAccountThatVerifiedIt() {
+        AccountAwareStorageBackend<AccessKey> keys = new AccountAwareStorageBackend<>(
+                new InMemoryStorage<>(), null, "000000000000");
+        IamService service = iamService(false, keys);
+        IamUser user = service.createUser("writer", "/");
+        AccessKey key = service.createAccessKey("writer");
+
+        IamService.EksPrincipal principal = service.findEksPrincipal(key.getAccessKeyId(), "000000000000")
+                .orElseThrow();
+
+        assertEquals(new IamService.EksPrincipal(user.getArn(), user.getArn(), user.getUserId(), user.getUserId(),
+                null, "000000000000"), principal);
+        assertTrue(service.findEksPrincipal(key.getAccessKeyId(), "111122223333").isEmpty());
+        assertTrue(service.findEksPrincipal(key.getAccessKeyId(), null).isEmpty());
+        service.updateAccessKey("writer", key.getAccessKeyId(), "Inactive");
+        assertTrue(service.findEksPrincipal(key.getAccessKeyId(), "000000000000").isEmpty());
+    }
+
+    @Test
+    void eksPrincipalOfARoleSessionKeepsTheRolePathAndTheCurrentRoleId() {
+        InMemoryStorage<String, SessionCredential> sessions = new InMemoryStorage<>();
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        IamRole role = service.createRole("reader-role", "/team/", "{}", null, 0, null);
+        SessionCredential session = new SessionCredential("ASIAREADERSESSION01", "secret", "token", role.getArn(),
+                Instant.now().plusSeconds(600), null);
+        session.setRoleSessionName("alice@corp");
+        session.setAssumedRoleId(role.getRoleId() + ":alice@corp");
+        sessions.put(session.getAccessKeyId(), session);
+
+        IamService.EksPrincipal principal = service.findEksPrincipal("ASIAREADERSESSION01", null).orElseThrow();
+
+        assertEquals("arn:aws:iam::000000000000:role/team/reader-role", principal.principalArn());
+        assertEquals("arn:aws:sts::000000000000:assumed-role/reader-role/alice@corp", principal.callerArn());
+        assertEquals(role.getRoleId(), principal.principalId());
+        assertEquals(role.getRoleId() + ":alice@corp", principal.userId());
+        assertEquals("alice@corp", principal.sessionName());
+        session.setExpiration(Instant.now().minusSeconds(1));
+        assertTrue(service.findEksPrincipal("ASIAREADERSESSION01", null).isEmpty());
+    }
+
+    @Test
+    void eksPrincipalOfARootSessionIsTheRootWithoutAPrincipalId() {
+        InMemoryStorage<String, SessionCredential> sessions = new InMemoryStorage<>();
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+        SessionCredential session = new SessionCredential("ASIAROOTSESSION0001", "secret", "token", null,
+                Instant.now().plusSeconds(600), null);
+        session.setIssuerArn("arn:aws:iam::000000000000:root");
+        sessions.put(session.getAccessKeyId(), session);
+
+        assertEquals(new IamService.EksPrincipal("arn:aws:iam::000000000000:root",
+                "arn:aws:iam::000000000000:root", null, "000000000000", null, "000000000000"),
+                service.findEksPrincipal("ASIAROOTSESSION0001", null).orElseThrow());
+    }
 }
 

@@ -10,8 +10,10 @@ import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterStatus;
 import io.github.hectorvent.floci.services.eks.model.CreateAccessEntryRequest;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.IamService.EksPrincipal;
 import io.github.hectorvent.floci.services.iam.IamService.EksSessionIdentity;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,6 +32,7 @@ class EksWorkerAuthenticationTest {
     private static final String OTHER_ACCOUNT = "111122223333";
     private static final String DEFAULT_ACCOUNT = "000000000000";
     private static final String LONG_TERM_KEY = "AKIAUSERKEY";
+    private static final String USER = "arn:aws:iam::" + ACCOUNT + ":user/operator";
     private static final String REGION = "us-east-1";
     private static final String ROLE = "arn:aws:iam::" + ACCOUNT + ":role/path/worker";
     private static final String KEY = "ASIAWORKER";
@@ -42,7 +45,9 @@ class EksWorkerAuthenticationTest {
     private final Instance instance = new Instance();
     private final IamRole role = new IamRole("AROA-original", "worker", "/path/", ROLE, "{}");
     private final EmulatorConfig config = mock(EmulatorConfig.class);
-    private final EksWorkerAuthentication auth = new EksWorkerAuthentication(iam, eks, ec2, entries, config);
+    private final EksClusterManager clusters = mock(EksClusterManager.class);
+    private final EksIamAuthentication auth = new EksIamAuthentication(iam, eks, entries, clusters,
+            new EksWorkerAuthentication(iam, eks, ec2, entries), config);
     private final EksTokenValidator.VerifiedToken verified = new EksTokenValidator.VerifiedToken(KEY, REGION, null);
 
     @BeforeEach
@@ -65,6 +70,8 @@ class EksWorkerAuthenticationTest {
         when(iam.findEksSessionIdentity(KEY)).thenReturn(Optional.of(
                 new EksSessionIdentity(ACCOUNT, ROLE, role.getRoleId(), instance.getInstanceId())));
         when(eks.findAuthenticationCluster(ACCOUNT, "demo")).thenReturn(Optional.of(cluster));
+        when(eks.findWebhookCluster(any(), any(), any(), any())).thenCallRealMethod();
+        when(clusters.readAwsAuth(any())).thenReturn(EksAwsAuth.NONE);
         when(ec2.findInstanceForAccount(ACCOUNT, REGION, "i-worker")).thenReturn(Optional.of(instance));
         createEntry("EC2_LINUX");
     }
@@ -89,16 +96,24 @@ class EksWorkerAuthenticationTest {
     }
 
     @Test
-    void longTermKeyOfTheClustersAccountGetsTheLegacyIdentity() {
+    void longTermKeyOfTheClustersAccountNeedsAnAccessEntryAndIsNotAnAdministrator() {
         when(iam.findEksSessionIdentity(LONG_TERM_KEY)).thenReturn(Optional.empty());
-        Optional<Map<String, Object>> user = auth.authenticate(longTermToken(ACCOUNT), "demo", ACCOUNT, REGION, CREATED.toString());
-        assertEquals(List.of("system:masters"), user.orElseThrow().get("groups"));
+        when(iam.findEksPrincipal(LONG_TERM_KEY, ACCOUNT)).thenReturn(Optional.of(operator(ACCOUNT)));
+        assertTrue(auth.authenticate(longTermToken(ACCOUNT), "demo", ACCOUNT, REGION, CREATED.toString()).isEmpty());
+
+        createOperatorEntry(cluster, ACCOUNT);
+        Map<String, Object> user = auth.authenticate(longTermToken(ACCOUNT), "demo", ACCOUNT, REGION,
+                CREATED.toString()).orElseThrow();
+        assertEquals(USER, user.get("username"));
+        assertEquals(List.of("operators"), user.get("groups"));
         verify(iam, never()).resolveAccountId(any());
     }
 
     @Test
     void longTermKeyOfAnotherAccountIsRejected() {
+        createOperatorEntry(cluster, ACCOUNT);
         when(iam.findEksSessionIdentity(LONG_TERM_KEY)).thenReturn(Optional.empty());
+        when(iam.findEksPrincipal(LONG_TERM_KEY, OTHER_ACCOUNT)).thenReturn(Optional.of(operator(OTHER_ACCOUNT)));
         assertTrue(auth.authenticate(longTermToken(OTHER_ACCOUNT), "demo", ACCOUNT, REGION, CREATED.toString()).isEmpty());
     }
 
@@ -109,11 +124,32 @@ class EksWorkerAuthenticationTest {
     }
 
     @Test
-    void unscopedWebhookAdmitsOnlyTheDefaultAccountsKeys() {
+    void unscopedWebhookAuthenticatesAgainstTheDefaultAccountsCluster() {
         // Clusters created before scoped webhook paths call it without an account.
+        Cluster legacy = new Cluster();
+        legacy.setName("demo");
+        legacy.setArn("arn:aws:eks:" + REGION + ":" + DEFAULT_ACCOUNT + ":cluster/demo");
+        legacy.setStatus(ClusterStatus.ACTIVE);
+        legacy.setAccessConfig(new AccessConfig("API", false));
+        when(eks.findAuthenticationCluster(DEFAULT_ACCOUNT, "demo")).thenReturn(Optional.of(legacy));
+        createOperatorEntry(legacy, DEFAULT_ACCOUNT);
         when(iam.findEksSessionIdentity(LONG_TERM_KEY)).thenReturn(Optional.empty());
+        when(iam.findEksPrincipal(LONG_TERM_KEY, DEFAULT_ACCOUNT)).thenReturn(Optional.of(operator(DEFAULT_ACCOUNT)));
+        when(iam.findEksPrincipal(LONG_TERM_KEY, OTHER_ACCOUNT)).thenReturn(Optional.of(operator(OTHER_ACCOUNT)));
         assertTrue(auth.authenticate(longTermToken(DEFAULT_ACCOUNT), "demo", null, null, null).isPresent());
         assertTrue(auth.authenticate(longTermToken(OTHER_ACCOUNT), "demo", null, null, null).isEmpty());
+    }
+
+    private static EksPrincipal operator(String account) {
+        String arn = "arn:aws:iam::" + account + ":user/operator";
+        return new EksPrincipal(arn, arn, "AIDAOPERATOR" + account, "AIDAOPERATOR" + account, null, account);
+    }
+
+    private void createOperatorEntry(Cluster target, String account) {
+        String arn = "arn:aws:iam::" + account + ":user/operator";
+        when(iam.findUser(account, "operator")).thenReturn(Optional.of(
+                new IamUser("AIDAOPERATOR" + account, "operator", "/", arn)));
+        entries.create(target, new CreateAccessEntryRequest(arn, null, null, List.of("operators"), null, null));
     }
 
     private static EksTokenValidator.VerifiedToken longTermToken(String keyAccountId) {

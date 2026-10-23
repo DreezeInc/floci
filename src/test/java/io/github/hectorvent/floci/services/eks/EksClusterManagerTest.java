@@ -137,6 +137,27 @@ class EksClusterManagerTest {
     }
 
     @Test
+    void authorizationWebhookPathCarriesTheSameClusterScope() {
+        Cluster cluster = new Cluster();
+        cluster.setName("demo");
+        cluster.setAccountId("123456789012");
+        cluster.setArn("arn:aws:eks:us-west-2:123456789012:cluster/demo");
+        cluster.setCreatedAt(Instant.parse("2026-09-17T00:00:00Z"));
+        assertEquals("/_floci/eks/clusters/demo/authorization-webhook/scope/123456789012"
+                + "/us-west-2/2026-09-17T00:00:00Z", EksClusterManager.authorizationWebhookPath(cluster, "cn-north-1"));
+    }
+
+    @Test
+    void authorizationWebhookRunsAfterNodeAndRbacWithV1AndShortCaches() {
+        assertEquals(List.of("--kube-apiserver-arg=authorization-mode=Node,RBAC,Webhook",
+                "--kube-apiserver-arg=authorization-webhook-config-file=/etc/authorization-webhook.yaml",
+                "--kube-apiserver-arg=authorization-webhook-version=v1",
+                "--kube-apiserver-arg=authorization-webhook-cache-authorized-ttl=30s",
+                "--kube-apiserver-arg=authorization-webhook-cache-unauthorized-ttl=10s"),
+                EksClusterManager.authorizationWebhookArgs());
+    }
+
+    @Test
     void webhookPathBindsAuthenticationToOneCluster() {
         assertEquals("/_floci/eks/clusters/demo/token-webhook", EksClusterManager.webhookPath("demo"));
     }
@@ -2233,6 +2254,32 @@ class EksClusterManagerTest {
                     Mockito.mock(ContainerDetector.class), Mockito.mock(PortAllocator.class),
                     Mockito.mock(DockerHostResolver.class), Mockito.mock(EcrRegistryManager.class),
                     config, regionResolver, null, oidcService, null, null, nodeGroupStorage);
+        }
+
+        @Test
+        void iamWebhookAlsoInstallsTheAccessPolicyAuthorizer(@TempDir Path tempDir) throws Exception {
+            when(eks.iamAuthWebhook()).thenReturn(true);
+            when(eks.dataPath()).thenReturn(tempDir.toString());
+            Cluster cluster = new Cluster();
+            cluster.setName("my-cluster");
+            cluster.setAccountId("000000000000");
+            cluster.setArn("arn:aws:eks:us-east-1:000000000000:cluster/my-cluster");
+            cluster.setCreatedAt(Instant.parse("2026-09-17T00:00:00Z"));
+
+            manager.startCluster(cluster);
+
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<List<String>> cmdCaptor = ArgumentCaptor.forClass(List.class);
+            verify(builder).withCmd(cmdCaptor.capture());
+            List<String> cmd = cmdCaptor.getValue();
+            assertTrue(cmd.contains("--kube-apiserver-arg=authentication-token-webhook-config-file=/etc/token-webhook.yaml"));
+            assertTrue(cmd.containsAll(EksClusterManager.authorizationWebhookArgs()));
+            Path kubeconfig = tempDir.resolve("webhook").resolve("my-cluster").resolve("authorization-webhook.yaml");
+            String yaml = Files.readString(kubeconfig);
+            assertTrue(yaml.contains("/_floci/eks/clusters/my-cluster/authorization-webhook/scope/000000000000"
+                    + "/us-east-1/2026-09-17T00:00:00Z"));
+            assertTrue(yaml.contains("current-context: floci-authorization-webhook"));
+            verify(copyCmd).withHostResource(kubeconfig.toString());
         }
 
         @Test

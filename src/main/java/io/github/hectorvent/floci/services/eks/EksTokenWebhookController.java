@@ -21,13 +21,13 @@ import java.util.Optional;
  * <p>The k3s API server is configured (see {@code EksClusterManager}) to POST a
  * {@code TokenReview} here whenever it receives a bearer token it does not recognise, notably the
  * {@code k8s-aws-v1.<presigned-sts-url>} token produced by {@code aws eks get-token}. Floci validates
- * the request signature, expiration, and signed cluster ID before resolving worker access entries.
- * Non-worker credentials retain the legacy cluster-admin compatibility behavior.
+ * the request signature, expiration, and signed cluster ID, then maps the caller through the
+ * cluster's access entries or {@code aws-auth}, as its authentication mode allows.
  *
  * <p>New clusters use {@code token-webhook/scope/{accountId}/{region}/{createdAt}}, keeping
  * scope in the path because Kubernetes client-go replaces URL query parameters. The base
  * {@code token-webhook} route retains query-parameter scope for legacy compatibility;
- * unscoped requests cannot authenticate workers.
+ * unscoped requests resolve the cluster in the default account and cannot authenticate workers.
  *
  * <p>This is Floci plumbing under the {@code _floci/...} namespace, not an AWS API.
  */
@@ -39,10 +39,10 @@ public class EksTokenWebhookController {
 
     private static final Logger LOG = Logger.getLogger(EksTokenWebhookController.class);
     private final EksTokenValidator tokenValidator;
-    private final EksWorkerAuthentication authentication;
+    private final EksIamAuthentication authentication;
 
     @Inject
-    public EksTokenWebhookController(EksTokenValidator tokenValidator, EksWorkerAuthentication authentication) {
+    public EksTokenWebhookController(EksTokenValidator tokenValidator, EksIamAuthentication authentication) {
         this.tokenValidator = tokenValidator;
         this.authentication = authentication;
     }

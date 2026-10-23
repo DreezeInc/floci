@@ -127,8 +127,16 @@ public class Cluster {
 
     private AccessConfig accessConfig;
 
+    // Internal persisted principal that bootstrapClusterCreatorAdminPermissions grants admin to.
+    @JsonProperty("creatorPrincipalArn")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String creatorPrincipalArn;
+
     public AccessConfig getAccessConfig() { return accessConfig; }
     public void setAccessConfig(AccessConfig accessConfig) { this.accessConfig = accessConfig; }
+
+    public String getCreatorPrincipalArn() { return creatorPrincipalArn; }
+    public void setCreatorPrincipalArn(String creatorPrincipalArn) { this.creatorPrincipalArn = creatorPrincipalArn; }
 
     public Map<String, String> getJoinedInstanceIds() {
         if (joinedInstanceIds != null && !(joinedInstanceIds instanceof ConcurrentHashMap)) {
@@ -254,6 +262,7 @@ public class Cluster {
         c.defaultStorageClass = this.defaultStorageClass;
         c.joinedInstanceIds = this.joinedInstanceIds != null ? new ConcurrentHashMap<>(this.joinedInstanceIds) : null;
         c.accessConfig = this.accessConfig;
+        c.creatorPrincipalArn = this.creatorPrincipalArn;
         return c;
     }
 }

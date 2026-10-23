@@ -129,6 +129,37 @@ public final class IamServiceTestHelper {
         }
     }
 
+    /** As above, with the key's owner {@code test-user} stored in {@code accountId}, so its key resolves to a principal. */
+    public static IamService iamServiceWithUserKeyInAccount(String accessKeyId, String secretAccessKey,
+                                                            String accountId, String defaultAccountId) {
+        try {
+            Constructor<IamService> constructor = IamService.class.getDeclaredConstructor(
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    RegionResolver.class
+            );
+            constructor.setAccessible(true);
+
+            AccountAwareStorageBackend<IamUser> users =
+                    new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, defaultAccountId);
+            users.putForAccount(accountId, "test-user", new IamUser("AIDATESTUSER" + accountId, "test-user", "/",
+                    "arn:aws:iam::" + accountId + ":user/test-user"));
+            AccountAwareStorageBackend<AccessKey> accessKeys =
+                    new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, defaultAccountId);
+            accessKeys.putForAccount(accountId, accessKeyId, new AccessKey(accessKeyId, secretAccessKey, "test-user"));
+
+            return constructor.newInstance(users, null, null, null, accessKeys, null, null,
+                    new RegionResolver("us-east-1", defaultAccountId));
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to construct IamService test fixture", e);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     public static IamService iamServiceWithSessionCredential(String accessKeyId, String secretAccessKey) {
         return iamServiceWithSessionCredential(

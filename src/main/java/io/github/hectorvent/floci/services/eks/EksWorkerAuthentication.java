@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.eks;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -23,36 +22,17 @@ class EksWorkerAuthentication {
     private final EksService eks;
     private final Ec2Service ec2;
     private final EksAccessEntryService entries;
-    private final EmulatorConfig config;
 
     @Inject
-    EksWorkerAuthentication(IamService iam, EksService eks, Ec2Service ec2, EksAccessEntryService entries,
-                            EmulatorConfig config) {
+    EksWorkerAuthentication(IamService iam, EksService eks, Ec2Service ec2, EksAccessEntryService entries) {
         this.iam = iam;
         this.eks = eks;
         this.ec2 = ec2;
         this.entries = entries;
-        this.config = config;
     }
 
-    Optional<Map<String, Object>> authenticate(EksTokenValidator.VerifiedToken token, String name,
-                                               String account, String region, String createdAt) {
-        Optional<EksSessionIdentity> session = iam.findEksSessionIdentity(token.accessKeyId());
-        // Keep the existing non-worker compatibility path. Expired/revoked temporary sessions
-        // must never fall through to it after signature validation.
-        if (session.isEmpty()) {
-            if (IamService.isTemporaryAccessKey(token.accessKeyId())) {
-                return Optional.empty();
-            }
-            // The legacy identity is system:masters, so only a key of the cluster's own account gets it.
-            return Optional.ofNullable(token.keyAccountId())
-                    .filter(owner -> owner.equals(clusterAccount(account)))
-                    .flatMap(owner -> legacyIdentity());
-        }
-        EksSessionIdentity identity = session.get();
-        if (identity.instanceId() == null) {
-            return legacyIdentity();
-        }
+    Optional<Map<String, Object>> authenticate(EksTokenValidator.VerifiedToken token, EksSessionIdentity identity,
+                                               String name, String account, String region, String createdAt) {
         if (account == null || region == null || createdAt == null || !account.equals(identity.accountId())
                 || !region.equals(token.region()) || identity.roleArn() == null || identity.roleId() == null) {
             return Optional.empty();
@@ -102,15 +82,5 @@ class EksWorkerAuthentication {
         return iam.findInstanceProfile(account, arn.substring(arn.lastIndexOf('/') + 1))
                 .filter(profile -> arn.equals(profile.getArn()))
                 .filter(profile -> List.of(roleName).equals(profile.getRoleNames())).isPresent();
-    }
-
-    /** Unscoped webhook paths predate per-account clusters, so they serve the default account. */
-    private String clusterAccount(String account) {
-        return account != null ? account : config.defaultAccountId();
-    }
-
-    private static Optional<Map<String, Object>> legacyIdentity() {
-        return Optional.of(Map.of("username", "floci:aws-iam", "uid", "floci-aws-iam",
-                "groups", List.of("system:masters")));
     }
 }

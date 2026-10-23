@@ -4431,6 +4431,64 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 session.getOriginAccountId(), session.getRoleArn(), session.getEc2RoleId(), session.getEc2InstanceId()));
     }
 
+    /** principalArn keeps a role's path; principalId is null for the account root and federated users. */
+    public record EksPrincipal(String principalArn, String callerArn, String principalId, String userId,
+                               String sessionName, String accountId) {}
+
+    /** The webhook has no account in scope, so a long-term key is read from the account that verified it. */
+    public Optional<EksPrincipal> findEksPrincipal(String accessKeyId, String keyAccountId) {
+        if (!isTemporaryAccessKey(accessKeyId)) {
+            if (keyAccountId == null) {
+                return Optional.empty();
+            }
+            Optional<AccessKey> key = accessKeys instanceof AccountAwareStorageBackend<AccessKey> aware
+                    ? aware.getForAccount(keyAccountId, accessKeyId) : accessKeys.get(accessKeyId);
+            return key.filter(value -> "Active".equals(value.getStatus()))
+                    .flatMap(value -> findUser(keyAccountId, value.getUserName()))
+                    .map(user -> new EksPrincipal(user.getArn(), user.getArn(), user.getUserId(), user.getUserId(),
+                            null, keyAccountId));
+        }
+        Optional<SessionCredential> current = currentSession(accessKeyId);
+        if (current.isEmpty()) {
+            return Optional.empty();
+        }
+        SessionCredential session = current.get();
+        if (isFederatedUserSession(session)) {
+            AwsArnUtils.Arn federated = AwsArnUtils.parse(session.getRoleArn());
+            return Optional.of(new EksPrincipal(session.getRoleArn(), session.getRoleArn(), null,
+                    sessionUserId(session).orElse(null), null, federated.accountId()));
+        }
+        String roleArn = session.getRoleArn();
+        if (roleArn == null) {
+            if (session.getPresignedAction() != null) {
+                return Optional.empty();
+            }
+            if (issuedByRoot(session)) {
+                String rootArn = session.getIssuerArn();
+                String account = AwsArnUtils.parse(rootArn).accountId();
+                return Optional.of(new EksPrincipal(rootArn, rootArn, null, account, null, account));
+            }
+            return issuingUser(session).map(user -> new EksPrincipal(user.getArn(), user.getArn(),
+                    user.getUserId(), user.getUserId(), null, AwsArnUtils.parse(user.getArn()).accountId()));
+        }
+        if (!AwsArnUtils.isArnFor(roleArn, "iam")) {
+            return Optional.empty();
+        }
+        AwsArnUtils.Arn role = AwsArnUtils.parse(roleArn);
+        String roleName = roleArn.substring(roleArn.lastIndexOf('/') + 1);
+        String roleId = findRole(role.accountId(), roleName).filter(stored -> roleArn.equals(stored.getArn()))
+                .map(IamRole::getRoleId).orElse(null);
+        String sessionName = session.getRoleSessionName();
+        if (sessionName == null || sessionName.isBlank()) {
+            sessionName = session.getEc2InstanceId();
+        }
+        String callerArn = sessionName == null ? null : AwsArnUtils.Arn.global(role.partition(), "sts",
+                role.accountId(), "assumed-role/" + roleName + "/" + sessionName).toString();
+        String userId = roleId == null || sessionName == null ? sessionUserId(session).orElse(null)
+                : roleId + ":" + sessionName;
+        return Optional.of(new EksPrincipal(roleArn, callerArn, roleId, userId, sessionName, role.accountId()));
+    }
+
     private Optional<SessionCredential> currentSession(String accessKeyId) {
         return findSessionAnyAccount(accessKeyId).filter(session -> !isExpired(session, clock.instant()));
     }

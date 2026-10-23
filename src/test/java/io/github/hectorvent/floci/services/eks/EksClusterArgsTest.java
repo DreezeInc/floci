@@ -141,6 +141,10 @@ class EksClusterArgsTest {
             "authentication-token-webhook-config-file",
             "authentication-token-webhook-version",
             "authentication-token-webhook-cache-ttl",
+            "authorization-webhook-config-file",
+            "authorization-webhook-version",
+            "authorization-webhook-cache-authorized-ttl",
+            "authorization-webhook-cache-unauthorized-ttl=0s",
             "service-account-issuer",
             "service-account-key-file",
             "service-account-signing-key-file",
@@ -171,6 +175,7 @@ class EksClusterArgsTest {
             "authorization-mode+=AlwaysAllow",
             "authorization-mode-=AlwaysAllow",
             "authorization-mode+",
+            "authorization-config=/etc/authz.yaml",
             "storage-backend=etcd3",
             "storage-backend+=etcd3",
             "etcd-servers=https://127.0.0.1:2379"

@@ -105,11 +105,33 @@ a disassociation. Deleting a cluster drops its configs and their updates.
 
 `CreateCluster` accepts `accessConfig.authenticationMode` (`CONFIG_MAP`, `API_AND_CONFIG_MAP`, or `API`) and `bootstrapClusterCreatorAdminPermissions`. The API default is `CONFIG_MAP`; access-entry operations require an ACTIVE cluster created with `API` or `API_AND_CONFIG_MAP`.
 
+With `bootstrapClusterCreatorAdminPermissions` true (the default), the IAM principal that called `CreateCluster` becomes a cluster administrator, as in EKS. The principal is the role ARN with its path for an assumed-role session, the user ARN for a user's key, and the account root otherwise; a cluster that CloudFormation provisions bootstraps the account root, because the stack creates it without the caller's key. In `API` and `API_AND_CONFIG_MAP` the creator gets a visible STANDARD access entry with `AmazonEKSClusterAdminPolicy` at cluster scope. In `CONFIG_MAP` it gets invisible administrator access as `kubernetes-admin` in `system:masters`, and a later `UpdateClusterConfig` to an API mode gives the creator, and only the creator, its access entry. The creator is stored with the cluster, outside the `DescribeCluster` shape, so it survives a restart. With the flag false the creator gets no access.
+
 The four access-entry management operations support `STANDARD` (the default) and `EC2_LINUX`. STANDARD accepts existing IAM users or roles, including principals in another account. EC2_LINUX requires a role in the cluster account and generates `system:node:{{EC2PrivateDNSName}}`; custom usernames and Kubernetes groups are not accepted for node entries. Tags supplied at creation are preserved. Repeating a create with the same client token and normalized parameters returns the existing entry. Listing accepts `maxResults` from 1 to 100 and cluster-specific `nextToken` values.
 
 `UpdateAccessEntry` changes only the fields it is given: `kubernetesGroups` replaces the group list (an empty list clears it) and `username` replaces the username, with the same rules as create. EC2_LINUX entries accept neither. The entry's `modifiedAt` moves forward.
 
 Access entries use EKS storage and retain the IAM principal's stable ID internally. Cluster deletion removes its entries, and a cluster recreated with the same name does not inherit previous entries or pagination tokens.
+
+### Authentication of IAM principals
+
+In real mode the token webhook resolves the token's caller to its IAM principal: the role ARN with its path for an assumed-role session, the user ARN for a user's key or `GetSessionToken` session, and the root ARN for the account root. The cluster's authentication mode decides where that principal is looked up:
+
+| Mode | Consulted, in order |
+| --- | --- |
+| `API` | access entries |
+| `API_AND_CONFIG_MAP` | access entries, then `aws-auth` |
+| `CONFIG_MAP` | the cluster creator, then `aws-auth` |
+
+- A STANDARD entry matches on the principal ARN and the principal's stored ID. It authenticates with the entry's username, or the EKS default (`arn:aws:sts::<account>:assumed-role/<role-name>/{{SessionName}}` for a role, the principal ARN for a user or the root), and with the entry's `kubernetesGroups`. An entry of a deleted and recreated principal no longer matches, because the principal's ID changed. An entry of another type for the same principal rejects the request instead of falling back to `aws-auth`.
+- `aws-auth` `mapRoles` matches the role ARN without its path, as aws-iam-authenticator does, so a `rolearn` written with a path never matches. `mapUsers` matches the user ARN. ARNs compare case-insensitively, and when a principal is mapped twice the last mapping wins. A mapping needs a `username`. `mapAccounts` is not read.
+- When an access entry and an `aws-auth` mapping both match, the entry wins.
+- Usernames and groups resolve `{{AccountID}}`, `{{SessionName}}` (with `@` replaced by `-`), `{{SessionNameRaw}}` and `{{AccessKeyID}}`. `{{EC2PrivateDNSName}}` exists only for an instance session, so a mapping that uses it does not authenticate any other caller.
+- Anything else gets `401 Unauthorized`. A principal of another account matches only an entry or mapping that names it, so a key never reaches another account's cluster by accident.
+
+The authenticated user carries the principal in its `extra`, under the keys aws-iam-authenticator uses: `arn` (the caller, such as the `assumed-role` session ARN), `canonicalArn` (the IAM ARN, without a role's path), `sessionName`, `accessKeyId` and `principalId`. Its `uid` is `aws-iam-authenticator:<account>:<principal-id>`. Instance-profile sessions authenticate only through the EC2 Linux worker path below.
+
+Floci reads `aws-auth` through the cluster's own administrator credentials on every token review k3s has not cached, so a ConfigMap edit applies to new tokens at once. An `aws-auth` that cannot be read maps nobody.
 
 ### Access policies
 
@@ -117,7 +139,17 @@ Access entries use EKS storage and retain the IAM principal's stable ID internal
 
 `AssociateAccessPolicy` accepts only a policy from that catalog, in the cluster's partition, and only on a STANDARD entry. The `accessScope.type` is `cluster` or `namespace`: a `namespace` scope needs at least one namespace (wildcards such as `dev-*` are stored as given), and a `cluster` scope takes no namespaces and is returned with `namespaces: []`. Associating a policy that is already associated replaces its scope and moves `modifiedAt` forward while `associatedAt` stays. `ListAssociatedAccessPolicies` pages with `maxResults` (1-100) and `nextToken`. `DisassociateAccessPolicy` returns `ResourceNotFoundException` when the policy is not associated. Principal and policy ARNs travel URL-encoded in the path, as the AWS SDKs send them. A missing access entry is `ResourceNotFoundException` with the message `The specified principalArn could not be found.`, which Terraform's `aws_eks_access_policy_association` retries on.
 
-Associations are stored with their access entry, so deleting the entry or the cluster removes them. They are metadata only: Kubernetes authorization does not read them.
+Associations are stored with their access entry, so deleting the entry or the cluster removes them.
+
+In real mode Kubernetes enforces the associations through a second Floci webhook, `/_floci/eks/clusters/<cluster-name>/authorization-webhook`, which k3s consults after `Node` and `RBAC` (`authorization-mode=Node,RBAC,Webhook`, `authorization.k8s.io/v1` SubjectAccessReviews). For a cluster in `API` or `API_AND_CONFIG_MAP` mode, the webhook finds the STANDARD entry of the principal named in the user's `extra` and allows the request when one of the entry's associated policies allows it within its scope. Otherwise it returns no opinion (`allowed: false, denied: false`), so RBAC's answer stands and RBAC objects bound to an entry's groups or username keep working alongside its access policies, as in EKS.
+
+- `AmazonEKSClusterAdminPolicy` at cluster scope also adds `system:masters` to the authenticated groups, so the principal is a full administrator before any authorizer runs. At namespace scope it allows everything inside those namespaces.
+- `AmazonEKSAdminPolicy`, `AmazonEKSEditPolicy`, `AmazonEKSViewPolicy` and `AmazonEKSAdminViewPolicy` allow the API groups, resources and verbs that the AWS page *Review access policy permissions* lists for them. View reads workloads but not Secrets and writes nothing. AdminView reads every resource, Secrets included, and writes nothing. Edit writes workloads, ConfigMaps and Secrets, executes into pods and impersonates service accounts, but cannot change RBAC. Admin adds namespaced Roles, RoleBindings and `localsubjectaccessreviews`.
+- A `namespace` scope allows only requests inside one of its namespaces. A name ending in `*` matches by prefix (`dev-*` matches `dev-a`); any other name must match exactly. Cluster-scoped resources, listing across all namespaces, and non-resource URLs fall outside every namespace scope.
+- Every other access policy, such as `AmazonEKSSecretReaderPolicy` and the Auto Mode, hybrid-node, backup and capability policies, can be associated but grants nothing.
+- As in EKS, the policies are not Kubernetes objects: `kubectl auth can-i --list` does not show them, and a request that impersonates a user or group gets only that identity's RBAC permissions.
+
+Changes to entries and associations apply within the k3s webhook caches: 30 seconds for an authenticated token and for an allowed request, 10 seconds for a refused one. The authorization webhook is configured when the k3s container is created, so a cluster whose container predates it authorizes only through `system:masters` and RBAC until it is recreated.
 
 ### EC2 Linux worker authentication
 
@@ -141,11 +173,13 @@ In real mode, a running cluster whose authentication mode is `CONFIG_MAP` or `AP
 `kube-system/aws-auth`, as EKS creates it for managed node groups. Every ACTIVE node group's `nodeRole` is
 mapped as `system:node:{{EC2PrivateDNSName}}` with the `system:bootstrappers` and `system:nodes` groups.
 Floci creates the ConfigMap when it is absent and otherwise adds only the missing roles, so entries that
-other tools added stay. A replaced k3s container is mapped again. The token webhook does not read
-`aws-auth`; the ConfigMap exists for tools that read or edit it.
+other tools added stay. A replaced k3s container is mapped again. The token webhook reads the `mapRoles`
+and `mapUsers` of `aws-auth` to authenticate IAM principals, as described in
+[Authentication of IAM principals](#authentication-of-iam-principals); node instance sessions still
+authenticate through their EC2_LINUX entries.
 
-!!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, the aws-auth ConfigMap's mappings, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Tag updates on an existing access entry remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+!!! note "Limits"
+    Instance-profile sessions authenticate only through EC2_LINUX entries, never through a STANDARD entry or an `aws-auth` mapping. Automatic managed-node access entries, `aws-auth` `mapAccounts`, and tag updates on an existing access entry are not implemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \
@@ -297,7 +331,7 @@ The supported component prefixes correspond to k3s server argument flags:
 
 Floci manages a specific set of flags required for container networking, IAM authentication, audit logging, and topology emulation. Passing a conflicting value or modifier (such as `+=` or `-=`) for any of these flags causes `CreateCluster` to reject the request with `InvalidParameterException` (HTTP 400).
 
-Floci manages the following 17 flags:
+Floci manages the following 21 flags:
 - Kubelet:
   - `provider-id`: manages EC2 worker node identity.
   - `node-labels`: manages topology zones, instance types, and nodegroup labels. Nodegroup labels merge directly into this managed argument rather than through the passthrough.
@@ -309,6 +343,10 @@ Floci manages the following 17 flags:
   - `authentication-token-webhook-config-file`: manages worker IAM authentication.
   - `authentication-token-webhook-version`: token webhook protocol version.
   - `authentication-token-webhook-cache-ttl`: webhook cache duration.
+  - `authorization-webhook-config-file`: manages access-policy authorization.
+  - `authorization-webhook-version`: authorization webhook protocol version.
+  - `authorization-webhook-cache-authorized-ttl`: cache duration of an allowed request.
+  - `authorization-webhook-cache-unauthorized-ttl`: cache duration of a refused request.
   - `service-account-issuer`: IRSA OIDC discovery issuer URL.
   - `service-account-key-file`: IRSA public signing key.
   - `service-account-signing-key-file`: IRSA private signing key.
@@ -320,10 +358,11 @@ Floci manages the following 17 flags:
 
 ### Refused arguments
 
-The following flags are refused outright because they conflict with the k3s embedded SQLite (kine) engine or bypass API server RBAC authorization:
+The following flags are refused outright because they conflict with the k3s embedded SQLite (kine) engine or replace the API server's authorization chain (Node, RBAC and the access-policy webhook):
 - `storage-backend`
 - `etcd-servers`
 - `authorization-mode`
+- `authorization-config`
 
 ### Error handling and tag stripping
 
@@ -491,9 +530,9 @@ aws eks update-kubeconfig --name my-cluster
 kubectl get nodes
 ```
 
-`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token contains a SigV4-presigned STS `GetCallerIdentity` request. Floci validates its signature and 15-minute token lifetime matching `aws-iam-authenticator` rather than the presigned expiry, then verifies the signed `x-k8s-aws-id` header against the cluster-specific `/_floci/eks/clusters/<cluster-name>/token-webhook` endpoint before resolving the caller identity. Instance-profile sessions require an EC2_LINUX access entry as described above; non-worker callers retain the `system:masters` mapping (bound to `cluster-admin`). A long-term access key gets it only on clusters of its own account, so a default-account key is refused on another account's cluster; on the older unscoped webhook path only the default account's keys get it. No `aws-iam-authenticator` is required.
+`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token contains a SigV4-presigned STS `GetCallerIdentity` request. Floci validates its signature and 15-minute token lifetime matching `aws-iam-authenticator` rather than the presigned expiry, then verifies the signed `x-k8s-aws-id` header against the cluster-specific `/_floci/eks/clusters/<cluster-name>/token-webhook` endpoint before resolving the caller identity. The caller then needs what it needs on EKS: an access entry, an `aws-auth` mapping, or to be the cluster creator, as described in [Authentication of IAM principals](#authentication-of-iam-principals). Any other caller, including a key of the cluster's own account, gets `401 Unauthorized`. The older unscoped webhook path of clusters created before scoped paths looks the cluster up in the default account. No `aws-iam-authenticator` is required.
 
-Create an IAM access key before using EKS authentication. The public local-development pairs `test`/`test` and `floci`/`floci` are deliberately rejected because the webhook grants cluster-admin access.
+Create IAM credentials before using EKS authentication. The public local-development pairs `test`/`test` and `floci`/`floci` are not IAM keys and are rejected.
 
 Temporary IAM credentials must include their `AWS_SESSION_TOKEN` when signing the token.
 

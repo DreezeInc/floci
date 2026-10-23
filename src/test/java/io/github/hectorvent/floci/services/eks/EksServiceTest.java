@@ -43,6 +43,10 @@ import io.github.hectorvent.floci.services.eks.model.NodegroupStatus;
 import io.github.hectorvent.floci.services.eks.model.OidcIdentity;
 import io.github.hectorvent.floci.services.eks.model.Provider;
 import io.github.hectorvent.floci.services.eks.model.ResourcesVpcConfig;
+import io.github.hectorvent.floci.services.eks.model.UpdateAccessConfigRequest;
+import io.github.hectorvent.floci.services.eks.model.UpdateClusterConfigRequest;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -1294,6 +1298,58 @@ class EksServiceTest {
         service.mapNodeGroupRolesInAwsAuth("000000000000", empty);
 
         verify(clusterManager, never()).ensureAwsAuthNodeRoles(any(), any());
+    }
+
+    @Test
+    void clusterCreatorGetsAdminByModeOnlyWithBootstrapPermissions() throws Exception {
+        String creator = "arn:aws:iam::000000000000:role/admin/deployer";
+        IamService iam = mock(IamService.class);
+        when(iam.resolveCallerArns("ASIADEPLOYER")).thenReturn(Optional.of(new IamService.CallerArns(
+                "arn:aws:sts::000000000000:assumed-role/deployer/ci", creator)));
+        when(iam.findRole("000000000000", "deployer")).thenReturn(Optional.of(
+                new IamRole("AROADEPLOYER", "deployer", "/admin/", creator, "{}")));
+        EksAccessEntryService entries = new EksAccessEntryService(AccountAwareStorageBackend.inMemory("000000000000"), iam);
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), entries,
+                mock(EksPodIdentityAssociationService.class), mock(EksAddonService.class),
+                new EksClusterUpdateService(new InMemoryStorage<>(), mock(EksAddonService.class),
+                        mock(EksIdentityProviderConfigService.class)));
+
+        Cluster api = service.createCluster(accessRequest("api-creator", "API", null), "ASIADEPLOYER");
+        assertEquals(creator, api.getCreatorPrincipalArn());
+        assertEquals(List.of(creator), entries.list(api, null, null).accessEntries());
+        assertEquals(List.of("arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"),
+                entries.listAssociatedPolicies(api, creator, null, null).items().stream()
+                        .map(policy -> policy.policyArn()).toList());
+        assertEquals("cluster", entries.listAssociatedPolicies(api, creator, null, null).items().getFirst()
+                .accessScope().type());
+
+        Cluster configMap = service.createCluster(accessRequest("config-map-creator", "CONFIG_MAP", null),
+                "ASIADEPLOYER");
+        assertEquals(creator, configMap.getCreatorPrincipalArn());
+        service.updateClusterConfig("config-map-creator", new UpdateClusterConfigRequest(null, null,
+                new UpdateAccessConfigRequest("API_AND_CONFIG_MAP"), null));
+        assertEquals(List.of(creator), entries.list(configMap, null, null).accessEntries());
+
+        Cluster withoutBootstrap = service.createCluster(accessRequest("no-bootstrap", "API", false), "ASIADEPLOYER");
+        assertNull(withoutBootstrap.getCreatorPrincipalArn());
+        assertEquals(List.of(), entries.list(withoutBootstrap, null, null).accessEntries());
+
+        Cluster defaultCredentials = service.createCluster(accessRequest("root-creator", "CONFIG_MAP", null), null);
+        assertEquals("arn:aws:iam::000000000000:root", defaultCredentials.getCreatorPrincipalArn());
+
+        ObjectMapper json = new ObjectMapper().registerModule(new JavaTimeModule());
+        Cluster restored = json.readValue(json.writeValueAsString(configMap), Cluster.class);
+        assertEquals(creator, restored.getCreatorPrincipalArn());
+        assertEquals(creator, configMap.copy().getCreatorPrincipalArn());
+    }
+
+    private static CreateClusterRequest accessRequest(String name, String mode, Boolean bootstrap) {
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName(name);
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        request.setAccessConfig(new AccessConfig(mode, bootstrap));
+        return request;
     }
 
     private Cluster awsAuthCluster(EksService service, String name, AccessConfig accessConfig) {

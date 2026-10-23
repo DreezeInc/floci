@@ -66,13 +66,17 @@ public final class EksClusterArgs {
     );
 
     /**
-     * Arguments Floci sets for kube-apiserver for IAM token webhook authentication, IRSA signing,
-     * and audit logging. Normalized without hyphens.
+     * Arguments Floci sets for kube-apiserver for IAM token webhook authentication, access-policy
+     * webhook authorization, IRSA signing, and audit logging. Normalized without hyphens.
      */
     static final Set<String> FLOCI_MANAGED_APISERVER_FLAGS = Set.of(
             "authenticationtokenwebhookconfigfile",
             "authenticationtokenwebhookversion",
             "authenticationtokenwebhookcachettl",
+            "authorizationwebhookconfigfile",
+            "authorizationwebhookversion",
+            "authorizationwebhookcacheauthorizedttl",
+            "authorizationwebhookcacheunauthorizedttl",
             "serviceaccountissuer",
             "serviceaccountkeyfile",
             "serviceaccountsigningkeyfile",
@@ -85,12 +89,13 @@ public final class EksClusterArgs {
 
     /**
      * Flags refused outright because they conflict with the k3s embedded SQLite (kine) engine
-     * or bypass API server RBAC authorization.
+     * or replace the API server's RBAC and access-policy authorization.
      */
     static final Set<String> REFUSED_APISERVER_FLAGS = Set.of(
             "storagebackend",
             "etcdservers",
-            "authorizationmode"
+            "authorizationmode",
+            "authorizationconfig"
     );
 
     private static final TypeReference<List<String>> STRING_LIST_TYPE = new TypeReference<>() {};

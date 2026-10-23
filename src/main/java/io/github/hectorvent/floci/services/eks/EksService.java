@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.common.TagHandler;
@@ -52,6 +53,7 @@ import io.github.hectorvent.floci.services.eks.model.UpdateClusterVersionRequest
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -123,6 +125,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     /** Left null by the unit tests that construct this service directly. */
     @Inject
     EksServiceLoadBalancers serviceLoadBalancers;
+
+    /** Left null by the unit tests that construct this service directly. */
+    @Inject
+    jakarta.enterprise.inject.Instance<RequestContext> requestContext;
 
     @Inject
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -616,6 +622,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     public Cluster createCluster(CreateClusterRequest request) {
+        return createCluster(request, callerAccessKeyId());
+    }
+
+    Cluster createCluster(CreateClusterRequest request, String callerAccessKeyId) {
         String name = request.getName();
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidParameterException", "Cluster name is required", 400);
@@ -655,6 +665,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         cluster.setArn(arn);
         cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
+        if (accessConfig.bootstrapClusterCreatorAdminPermissions() && accessEntries != null) {
+            cluster.setCreatorPrincipalArn(accessEntries.callerPrincipalArn(callerAccessKeyId,
+                    AwsArnUtils.parse(arn).partition(), accountId));
+        }
 
         if (request.getVersion() != null && !request.getVersion().isBlank()) {
             String requestedVersion = request.getVersion().trim();
@@ -735,6 +749,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
 
             storage.put(name, cluster);
+            if (cluster.getCreatorPrincipalArn() != null && !"CONFIG_MAP".equals(authenticationMode)) {
+                accessEntries.bootstrapCreator(cluster, cluster.getCreatorPrincipalArn());
+            }
         } catch (RuntimeException e) {
             if (clusterSg != null) {
                 try {
@@ -779,9 +796,41 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     public Update updateClusterConfig(String name, UpdateClusterConfigRequest request) {
         Cluster cluster = describeCluster(name);
+        boolean configMapOnly = authenticationMode(cluster).equals("CONFIG_MAP");
         Update update = clusterUpdates.updateClusterConfig(cluster, request);
+        // Enabling access entries gives the cluster creator, and only it, an entry.
+        if (configMapOnly && !authenticationMode(cluster).equals("CONFIG_MAP")
+                && cluster.getCreatorPrincipalArn() != null && accessEntries != null) {
+            accessEntries.bootstrapCreator(cluster, cluster.getCreatorPrincipalArn());
+        }
         storage.put(name, cluster);
         return update;
+    }
+
+    static String authenticationMode(Cluster cluster) {
+        return cluster.getAccessConfig() == null || cluster.getAccessConfig().authenticationMode() == null
+                ? "CONFIG_MAP" : cluster.getAccessConfig().authenticationMode();
+    }
+
+    /** The cluster a webhook path names, matched on its account, region and creation time. */
+    Optional<Cluster> findWebhookCluster(String name, String accountId, String region, String createdAt) {
+        if (accountId == null || region == null || createdAt == null) {
+            return Optional.empty();
+        }
+        String arn = AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + name).toString();
+        return findAuthenticationCluster(accountId, name).filter(cluster -> arn.equals(cluster.getArn()))
+                .filter(cluster -> createdAt.equals(String.valueOf(cluster.getCreatedAt())));
+    }
+
+    private String callerAccessKeyId() {
+        if (requestContext == null) {
+            return null;
+        }
+        try {
+            return requestContext.get().getAccessKeyId();
+        } catch (ContextNotActiveException outsideRequest) {
+            return null;
+        }
     }
 
     public Update updateClusterVersion(String name, UpdateClusterVersionRequest request) {
