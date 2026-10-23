@@ -793,6 +793,8 @@ With `floci.services.eks.agent-nodes: true` (or `FLOCI_SERVICES_EKS_AGENT_NODES=
 | `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Start k3s without its service load balancer and give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
 | `FLOCI_SERVICES_EKS_AGENT_NODES` | `false` | Run a k3s agent container for each EC2 instance that joins a cluster, so its node has a kubelet, reports Ready and runs pods |
 | `FLOCI_SERVICES_EKS_SERIALIZE_IMAGE_PULLS` | `false` | Have each node's kubelet pull one image at a time, k3s's default; the default pulls in parallel, as the EKS AMI's kubelet does |
+| `FLOCI_SERVICES_EKS_IMAGE_CACHE` | `false` | Pull from the public registries below through one pull-through cache container each, on the cluster network, so a repeated pull is served from the cache's storage (see [Caching public images](#caching-public-images)) |
+| `FLOCI_SERVICES_EKS_IMAGE_CACHE_REGISTRIES` | `docker.io,ghcr.io,quay.io,registry.k8s.io,public.ecr.aws` | The registry hosts the image cache fronts; `docker.io` stands for Docker Hub |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
 | `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials, and route the pod identity endpoint (`169.254.170.23`) on each node to Floci. Needs `FLOCI_TLS_ENABLED=true` |
 | `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |
@@ -902,8 +904,9 @@ Requirements and limits:
   `FLOCI_SERVICES_DOCKER_NETWORK` as in the standard `docker-compose.yml` or the
   EKS service network variable.
 - Only ECR registry hostnames are mirrored; public registries (docker.io, ghcr.io, …)
-  are never touched. k3s accepts no partial wildcards, so the hostnames are listed one by
-  one: two per mirrored account and region (three with TLS URIs), in a fixed order.
+  are never touched, unless the [image cache](#caching-public-images) fronts them. k3s
+  accepts no partial wildcards, so the hostnames are listed one by one: two per mirrored
+  account and region (three with TLS URIs), in a fixed order.
 - Mirrored `localhost` hostnames carry the port the repository URIs advertise, which is the host port
   when Floci's container publishes `4566` on another one (see [ECR](ecr.md#docker-compose-port-mapping)).
 - The mirror set is snapshotted when the k3s container is created, because k3s reads
@@ -916,6 +919,26 @@ Requirements and limits:
   docker cp registries.yaml floci-eks-<cluster>:/etc/rancher/k3s/registries.yaml
   docker restart floci-eks-<cluster>
   ```
+
+### Caching public images
+
+Every cluster pulls its images from the public registries afresh, so a test that creates
+clusters one after another pays for the same images each time, and the pulls of a cluster
+coming up all at once share the host's bandwidth. With `FLOCI_SERVICES_EKS_IMAGE_CACHE=true`,
+Floci starts one pull-through cache per registry in `FLOCI_SERVICES_EKS_IMAGE_CACHE_REGISTRIES`
+when the first cluster is created: a container of the ECR backing registry's image
+(`FLOCI_SERVICES_ECR_REGISTRY_IMAGE`) in proxy mode, on the cluster network, keeping its blobs
+in a named volume. Each new cluster's `registries.yaml` then names the cache as the registry's
+mirror, for the server node and every agent node, so the first pull of an image fills the
+cache and every later one, from another node or another cluster, is served from it.
+
+The caches resolve registry names as the nodes do (Floci's embedded DNS when
+`FLOCI_SERVICES_EKS_EMBEDDED_DNS` is on), pull anonymously, and are adopted by name after a
+Floci restart, so a warm cache survives it. A cache is a containerd mirror: when it is down or
+answers with an error, the node pulls from the registry itself, since k3s keeps the registry's
+own endpoint as the last one. The cache's address is snapshotted into `registries.yaml` when
+the cluster's container is created, as the ECR mirrors are, so a cache recreated with another
+address serves only the clusters created after it.
 
 ### DNS resolution and Route 53 private hosted zones
 

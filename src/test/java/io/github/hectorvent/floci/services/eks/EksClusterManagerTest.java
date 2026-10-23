@@ -1329,7 +1329,7 @@ class EksClusterManagerTest {
 
         @Test
         void aDefaultCommercialClusterKeepsTheDeploymentWideMirror() throws Exception {
-            manager.injectEcrRegistryMirror("container-1",
+            manager.injectRegistriesYaml("container-1",
                     clusterWithArn("arn:aws:eks:us-east-1:000000000000:cluster/demo"));
 
             assertEquals(EksClusterManager.buildRegistriesYaml("000000000000", AwsRegions.advertised("aws"),
@@ -1338,7 +1338,7 @@ class EksClusterManagerTest {
 
         @Test
         void aChinaClusterInACommercialDeploymentMirrorsItsOwnPartitionsRegions() throws Exception {
-            manager.injectEcrRegistryMirror("container-1",
+            manager.injectRegistriesYaml("container-1",
                     clusterWithArn("arn:aws-cn:eks:cn-north-1:000000000000:cluster/demo"));
 
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
@@ -1352,7 +1352,7 @@ class EksClusterManagerTest {
             Cluster cluster = clusterWithArn("arn:aws:eks:eu-west-1:111122223333:cluster/demo");
             cluster.setAccountId("111122223333");
 
-            manager.injectEcrRegistryMirror("container-1", cluster);
+            manager.injectRegistriesYaml("container-1", cluster);
 
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
             assertTrue(yaml.contains("\"111122223333.dkr.ecr.eu-west-1.localhost:4566\":"));
@@ -1367,7 +1367,7 @@ class EksClusterManagerTest {
             Cluster cluster = clusterWithArn("arn:aws:eks:eu-west-1:111122223333:cluster/demo");
             cluster.setAccountId("111122223333");
 
-            manager.injectEcrRegistryMirror("container-1", cluster);
+            manager.injectRegistriesYaml("container-1", cluster);
 
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
             assertEquals(EksClusterManager.buildRegistriesYaml(
@@ -1383,7 +1383,7 @@ class EksClusterManagerTest {
             when(ecrService.repositoryOwnerAccounts("aws-cn")).thenReturn(List.of("444455556666"));
             manager.ecrService = ecrService;
 
-            manager.injectEcrRegistryMirror("container-1",
+            manager.injectRegistriesYaml("container-1",
                     clusterWithArn("arn:aws-cn:eks:cn-north-1:000000000000:cluster/demo"));
 
             verify(ecrService).repositoryOwnerAccounts("aws-cn");
@@ -1393,7 +1393,7 @@ class EksClusterManagerTest {
 
         @Test
         void injectsTheMirrorIntoTheContainer() throws Exception {
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             verify(registryManager).ensureStarted();
             verify(copyCmd).withRemotePath("/etc");
@@ -1409,7 +1409,7 @@ class EksClusterManagerTest {
             // k3s still reaches Floci on its own port inside the Docker network.
             when(registryManager.advertisedPort()).thenReturn(54321);
 
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
             assertTrue(yaml.contains("\"000000000000.dkr.ecr.us-east-1.localhost:54321\":"));
@@ -1426,7 +1426,7 @@ class EksClusterManagerTest {
             when(tls.enabled()).thenReturn(true);
             when(ecr.tlsUri()).thenReturn(true);
 
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
             assertTrue(yaml.contains("\"000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566\":"));
@@ -1442,7 +1442,7 @@ class EksClusterManagerTest {
             when(config.tls()).thenReturn(tls);
             when(ecr.tlsUri()).thenReturn(true);
 
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             String yaml = Files.readString(tempDir.resolve("registries/demo/registries.yaml"));
             assertFalse(yaml.contains("localhost.floci.io"));
@@ -1454,7 +1454,7 @@ class EksClusterManagerTest {
         void skipsWhenTheKnobIsOff() {
             when(eks.ecrRegistryMirror()).thenReturn(false);
 
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             verifyNoInteractions(registryManager);
             verify(lifecycleManager, never()).getDockerClient();
@@ -1464,9 +1464,56 @@ class EksClusterManagerTest {
         void skipsWhenEcrIsDisabled() {
             when(ecr.enabled()).thenReturn(false);
 
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             verifyNoInteractions(registryManager);
+            verify(lifecycleManager, never()).getDockerClient();
+        }
+
+        @Test
+        void addsTheImageCacheMirrorsAfterTheEcrOnes() throws Exception {
+            EksImageCache imageCache = Mockito.mock(EksImageCache.class);
+            Map<String, String> endpoints = new LinkedHashMap<>();
+            endpoints.put("docker.io", "http://172.17.0.9:5000");
+            endpoints.put("quay.io", "http://172.17.0.10:5000");
+            when(imageCache.endpoints()).thenReturn(endpoints);
+            manager.imageCache = imageCache;
+
+            manager.injectRegistriesYaml("container-1",
+                    clusterWithArn("arn:aws:eks:us-east-1:000000000000:cluster/demo"));
+
+            assertEquals(EksClusterManager.buildRegistriesYaml("000000000000", AwsRegions.advertised("aws"),
+                    4566, "http://floci:4566")
+                    + "  \"docker.io\":\n    endpoint:\n      - \"http://172.17.0.9:5000\"\n"
+                    + "  \"quay.io\":\n    endpoint:\n      - \"http://172.17.0.10:5000\"\n",
+                    Files.readString(tempDir.resolve("registries/demo/registries.yaml")));
+            verify(copyCmd).exec();
+        }
+
+        @Test
+        void mirrorsOnlyTheImageCacheWhenTheEcrMirrorIsOff() throws Exception {
+            when(eks.ecrRegistryMirror()).thenReturn(false);
+            EksImageCache imageCache = Mockito.mock(EksImageCache.class);
+            when(imageCache.endpoints()).thenReturn(Map.of("ghcr.io", "http://172.17.0.9:5000"));
+            manager.imageCache = imageCache;
+
+            manager.injectRegistriesYaml("container-1", demoCluster());
+
+            verifyNoInteractions(registryManager);
+            assertEquals("mirrors:\n  \"ghcr.io\":\n    endpoint:\n      - \"http://172.17.0.9:5000\"\n",
+                    Files.readString(tempDir.resolve("registries/demo/registries.yaml")));
+            verify(copyCmd).exec();
+        }
+
+        @Test
+        void skipsWhenTheImageCacheIsOffToo() {
+            when(eks.ecrRegistryMirror()).thenReturn(false);
+            EksImageCache imageCache = Mockito.mock(EksImageCache.class);
+            when(imageCache.endpoints()).thenReturn(Map.of());
+            manager.imageCache = imageCache;
+
+            manager.injectRegistriesYaml("container-1", demoCluster());
+
             verify(lifecycleManager, never()).getDockerClient();
         }
 
@@ -1474,7 +1521,7 @@ class EksClusterManagerTest {
         void registryStartupFailureSkipsTheMirrorWithoutAborting() {
             Mockito.doThrow(new RuntimeException("no docker")).when(registryManager).ensureStarted();
 
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             verify(lifecycleManager, never()).getDockerClient();
         }
@@ -1483,7 +1530,7 @@ class EksClusterManagerTest {
         void copyFailureDoesNotAbortClusterCreation() {
             when(copyCmd.exec()).thenThrow(new RuntimeException("copy failed"));
 
-            manager.injectEcrRegistryMirror("container-1", demoCluster());
+            manager.injectRegistriesYaml("container-1", demoCluster());
 
             verify(copyCmd).exec();
         }

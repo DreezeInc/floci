@@ -839,7 +839,7 @@ public class EksClusterManager
         if (auditPolicyLocalFile != null) {
             copyAuditPolicyIntoContainer(containerId, auditPolicyLocalFile, cluster.getName());
         }
-        injectEcrRegistryMirror(containerId, cluster);
+        injectRegistriesYaml(containerId, cluster);
         linkContainerdCertsDir(containerId, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
         registerEbsStorageEmulation(containerId, cluster);
@@ -2203,29 +2203,57 @@ public class EksClusterManager
     @Inject
     EcrService ecrService;
 
+    @Inject
+    EksImageCache imageCache;
+
     /**
      * Generates and injects {@code /etc/rancher/k3s/registries.yaml} into the (created,
-     * not-yet-started) k3s container so its containerd can pull images pushed to the Floci ECR
-     * registry. Mirrors every repository hostname the cluster can pull from Floci: its own account,
-     * the default account and every account owning a repository in the cluster's partition, across
-     * every region of that partition, in both the Floci and the AWS-shaped form, plus the path-style
-     * {@code localhost:<port>} form, including {@code localhost.floci.io} aliases when TLS registry
-     * URIs are enabled, to Floci's in-network data plane. Public registries are never matched. k3s
-     * reads the file once at start, so an account whose first repository appears later is not
-     * mirrored into an already-running cluster. A failure disables the mirror for this cluster but
-     * does not abort its startup, matching the webhook contract.
+     * not-yet-started) k3s container: the Floci ECR mirrors, then the image cache mirrors. k3s
+     * reads the file once at start, so an account whose first repository appears later, or a
+     * cache that moves, is not seen by an already-running cluster. A failure leaves this cluster
+     * without mirrors but does not abort its startup, matching the webhook contract.
      */
-    void injectEcrRegistryMirror(String containerId, Cluster cluster) {
+    void injectRegistriesYaml(String containerId, Cluster cluster) {
+        String clusterName = cluster.getName();
+        String ecrMirrors = ecrRegistryMirrors(cluster);
+        Map<String, String> imageCacheEndpoints = imageCache != null ? imageCache.endpoints() : Map.of();
+        if (ecrMirrors.isEmpty() && imageCacheEndpoints.isEmpty()) {
+            return;
+        }
+        String content = "mirrors:\n" + ecrMirrors + imageCacheMirrors(imageCacheEndpoints);
+        writeLocalCopy(Paths.get(config.services().eks().dataPath(), "registries", clusterName,
+                "registries.yaml"), content, clusterName);
+        try {
+            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, "/etc",
+                    REGISTRIES_TAR_ENTRY, content.getBytes(StandardCharsets.UTF_8), 0644);
+            LOG.infov("Injected registries.yaml into k3s cluster {0} (image cache for {1})", clusterName,
+                    imageCacheEndpoints.keySet());
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} gets no registry mirrors: could not copy registries.yaml "
+                    + "into the k3s container: {1}", clusterName, e.getMessage());
+        }
+    }
+
+    /**
+     * The mirror entries that let the cluster pull images pushed to the Floci ECR registry:
+     * every repository hostname the cluster can pull from Floci, its own account, the default
+     * account and every account owning a repository in the cluster's partition, across every
+     * region of that partition, in both the Floci and the AWS-shaped form, plus the path-style
+     * {@code localhost:<port>} form, including {@code localhost.floci.io} aliases when TLS registry
+     * URIs are enabled, to Floci's in-network data plane. Empty when the mirror is off, ECR is
+     * disabled, or the registry is unavailable.
+     */
+    private String ecrRegistryMirrors(Cluster cluster) {
         String clusterName = cluster.getName();
         if (!config.services().eks().ecrRegistryMirror() || !config.services().ecr().enabled()) {
-            return;
+            return "";
         }
         try {
             ecrRegistryManager.ensureStarted();
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no ECR registry mirror: registry unavailable: {1}",
                     clusterName, e.getMessage());
-            return;
+            return "";
         }
         String region = AwsArnUtils.regionOrDefault(cluster.getArn(), config.defaultRegion());
         String endpoint = "http://" + dockerHostResolver.resolve() + ":" + config.port();
@@ -2235,19 +2263,10 @@ public class EksClusterManager
                 : List.of();
         List<String> accounts = mirrorAccounts(resolveClusterAccountId(cluster), config.defaultAccountId(),
                 repositoryOwners);
-        String content = buildRegistriesYaml(accounts, mirrorRegions(region), ecrRegistryManager.advertisedPort(),
-                endpoint, tlsUri);
-        writeLocalCopy(Paths.get(config.services().eks().dataPath(), "registries", clusterName,
-                "registries.yaml"), content, clusterName);
-        try {
-            RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, "/etc",
-                    REGISTRIES_TAR_ENTRY, content.getBytes(StandardCharsets.UTF_8), 0644);
-            LOG.infov("Injected ECR registry mirror ({0}) for accounts {1} into k3s cluster {2}",
-                    endpoint, accounts, clusterName);
-        } catch (Exception e) {
-            LOG.warnv("EKS cluster {0} gets no ECR registry mirror: could not copy registries.yaml "
-                    + "into the k3s container: {1}", clusterName, e.getMessage());
-        }
+        LOG.infov("ECR registry mirror ({0}) for accounts {1} goes into k3s cluster {2}", endpoint, accounts,
+                clusterName);
+        return ecrMirrorEntries(accounts, mirrorRegions(region), ecrRegistryManager.advertisedPort(), endpoint,
+                tlsUri);
     }
 
     /**
@@ -2810,7 +2829,12 @@ public class EksClusterManager
 
     static String buildRegistriesYaml(List<String> accountIds, List<String> regions, int advertisedPort,
                                      String endpoint, boolean tlsUri) {
-        StringBuilder yaml = new StringBuilder("mirrors:\n");
+        return "mirrors:\n" + ecrMirrorEntries(accountIds, regions, advertisedPort, endpoint, tlsUri);
+    }
+
+    static String ecrMirrorEntries(List<String> accountIds, List<String> regions, int advertisedPort,
+                                   String endpoint, boolean tlsUri) {
+        StringBuilder yaml = new StringBuilder();
         for (String accountId : accountIds) {
             for (String region : regions) {
                 appendMirror(yaml, accountId + ".dkr.ecr." + region + ".localhost:" + advertisedPort, endpoint);
@@ -2825,6 +2849,13 @@ public class EksClusterManager
         if (tlsUri) {
             appendMirror(yaml, "localhost.floci.io:" + advertisedPort, endpoint);
         }
+        return yaml.toString();
+    }
+
+    /** The mirror entries sending each cached registry's pulls to its pull-through cache first. */
+    static String imageCacheMirrors(Map<String, String> endpointsByHost) {
+        StringBuilder yaml = new StringBuilder();
+        endpointsByHost.forEach((host, endpoint) -> appendMirror(yaml, host, endpoint));
         return yaml.toString();
     }
 
@@ -3738,7 +3769,7 @@ public class EksClusterManager
         }
         ContainerSpec spec = specBuilder.build();
         String agentContainerId = lifecycleManager.create(spec);
-        injectEcrRegistryMirror(agentContainerId, cluster);
+        injectRegistriesYaml(agentContainerId, cluster);
         linkContainerdCertsDir(agentContainerId, cluster.getName());
         try {
             lifecycleManager.startCreated(agentContainerId, spec);

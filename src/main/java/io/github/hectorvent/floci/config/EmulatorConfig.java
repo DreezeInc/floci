@@ -3441,6 +3441,20 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean serializeImagePulls();
 
+        /**
+         * When true, each new cluster also pulls from the public registries in
+         * {@link #imageCacheRegistries()} through a pull-through cache: one container of the ECR
+         * backing registry's image in proxy mode per registry, on the cluster network, started with
+         * the first cluster and adopted by name afterwards. Each is a containerd mirror, so a pull
+         * goes to the registry itself whenever its cache is down.
+         */
+        @WithDefault("false")
+        boolean imageCache();
+
+        /** The public registry hosts the image cache fronts; {@code docker.io} stands for Docker Hub. */
+        @WithDefault("docker.io,ghcr.io,quay.io,registry.k8s.io,public.ecr.aws")
+        List<String> imageCacheRegistries();
+
         /** The port Floci serves the EBS CSI driver's gRPC services on when {@link #emulateEbsStorage()} is on. */
         @WithDefault("4591")
         int ebsCsiPort();
