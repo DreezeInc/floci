@@ -401,6 +401,21 @@ class EksClusterManagerTest {
     }
 
     @Test
+    void agentArgsCarryNodeIdentityLabelsAndTaints() {
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put("topology.kubernetes.io/zone", "us-east-1a");
+        labels.put("karpenter.sh/nodepool", "default");
+
+        List<String> args = EksClusterManager.buildAgentArgs("ip-10-0-0-5.ec2.internal", "aws:///us-east-1a/i-0abc",
+                labels, List.of("karpenter.sh/unregistered:NoExecute", "team=a:NoSchedule"));
+
+        assertEquals(List.of("agent", "--node-name=ip-10-0-0-5.ec2.internal",
+                "--kubelet-arg=provider-id=aws:///us-east-1a/i-0abc",
+                "--node-label=topology.kubernetes.io/zone=us-east-1a", "--node-label=karpenter.sh/nodepool=default",
+                "--node-taint=karpenter.sh/unregistered:NoExecute", "--node-taint=team=a:NoSchedule"), args);
+    }
+
+    @Test
     void serverArgsAlwaysDisableK3sMetricsServer() {
         assertTrue(EksClusterManager.buildServerArgs(false).contains("--disable=metrics-server"));
         assertTrue(EksClusterManager.buildServerArgs(true).contains("--disable=metrics-server"));

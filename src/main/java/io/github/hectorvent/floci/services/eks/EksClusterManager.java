@@ -9,6 +9,7 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLGenerator;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Info;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -119,6 +120,7 @@ public class EksClusterManager
     static final String DEFAULT_NODE_INSTANCE_TYPE = "m5.large";
     private static final String NODE_CAPACITY_LABEL = "io.floci.eks.node-capacity";
     private static final String DEFAULT_STORAGE_CLASS_LABEL = "io.floci.eks.default-storage-class";
+    private static final String AGENT_NODE_INSTANCE_LABEL = "io.floci.eks.instance-id";
 
     private static final String WEBHOOK_CONFIG_DIR = "/etc";
     private static final String WEBHOOK_CONFIG_FILE = "token-webhook.yaml";
@@ -638,6 +640,8 @@ public class EksClusterManager
     private void launchCluster(Cluster cluster, String image, String containerName, int hostPort) {
         // Remove any stale container
         ContainerStorageHelper.removeStaleContainer(config, lifecycleManager, containerName);
+        // Agents of the earlier server hold its address and token; they rejoin once the cluster is ACTIVE.
+        removeAgentNodeContainers(cluster);
 
         // k3s v1.34+ removed support for --kube-apiserver-arg=storage-backend and
         // --kube-apiserver-arg=etcd-servers. k3s now manages kine (embedded SQLite)
@@ -1234,6 +1238,7 @@ public class EksClusterManager
     public void stopCluster(Cluster cluster) {
         String resourceName = clusterResourceName(cluster);
         if (cluster.getContainerId() == null) {
+            removeAgentNodeContainers(cluster);
             unregisterMetadataEndpoint(cluster);
             closeQuietly(clusterLogHandles.remove(resourceName));
             return;
@@ -1243,6 +1248,7 @@ public class EksClusterManager
         // port, so the delete fails and keeps the cluster record, its metadata endpoint, log
         // handle and port reservation; a retried delete releases them once the container is gone.
         lifecycleManager.stopAndRemoveStrict(cluster.getContainerId(), logStream);
+        removeAgentNodeContainers(cluster);
         unregisterMetadataEndpoint(cluster);
         // Removed by value so an overlapping delete cannot drop a handle it does not own.
         if (logStream != null) {
@@ -3528,6 +3534,9 @@ public class EksClusterManager
             } catch (Exception e) {
                 String region = instance.getRegion() != null ? instance.getRegion() : clusterRegion(cluster);
                 String nodeName = deriveInstanceNodeName(instance, region);
+                if (config.services().eks().agentNodes()) {
+                    lifecycleManager.removeIfExists(agentNodeContainerName(cluster, instance.getInstanceId()));
+                }
                 try {
                     execInContainerForResult(containerId,
                             new String[]{"kubectl", "delete", "node", nodeName, "--ignore-not-found=true"}, 15);
@@ -3605,6 +3614,10 @@ public class EksClusterManager
     }
 
     private void registerNodeInCluster(Cluster cluster, String containerId, Instance instance) {
+        if (config.services().eks().agentNodes()) {
+            launchAgentNode(cluster, containerId, instance);
+            return;
+        }
         String region = instance.getRegion() != null ? instance.getRegion() : clusterRegion(cluster);
         String nodeName = deriveInstanceNodeName(instance, region);
         try {
@@ -3662,6 +3675,149 @@ public class EksClusterManager
             }
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * Starts a k3s agent container for a joined instance, so the cluster gets a node with a
+     * kubelet: Ready, carrying the labels and taints the instance's user data asked for, and
+     * running pods. A still-running container from an earlier Floci run is adopted as it is.
+     */
+    private void launchAgentNode(Cluster cluster, String serverContainerId, Instance instance) {
+        String containerName = agentNodeContainerName(cluster, instance.getInstanceId());
+        Optional<Container> existing = lifecycleManager.findByName(containerName);
+        if (existing.isPresent() && "running".equalsIgnoreCase(existing.get().getState())) {
+            LOG.infov("Adopted running k3s agent container {0} for instance {1} in cluster {2}",
+                    containerName, instance.getInstanceId(), cluster.getName());
+            return;
+        }
+        ContainerStorageHelper.removeStaleContainer(config, lifecycleManager, containerName);
+        String serverIp = lifecycleManager.resolveContainerNetworkIp(serverContainerId,
+                config.services().eks().dockerNetwork().orElse(null));
+        if (serverIp == null || serverIp.isBlank()) {
+            throw new IllegalStateException("Cluster " + cluster.getName()
+                    + " has no container address for agent nodes to join");
+        }
+        ContainerExec.Result token = execInContainerForResult(serverContainerId,
+                new String[]{"cat", K3S_DATA_DIR + "/server/node-token"}, 15);
+        if (token.exitCode() != 0 || token.stdout() == null || token.stdout().isBlank()) {
+            throw new IllegalStateException("Cluster " + cluster.getName() + " has no node token yet: "
+                    + token.stderr());
+        }
+        String region = instance.getRegion() != null ? instance.getRegion() : clusterRegion(cluster);
+        EksBootstrapUserData.NodeJoinRequest request =
+                EksBootstrapUserData.extract(instance.getUserData()).orElse(null);
+        List<String> agentArgs = buildAgentArgs(
+                deriveInstanceNodeName(instance, region),
+                deriveInstanceNodeProviderId(instance, region),
+                instanceNodeLabels(instance, region, request),
+                request != null ? request.taints() : List.of());
+        Map<String, String> labels = new LinkedHashMap<>(ContainerStorageHelper.resourceIdentityLabels(
+                "eks", cluster.getName(), resolveClusterAccountId(cluster), clusterRegion(cluster)));
+        labels.put(AGENT_NODE_INSTANCE_LABEL, instance.getInstanceId());
+        ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(resolveClusterImage(cluster))
+                .withName(containerName)
+                .withEnv("K3S_URL", "https://" + serverIp + ":" + K3S_API_SERVER_PORT)
+                .withEnv("K3S_TOKEN", token.stdout().strip())
+                .withDockerNetwork(config.services().eks().dockerNetwork())
+                .withPrivileged(true)
+                .withLogRotation()
+                .withLabels(labels)
+                .withEntrypoint(RSHARE_ENTRYPOINT)
+                .withCmd(buildRshareWrappedCmd(agentArgs));
+        if (config.services().eks().embeddedDns()) {
+            specBuilder.withEmbeddedDns();
+        }
+        if (config.services().eks().ecrRegistryMirror() && config.services().ecr().enabled()) {
+            specBuilder.withHostDockerInternalOnLinux();
+        }
+        ContainerSpec spec = specBuilder.build();
+        String agentContainerId = lifecycleManager.create(spec);
+        injectEcrRegistryMirror(agentContainerId, cluster);
+        linkContainerdCertsDir(agentContainerId, cluster.getName());
+        try {
+            lifecycleManager.startCreated(agentContainerId, spec);
+        } catch (Exception e) {
+            lifecycleManager.removeIfExists(containerName);
+            throw e;
+        }
+        LOG.infov("k3s agent container {0} started for instance {1} in cluster {2}",
+                containerName, instance.getInstanceId(), cluster.getName());
+    }
+
+    private Map<String, String> instanceNodeLabels(Instance instance, String region,
+            EksBootstrapUserData.NodeJoinRequest request) {
+        Map<String, String> labels = new LinkedHashMap<>();
+        String az = instance.getPlacement() != null && instance.getPlacement().getAvailabilityZone() != null
+                ? instance.getPlacement().getAvailabilityZone() : region + "a";
+        labels.put("topology.kubernetes.io/zone", az);
+        labels.put("topology.kubernetes.io/region", region);
+        labels.put("node.kubernetes.io/instance-type",
+                instance.getInstanceType() != null ? instance.getInstanceType() : DEFAULT_NODE_INSTANCE_TYPE);
+        if (request != null) {
+            labels.putAll(request.labels());
+        }
+        return labels;
+    }
+
+    /** The k3s {@code agent} args of a joined instance; the server URL and token travel as env vars. */
+    static List<String> buildAgentArgs(String nodeName, String providerId, Map<String, String> labels,
+            List<String> taints) {
+        List<String> args = new ArrayList<>();
+        args.add("agent");
+        args.add("--node-name=" + nodeName);
+        args.add("--kubelet-arg=provider-id=" + providerId);
+        for (Map.Entry<String, String> label : labels.entrySet()) {
+            args.add("--node-label=" + label.getKey() + "=" + label.getValue());
+        }
+        for (String taint : taints) {
+            args.add("--node-taint=" + taint);
+        }
+        return args;
+    }
+
+    String agentNodeContainerName(Cluster cluster, String instanceId) {
+        // The marker precedes the account qualifier for the reason capacityBackupName gives.
+        return ContainerStorageHelper.resourceName(config, "eks", null,
+                "node-" + instanceId + "." + accountQualifiedClusterName(cluster));
+    }
+
+    private void removeAgentNodeContainers(Cluster cluster) {
+        if (!config.services().eks().agentNodes() || cluster == null || cluster.getJoinedInstanceIds() == null) {
+            return;
+        }
+        for (String instanceId : cluster.getJoinedInstanceIds().keySet()) {
+            lifecycleManager.removeIfExists(agentNodeContainerName(cluster, instanceId));
+        }
+    }
+
+    /** Takes a terminated instance out of its cluster: its agent container, if any, and its Node. */
+    void leaveInstance(Cluster cluster, Instance instance) {
+        if (cluster == null || instance == null) {
+            return;
+        }
+        synchronized (joinedClusterInstances) {
+            Map<String, Instance> current = joinedClusterInstances.get(clusterResourceName(cluster));
+            if (current != null) {
+                current.remove(instance.getInstanceId());
+            }
+        }
+        if (config.services().eks().agentNodes()) {
+            lifecycleManager.removeIfExists(agentNodeContainerName(cluster, instance.getInstanceId()));
+        }
+        String containerId = cluster.getContainerId();
+        if (containerId == null || containerId.isBlank()) {
+            return;
+        }
+        String region = instance.getRegion() != null ? instance.getRegion() : clusterRegion(cluster);
+        String nodeName = deriveInstanceNodeName(instance, region);
+        ContainerExec.Result res = execInContainerForResult(containerId,
+                new String[]{"kubectl", "delete", "node", nodeName, "--ignore-not-found=true"}, 15);
+        if (res.exitCode() != 0) {
+            throw new IllegalStateException("Failed to delete node " + nodeName + " of terminated instance "
+                    + instance.getInstanceId() + " from cluster " + cluster.getName() + ": " + res.stderr());
+        }
+        LOG.infov("Removed node {0} of terminated instance {1} from cluster {2}",
+                nodeName, instance.getInstanceId(), cluster.getName());
     }
 
     record ContainerIps(String primaryIp, Set<String> allIps) {}

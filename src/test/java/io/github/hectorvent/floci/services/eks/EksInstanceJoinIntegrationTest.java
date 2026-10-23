@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
@@ -100,6 +101,44 @@ class EksInstanceJoinIntegrationTest {
                     .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId", equalTo(instanceId),
                             "DescribeInstancesResponse.reservationSet.item.instancesSet.item.privateDnsName", equalTo(expectedNodeName),
                             "DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceType", equalTo("t3.medium"));
+        } finally {
+            eksClusterManager.unregisterMetadataEndpoint(cluster);
+            try {
+                RequestScopes.runAs(account, () -> eksService.deleteCluster(clusterName));
+            } catch (Exception ignored) {
+                // Best effort cluster cleanup
+            }
+        }
+    }
+
+    @Test
+    void terminatedInstanceLeavesItsCluster() {
+        String account = "123456789012";
+        String clusterName = "leave-cluster-" + UUID.randomUUID().toString().substring(0, 8);
+
+        Cluster cluster = createTestCluster(clusterName, account);
+        cluster.setContainerId("mock-k3s-container");
+        ArgumentCaptor<String[]> cmdCaptor = ArgumentCaptor.forClass(String[].class);
+        doReturn(new ContainerExec.Result(0L, "", "", false)).when(eksClusterManager)
+                .execInContainerForResult(eq("mock-k3s-container"), cmdCaptor.capture(), anyInt());
+
+        try {
+            String instanceId = launchInstance(account, "us-east-1", "t3.medium",
+                    "#!/bin/bash\n/etc/eks/bootstrap.sh " + clusterName);
+            await().atMost(Duration.ofSeconds(10)).until(() ->
+                    RequestScopes.callAs(account, () -> eksService.isInstanceJoined(clusterName, instanceId)));
+            Instance joined = RequestScopes.callAs(account, () -> ec2Service.getInstance("us-east-1", instanceId).orElseThrow());
+            String nodeName = eksClusterManager.deriveInstanceNodeName(joined, "us-east-1");
+
+            ec2Form(account, "TerminateInstances", "InstanceId.1", instanceId).statusCode(200);
+
+            await().atMost(Duration.ofSeconds(10)).until(() ->
+                    RequestScopes.callAs(account, () -> !eksService.isInstanceJoined(clusterName, instanceId)));
+            Map<String, String> joinedIds = RequestScopes.callAs(account,
+                    () -> eksService.describeCluster(clusterName).getJoinedInstanceIds());
+            assertTrue(joinedIds == null || !joinedIds.containsKey(instanceId));
+            assertTrue(cmdCaptor.getAllValues().stream().anyMatch(cmd -> cmd.length > 3
+                    && "delete".equals(cmd[1]) && "node".equals(cmd[2]) && nodeName.equals(cmd[3])));
         } finally {
             eksClusterManager.unregisterMetadataEndpoint(cluster);
             try {

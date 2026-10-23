@@ -13,8 +13,11 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -23,10 +26,22 @@ import java.util.Set;
  */
 public final class EksBootstrapUserData {
 
+    /**
+     * What an instance's user data asks of the cluster it joins: the cluster, the node labels of
+     * {@code --node-labels}, and the taints of {@code --register-with-taints} or nodeadm's
+     * {@code kubelet.config.registerWithTaints} as {@code key=value:Effect} or {@code key:Effect}.
+     */
+    public record NodeJoinRequest(String clusterName, Map<String, String> labels, List<String> taints) {
+    }
+
     private static final ObjectMapper YAML_MAPPER = new ObjectMapper(new YAMLFactory());
 
+    private static final String KUBELET_EXTRA_ARGS_FLAG = "--kubelet-extra-args";
+    private static final String NODE_LABELS_FLAG = "--node-labels=";
+    private static final String REGISTER_WITH_TAINTS_FLAG = "--register-with-taints=";
+
     private static final Set<String> FLAGS_WITH_ARG = Set.of(
-            "--b64-cluster-ca", "--apiserver-endpoint", "--kubelet-extra-args",
+            "--b64-cluster-ca", "--apiserver-endpoint", KUBELET_EXTRA_ARGS_FLAG,
             "--container-runtime", "--dns-cluster-ip", "--ip-family",
             "--service-ipv6-cidr", "--use-max-pods", "--aws-api-retry-attempts");
 
@@ -41,43 +56,67 @@ public final class EksBootstrapUserData {
      * @return the cluster name if found, or empty otherwise
      */
     public static Optional<String> extractClusterName(String userData) {
+        return extract(userData).map(NodeJoinRequest::clusterName);
+    }
+
+    /**
+     * Extracts the join request from an instance user data string if present: the cluster name
+     * that {@link #extractClusterName} finds, with the node labels and taints the same payload
+     * passes to the kubelet.
+     *
+     * @param userData the decoded user data payload
+     * @return the join request if the payload targets a cluster, or empty otherwise
+     */
+    public static Optional<NodeJoinRequest> extract(String userData) {
         if (userData == null || userData.isBlank()) {
             return Optional.empty();
         }
         return extractFromBootstrapScript(userData).or(() -> extractFromNodeadm(userData));
     }
 
-    private static Optional<String> extractFromBootstrapScript(String userData) {
+    private static Optional<NodeJoinRequest> extractFromBootstrapScript(String userData) {
         for (String line : userData.split("\n")) {
             String trimmed = line.trim();
             if (trimmed.startsWith("#") && !trimmed.startsWith("#!")) {
                 continue;
             }
             int idx = trimmed.indexOf("bootstrap.sh");
-            if (idx >= 0) {
-                List<String> tokens = tokenize(trimmed.substring(idx + "bootstrap.sh".length()).trim());
-                for (int i = 0; i < tokens.size(); i++) {
-                    String tok = tokens.get(i);
-                    if (tok.startsWith("--") && !tok.contains("=") && FLAGS_WITH_ARG.contains(tok) && i + 1 < tokens.size()) {
-                        i++;
-                    } else if (!tok.isEmpty()) {
-                        String name = stripQuotes(tok);
-                        if (!name.isEmpty() && !name.startsWith("-")) {
-                            return Optional.of(name);
-                        }
+            if (idx < 0) {
+                continue;
+            }
+            List<String> tokens = tokenize(trimmed.substring(idx + "bootstrap.sh".length()).trim());
+            String clusterName = null;
+            String kubeletExtraArgs = "";
+            for (int i = 0; i < tokens.size(); i++) {
+                String tok = tokens.get(i);
+                if (tok.startsWith(KUBELET_EXTRA_ARGS_FLAG + "=")) {
+                    kubeletExtraArgs = stripQuotes(tok.substring(KUBELET_EXTRA_ARGS_FLAG.length() + 1));
+                } else if (tok.startsWith("--") && !tok.contains("=") && FLAGS_WITH_ARG.contains(tok) && i + 1 < tokens.size()) {
+                    i++;
+                    if (KUBELET_EXTRA_ARGS_FLAG.equals(tok)) {
+                        kubeletExtraArgs = stripQuotes(tokens.get(i));
+                    }
+                } else if (!tok.isEmpty() && clusterName == null) {
+                    String name = stripQuotes(tok);
+                    if (!name.isEmpty() && !name.startsWith("-")) {
+                        clusterName = name;
                     }
                 }
+            }
+            if (clusterName != null) {
+                List<String> kubeletFlags = tokenize(kubeletExtraArgs);
+                return Optional.of(new NodeJoinRequest(clusterName, labelsFromFlags(kubeletFlags), taintsFromFlags(kubeletFlags)));
             }
         }
         return Optional.empty();
     }
 
-    private static Optional<String> extractFromNodeadm(String userData) {
+    private static Optional<NodeJoinRequest> extractFromNodeadm(String userData) {
         if (!userData.contains("NodeConfig") && !userData.contains("node.eks.aws")) {
             return Optional.empty();
         }
         if (userData.contains("Content-Type:") || userData.contains("MIME-Version:") || userData.contains("multipart/")) {
-            Optional<String> mimeExtracted = extractFromMime(userData);
+            Optional<NodeJoinRequest> mimeExtracted = extractFromMime(userData);
             if (mimeExtracted.isPresent()) {
                 return mimeExtracted;
             }
@@ -85,7 +124,7 @@ public final class EksBootstrapUserData {
         return parseNodeConfigYaml(userData);
     }
 
-    private static Optional<String> extractFromMime(String userData) {
+    private static Optional<NodeJoinRequest> extractFromMime(String userData) {
         try {
             Message message = new DefaultMessageBuilder().parseMessage(
                     new ByteArrayInputStream(userData.getBytes(StandardCharsets.UTF_8)));
@@ -96,13 +135,13 @@ public final class EksBootstrapUserData {
         }
     }
 
-    private static Optional<String> extractNodeConfigFromEntity(Entity entity) {
+    private static Optional<NodeJoinRequest> extractNodeConfigFromEntity(Entity entity) {
         if (entity == null) {
             return Optional.empty();
         }
         if (entity.getBody() instanceof Multipart multipart) {
             for (Entity part : multipart.getBodyParts()) {
-                Optional<String> found = extractNodeConfigFromEntity(part);
+                Optional<NodeJoinRequest> found = extractNodeConfigFromEntity(part);
                 if (found.isPresent()) {
                     return found;
                 }
@@ -122,23 +161,71 @@ public final class EksBootstrapUserData {
         return Optional.empty();
     }
 
-    private static Optional<String> parseNodeConfigYaml(String yaml) {
+    private static Optional<NodeJoinRequest> parseNodeConfigYaml(String yaml) {
         try {
             Iterator<JsonNode> it = YAML_MAPPER.readValues(
                     YAML_MAPPER.getFactory().createParser(yaml), JsonNode.class);
             while (it.hasNext()) {
                 JsonNode root = it.next();
-                if (root != null && "NodeConfig".equals(root.path("kind").asText())) {
-                    String name = root.path("spec").path("cluster").path("name").asText();
-                    if (name != null && !name.isBlank()) {
-                        return Optional.of(name.strip());
-                    }
+                if (root == null || !"NodeConfig".equals(root.path("kind").asText())) {
+                    continue;
                 }
+                String name = root.path("spec").path("cluster").path("name").asText();
+                if (name == null || name.isBlank()) {
+                    continue;
+                }
+                JsonNode kubelet = root.path("spec").path("kubelet");
+                List<String> flags = new ArrayList<>();
+                for (JsonNode flag : kubelet.path("flags")) {
+                    flags.add(flag.asText());
+                }
+                List<String> taints = new ArrayList<>(taintsFromFlags(flags));
+                for (JsonNode taint : kubelet.path("config").path("registerWithTaints")) {
+                    String key = taint.path("key").asText("");
+                    if (key.isBlank()) {
+                        continue;
+                    }
+                    String value = taint.path("value").asText("");
+                    String effect = taint.path("effect").asText("NoSchedule");
+                    taints.add(value.isBlank() ? key + ":" + effect : key + "=" + value + ":" + effect);
+                }
+                return Optional.of(new NodeJoinRequest(name.strip(), labelsFromFlags(flags), List.copyOf(taints)));
             }
         } catch (Exception ignored) {
             // Non-YAML or invalid NodeConfig user data is safely ignored.
         }
         return Optional.empty();
+    }
+
+    private static Map<String, String> labelsFromFlags(List<String> flags) {
+        Map<String, String> labels = new LinkedHashMap<>();
+        for (String flag : flags) {
+            if (!flag.startsWith(NODE_LABELS_FLAG)) {
+                continue;
+            }
+            for (String pair : flag.substring(NODE_LABELS_FLAG.length()).split(",")) {
+                int eq = pair.indexOf('=');
+                if (eq > 0) {
+                    labels.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
+                }
+            }
+        }
+        return Collections.unmodifiableMap(labels);
+    }
+
+    private static List<String> taintsFromFlags(List<String> flags) {
+        List<String> taints = new ArrayList<>();
+        for (String flag : flags) {
+            if (!flag.startsWith(REGISTER_WITH_TAINTS_FLAG)) {
+                continue;
+            }
+            for (String taint : flag.substring(REGISTER_WITH_TAINTS_FLAG.length()).split(",")) {
+                if (!taint.isBlank()) {
+                    taints.add(taint.trim());
+                }
+            }
+        }
+        return List.copyOf(taints);
     }
 
     private static String stripQuotes(String s) {

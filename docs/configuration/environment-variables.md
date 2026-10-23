@@ -512,6 +512,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EKS_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Keep EKS containers running when Floci stops |
 | `FLOCI_SERVICES_EKS_DOCKER_NETWORK` | _(none)_ | Docker network for EKS containers |
 | `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
+| `FLOCI_SERVICES_EKS_AGENT_NODES` | `false` | Run a k3s agent container for each EC2 instance that joins a cluster, so its node has a kubelet, reports Ready and runs pods |
 
 ### ECS (Elastic Container Service)
 

@@ -347,16 +347,31 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
-    private void notifyInstanceLaunched(String accountId, String region, Instance instance) {
+    private Set<Ec2InstanceLaunchListener> instanceListeners() {
         Set<Ec2InstanceLaunchListener> listeners = new LinkedHashSet<>(instanceLaunchListeners);
         if (instanceLaunchListenersInstance != null && !instanceLaunchListenersInstance.isUnsatisfied()) {
             instanceLaunchListenersInstance.forEach(listeners::add);
         }
-        for (Ec2InstanceLaunchListener listener : listeners) {
+        return listeners;
+    }
+
+    private void notifyInstanceLaunched(String accountId, String region, Instance instance) {
+        for (Ec2InstanceLaunchListener listener : instanceListeners()) {
             try {
                 listener.onInstanceLaunched(accountId, region, instance);
             } catch (Exception e) {
                 LOG.warnv("Error notifying launch listener for instance {0}: {1}",
+                        instance.getInstanceId(), e.getMessage());
+            }
+        }
+    }
+
+    private void notifyInstanceTerminated(String accountId, String region, Instance instance) {
+        for (Ec2InstanceLaunchListener listener : instanceListeners()) {
+            try {
+                listener.onInstanceTerminated(accountId, region, instance);
+            } catch (Exception e) {
+                LOG.warnv("Error notifying termination listener for instance {0}: {1}",
                         instance.getInstanceId(), e.getMessage());
             }
         }
@@ -4035,6 +4050,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             entry.put("currentState", "shutting-down");
             entry.put("currentCode", "32");
             result.add(entry);
+            notifyInstanceTerminated(owner, region, inst);
         }
         return result;
     }

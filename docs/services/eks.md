@@ -725,7 +725,7 @@ Limits:
 - `LoadBalancer` Services without the `nlb` annotation get no load balancer, where EKS would give them a Classic Load Balancer.
 - The data plane serves HTTP, so a TCP listener answers HTTP traffic only, and the health checker probes targets over HTTP.
 - Only the type, internal and additional-tags annotations are read. Others, such as target type, subnets, EIP allocations and health check settings, are ignored.
-- Nodes that Floci registers for joined EC2 instances have no kubelet and never report Ready, so they are not registered as targets.
+- Without [agent nodes](#agent-nodes), the nodes that Floci registers for joined EC2 instances have no kubelet and never report Ready, so they are not registered as targets. An agent node is registered, but its instance has no container address of its own, so the health checker finds it unhealthy and the data plane routes around it.
 - If the setting is turned off while Services still hold the finalizer, their deletion waits until it is turned back on or the finalizer is removed by hand.
 
 ## Joining EC2 instances as cluster nodes
@@ -738,6 +738,8 @@ Supported user data formats include:
 - Amazon Linux 2 `/etc/eks/bootstrap.sh <cluster-name>` commands (plain text, base64, or gzipped base64).
 - Amazon Linux 2023 `nodeadm` YAML documents or MIME multipart payloads (`NodeConfig` containing `spec.cluster.name`).
 
+Along with the cluster name, Floci reads the node labels of `--node-labels` and the taints of `--register-with-taints`, whether they come in `--kubelet-extra-args` or in nodeadm's `spec.kubelet.flags`, and the taints of nodeadm's `spec.kubelet.config.registerWithTaints`. They reach the node with [agent nodes](#agent-nodes).
+
 On AWS, EC2 does not fail instance launches if a target cluster is missing. Floci mirrors this: if the target cluster does not exist or node registration fails, Floci logs a warning and allows the launch to proceed.
 
 ### Node metadata and AWS outcome alignment
@@ -748,10 +750,14 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 - **Labels & Status**: Includes topology and instance-type labels, ready status, internal IP, and catalog capacity.
 - **EC2 persistence**: The instance remains an authentic EC2 instance reported by `DescribeInstances`.
 
+### Agent nodes
+
+With `floci.services.eks.agent-nodes: true` (or `FLOCI_SERVICES_EKS_AGENT_NODES=true`), each joined instance gets a k3s agent container of the cluster's image instead of a `Node` record. The container joins the cluster's server over the Docker network with the server's node token, registers under the instance's node name and provider ID, carries the topology and instance-type labels plus the labels and taints from the instance's user data, reports Ready through its own kubelet and runs pods. It is named after the cluster and the instance id, goes away when the instance is terminated or the cluster is deleted, and is adopted after a Floci restart when it is still running. Node autoscalers such as Karpenter, whose nodes have to become Ready and run pods, need this setting.
+
 ### Differences and limitations
 
-- Floci registers the `Node` directly in the control plane with matching provider ID, labels, and ready status.
-- Node cleanup on termination is handled in part two; an instance can belong to at most one cluster at a time.
+- Without agent nodes, Floci registers the `Node` directly in the control plane with matching provider ID, labels, and ready status, and no kubelet keeps it Ready.
+- A terminated instance's `Node` is deleted, and so is its agent container; an instance can belong to at most one cluster at a time.
 
 ## Configuration
 
@@ -777,6 +783,7 @@ When an instance joins a cluster, Floci registers a Kubernetes `Node` matching A
 | `FLOCI_SERVICES_EKS_EMULATE_EBS_STORAGE` | `false` | Define the stock `gp2` StorageClass and serve `ebs.csi.aws.com` claims as EC2 volumes whose data stays on the node's filesystem |
 | `FLOCI_SERVICES_EKS_EBS_CSI_PORT` | `4591` | Port Floci serves the EBS CSI driver on; cluster nodes reach it on the Docker host address |
 | `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Start k3s without its service load balancer and give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
+| `FLOCI_SERVICES_EKS_AGENT_NODES` | `false` | Run a k3s agent container for each EC2 instance that joins a cluster, so its node has a kubelet, reports Ready and runs pods |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
 | `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects IRSA and pod identity credentials, and route the pod identity endpoint (`169.254.170.23`) on each node to Floci. Needs `FLOCI_TLS_ENABLED=true` |
 | `FLOCI_SERVICES_EKS_INJECT_ENDPOINT_URL` | `false` | Also set `AWS_ENDPOINT_URL` to Floci, and mount Floci's CA bundle as `AWS_CA_BUNDLE`, on every pod the webhook mutates, so in-cluster controllers call Floci instead of AWS (pair with `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` for the STS credential call) |

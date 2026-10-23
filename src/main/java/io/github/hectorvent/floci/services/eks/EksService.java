@@ -859,6 +859,34 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 }));
     }
 
+    @Override
+    public void onInstanceTerminated(String accountId, String region, Instance instance) {
+        if (instance == null || instance.getInstanceId() == null) {
+            return;
+        }
+        for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+            Cluster cluster = entry.value();
+            if (cluster == null || cluster.getJoinedInstanceIds() == null
+                    || !cluster.getJoinedInstanceIds().containsKey(instance.getInstanceId())
+                    || (accountId != null && entry.accountId() != null && !accountId.equals(entry.accountId()))) {
+                continue;
+            }
+            RequestScopes.runAs(entry.accountId(), region, () -> {
+                try {
+                    clusterManager.leaveInstance(cluster, instance);
+                } catch (Exception e) {
+                    LOG.warnv("Failed to remove terminated instance {0} from cluster {1}: {2}",
+                            instance.getInstanceId(), cluster.getName(), e.getMessage());
+                }
+                saveClusterIfNotDeleting(entry.accountId(), cluster.getName(), current -> {
+                    if (current.getJoinedInstanceIds() != null) {
+                        current.getJoinedInstanceIds().remove(instance.getInstanceId());
+                    }
+                });
+            });
+        }
+    }
+
     private Optional<String> extractInstanceClusterName(Instance instance) {
         return (instance != null && instance.getUserData() != null && !instance.getUserData().isBlank())
                 ? EksBootstrapUserData.extractClusterName(instance.getUserData()) : Optional.empty();

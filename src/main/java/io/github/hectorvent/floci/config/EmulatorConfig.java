@@ -3416,6 +3416,15 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean loadBalancerServices();
 
+        /**
+         * When true, each EC2 instance that joins a cluster through its user data runs a k3s agent
+         * container of the cluster's image instead of getting a kubelet-less {@code Node} record:
+         * the node reports Ready, carries the labels and taints its user data asked for, and runs
+         * pods. The container goes away with the instance's termination or the cluster's deletion.
+         */
+        @WithDefault("false")
+        boolean agentNodes();
+
         /** The port Floci serves the EBS CSI driver's gRPC services on when {@link #emulateEbsStorage()} is on. */
         @WithDefault("4591")
         int ebsCsiPort();
