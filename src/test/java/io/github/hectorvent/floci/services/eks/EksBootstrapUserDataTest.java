@@ -63,6 +63,20 @@ class EksBootstrapUserDataTest {
     }
 
     @Test
+    void readsQuotedKubeletFlagValuesFromNodeadmConfig() {
+        String yaml = "---\napiVersion: node.eks.aws/v1alpha1\nkind: NodeConfig\nspec:\n  cluster:\n    name: nodeadm-cluster\n"
+                + "  kubelet:\n    flags:\n"
+                + "      - --node-labels=\"karpenter.sh/nodepool=default,karpenter.sh/capacity-type=on-demand\"\n"
+                + "      - --register-with-taints=\"karpenter.sh/unregistered:NoExecute\"\n";
+
+        EksBootstrapUserData.NodeJoinRequest request = EksBootstrapUserData.extract(yaml).orElseThrow();
+
+        assertEquals(Map.of("karpenter.sh/nodepool", "default", "karpenter.sh/capacity-type", "on-demand"),
+                request.labels());
+        assertEquals(List.of("karpenter.sh/unregistered:NoExecute"), request.taints());
+    }
+
+    @Test
     void plainJoinRequestsCarryNoLabelsOrTaints() {
         EksBootstrapUserData.NodeJoinRequest request =
                 EksBootstrapUserData.extract("#!/bin/bash\n/etc/eks/bootstrap.sh my-cluster\n").orElseThrow();

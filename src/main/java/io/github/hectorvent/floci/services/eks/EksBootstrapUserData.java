@@ -30,6 +30,7 @@ public final class EksBootstrapUserData {
      * What an instance's user data asks of the cluster it joins: the cluster, the node labels of
      * {@code --node-labels}, and the taints of {@code --register-with-taints} or nodeadm's
      * {@code kubelet.config.registerWithTaints} as {@code key=value:Effect} or {@code key:Effect}.
+     * A flag's value may be double-quoted, the way Karpenter writes nodeadm kubelet flags.
      */
     public record NodeJoinRequest(String clusterName, Map<String, String> labels, List<String> taints) {
     }
@@ -203,7 +204,7 @@ public final class EksBootstrapUserData {
             if (!flag.startsWith(NODE_LABELS_FLAG)) {
                 continue;
             }
-            for (String pair : flag.substring(NODE_LABELS_FLAG.length()).split(",")) {
+            for (String pair : stripQuotes(flag.substring(NODE_LABELS_FLAG.length())).split(",")) {
                 int eq = pair.indexOf('=');
                 if (eq > 0) {
                     labels.put(pair.substring(0, eq).trim(), pair.substring(eq + 1).trim());
@@ -219,7 +220,7 @@ public final class EksBootstrapUserData {
             if (!flag.startsWith(REGISTER_WITH_TAINTS_FLAG)) {
                 continue;
             }
-            for (String taint : flag.substring(REGISTER_WITH_TAINTS_FLAG.length()).split(",")) {
+            for (String taint : stripQuotes(flag.substring(REGISTER_WITH_TAINTS_FLAG.length())).split(",")) {
                 if (!taint.isBlank()) {
                     taints.add(taint.trim());
                 }
