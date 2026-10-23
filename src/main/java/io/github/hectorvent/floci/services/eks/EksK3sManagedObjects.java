@@ -136,6 +136,19 @@ final class EksK3sManagedObjects {
         return new Listing(missing, Optional.of(new String[]{"sh", "-c", APPLY_STDIN_SCRIPT, "sh", list.toString()}));
     }
 
+    /**
+     * Gives a joined node's password Secret EKS's field manager. The apply waits for k3s to create the
+     * Secret: one created first would hold no password hash and k3s would reject the node.
+     */
+    static String[] nodePasswordMarkCommand(String nodeName) {
+        String secretName = nodeName + NODE_PASSWORD_SUFFIX;
+        ObjectNode secret = JSON.createObjectNode().put("apiVersion", "v1").put("kind", "Secret");
+        ObjectNode metadata = secret.putObject("metadata").put("name", secretName).put("namespace", NAMESPACE);
+        metadata.putObject("labels").put(COMPONENT_LABEL, K3S_COMPONENT);
+        return new String[]{"sh", "-c", "kubectl get secret --namespace " + NAMESPACE
+                + " \"$2\" --output name >/dev/null 2>&1 && " + APPLY_STDIN_SCRIPT, "sh", secret.toString(), secretName};
+    }
+
     private static Map<String, String> checksumsByManifest(String sha256sumOutput) {
         Map<String, String> checksums = new HashMap<>();
         for (String line : sha256sumOutput == null ? new String[0] : sha256sumOutput.split("\\R")) {

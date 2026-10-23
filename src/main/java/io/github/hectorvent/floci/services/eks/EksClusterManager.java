@@ -191,6 +191,7 @@ public class EksClusterManager
     private static final long K3S_PLATFORM_RBAC_WAIT_MILLIS = 60_000;
     private static final long K3S_PLATFORM_RBAC_POLL_MILLIS = 500;
     private static final int K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS = 15;
+    private static final long JOINED_NODE_PASSWORD_WAIT_MILLIS = 300_000;
     private static final Duration REPLACED_NODE_EXIT_WAIT = Duration.ofSeconds(120);
 
     private final ContainerBuilder containerBuilder;
@@ -3706,10 +3707,11 @@ public class EksClusterManager
                     + token.stderr());
         }
         String region = instance.getRegion() != null ? instance.getRegion() : clusterRegion(cluster);
+        String nodeName = deriveInstanceNodeName(instance, region);
         EksBootstrapUserData.NodeJoinRequest request =
                 EksBootstrapUserData.extract(instance.getUserData()).orElse(null);
         List<String> agentArgs = buildAgentArgs(
-                deriveInstanceNodeName(instance, region),
+                nodeName,
                 deriveInstanceNodeProviderId(instance, region),
                 instanceNodeLabels(instance, region, request),
                 request != null ? request.taints() : List.of());
@@ -3750,6 +3752,35 @@ public class EksClusterManager
         }
         LOG.infov("k3s agent container {0} started for instance {1} in cluster {2}",
                 containerName, instance.getInstanceId(), cluster.getName());
+        markJoinedNodePasswordSecret(serverContainerId, cluster.getName(), nodeName);
+    }
+
+    /**
+     * Marks a joined node's password Secret as EKS-managed once k3s creates it at the node's
+     * registration, off the request thread so the join call returns as EC2 does.
+     */
+    private void markJoinedNodePasswordSecret(String serverContainerId, String clusterName, String nodeName) {
+        Thread.ofVirtual().name("eks-node-password-" + nodeName).start(() -> {
+            long deadline = System.currentTimeMillis() + JOINED_NODE_PASSWORD_WAIT_MILLIS;
+            try {
+                while (System.currentTimeMillis() < deadline) {
+                    ContainerExec.Result marked = execInContainerForResult(serverContainerId,
+                            EksK3sManagedObjects.nodePasswordMarkCommand(nodeName),
+                            K3S_PLATFORM_RBAC_KUBECTL_TIMEOUT_SECONDS);
+                    if (!marked.timedOut() && marked.exitCode() == 0) {
+                        return;
+                    }
+                    Thread.sleep(K3S_PLATFORM_RBAC_POLL_MILLIS);
+                }
+                LOG.warnv("EKS cluster {0} gave up waiting for the password Secret of node {1}; it reads as a "
+                        + "customer object", clusterName, nodeName);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (RuntimeException e) {
+                LOG.warnv("Could not mark the password Secret of node {0} in EKS cluster {1} as EKS-managed: {2}",
+                        nodeName, clusterName, e.getMessage());
+            }
+        });
     }
 
     private Map<String, String> instanceNodeLabels(Instance instance, String region,

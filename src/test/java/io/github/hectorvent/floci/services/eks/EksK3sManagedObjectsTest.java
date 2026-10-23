@@ -75,6 +75,19 @@ class EksK3sManagedObjectsTest {
     }
 
     @Test
+    void marksAJoinedNodesPasswordSecretOnlyOnceK3sHasCreatedIt() {
+        String[] command = EksK3sManagedObjects.nodePasswordMarkCommand("ip-10-0-4-10.us-east-2.compute.internal");
+
+        assertEquals(List.of("sh", "-c", "kubectl get secret --namespace kube-system \"$2\" --output name "
+                + ">/dev/null 2>&1 && printf '%s' \"$1\" | kubectl apply --server-side --field-manager=eks "
+                + "--validate=false --output name -f -", "sh"), Arrays.asList(command).subList(0, 4));
+        assertEquals("{\"apiVersion\":\"v1\",\"kind\":\"Secret\",\"metadata\":{\"name\":"
+                + "\"ip-10-0-4-10.us-east-2.compute.internal.node-password.k3s\",\"namespace\":\"kube-system\","
+                + "\"labels\":{\"eks.amazonaws.com/component\":\"k3s\"}}}", command[4]);
+        assertEquals("ip-10-0-4-10.us-east-2.compute.internal.node-password.k3s", command[5]);
+    }
+
+    @Test
     void leavesEksControlPlaneCustomerAndAlreadyMarkedObjectsAlone() {
         ObjectNode markedService = owned("v1", "Service", "kube-dns", "kube-system", "coredns");
         ((ObjectNode) markedService.path("metadata").path("labels")).put("eks.amazonaws.com/component", "coredns");
