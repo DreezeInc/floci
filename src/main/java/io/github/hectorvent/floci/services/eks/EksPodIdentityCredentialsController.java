@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.eks;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.WebIdentityToken;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier;
 import io.github.hectorvent.floci.core.common.WebIdentityTokenVerifier.ExpiredTokenException;
@@ -117,8 +118,9 @@ public class EksPodIdentityCredentialsController {
         String namespace = rest.substring(0, colon);
         String serviceAccount = rest.substring(colon + 1);
 
-        Optional<PodIdentityAssociation> maybeAssociation = associationService.findAssociation(
-                cluster, namespace, serviceAccount);
+        // The pod calls without AWS credentials, so the lookup runs as the cluster's account.
+        Optional<PodIdentityAssociation> maybeAssociation = RequestScopes.callAs(cluster.getAccountId(),
+                () -> associationService.findAssociation(cluster, namespace, serviceAccount));
         if (maybeAssociation.isEmpty()) {
             return error(404, "ResourceNotFoundException: No association found for service account: "
                     + serviceAccount + "\n");

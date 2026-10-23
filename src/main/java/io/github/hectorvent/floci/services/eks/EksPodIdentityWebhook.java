@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -159,7 +160,7 @@ public class EksPodIdentityWebhook {
         String serviceAccount = serviceAccountOf(pod);
         List<Injection> injections = new ArrayList<>();
         irsaInjection(cluster.get(), namespace, serviceAccount).ifPresent(injections::add);
-        if (podIdentityAgentInstalled(cluster.get()) && hasAssociation(cluster.get(), namespace, serviceAccount)) {
+        if (podIdentityAssociated(cluster.get(), accountId, namespace, serviceAccount)) {
             injections.add(podIdentityInjection());
         }
         if (injections.isEmpty()) {
@@ -226,6 +227,12 @@ public class EksPodIdentityWebhook {
 
     static Injection podIdentityInjection() {
         return new Injection(tokenVolume(), tokenMount(), credentialsEnv());
+    }
+
+    // The API server calls anonymously, so the account-scoped lookups run as the cluster's account.
+    private boolean podIdentityAssociated(Cluster cluster, String accountId, String namespace, String serviceAccount) {
+        return RequestScopes.callAs(accountId,
+                () -> podIdentityAgentInstalled(cluster) && hasAssociation(cluster, namespace, serviceAccount));
     }
 
     private boolean podIdentityAgentInstalled(Cluster cluster) {
