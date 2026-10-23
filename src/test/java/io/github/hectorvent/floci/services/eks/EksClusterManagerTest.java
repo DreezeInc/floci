@@ -12,6 +12,7 @@ import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.command.InfoCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectExecCmd;
@@ -107,6 +108,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
@@ -503,6 +505,80 @@ class EksClusterManagerTest {
 
         // First element is an unused $0 placeholder consumed by sh -c, not part of serverArgs.
         assertEquals(serverArgs, wrapped.subList(1, wrapped.size()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void startClusterBoundsTheNodeByItsInstanceTypeOnlyWhenConfigured(boolean nodeResourceLimits) {
+        long hostMemoryBytes = 64L * 1024 * 1024 * 1024;
+        EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = Mockito.mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.EksServiceConfig eks = Mockito.mock(EmulatorConfig.EksServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.eks()).thenReturn(eks);
+        when(eks.defaultImage()).thenReturn("rancher/k3s:v1.30.0-k3s1");
+        when(eks.apiServerBasePort()).thenReturn(6440);
+        when(eks.apiServerMaxPort()).thenReturn(6499);
+        when(eks.dockerNetwork()).thenReturn(Optional.empty());
+        when(eks.nodeResourceLimits()).thenReturn(nodeResourceLimits);
+
+        ContainerLifecycleManager lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.create(any())).thenReturn("container-id");
+        when(lifecycleManager.startCreated(any(), any())).thenReturn(
+                new ContainerInfo("container-id", Map.of()));
+        DockerClient dockerClient = Mockito.mock(DockerClient.class);
+        InfoCmd infoCmd = Mockito.mock(InfoCmd.class);
+        Info info = Mockito.mock(Info.class);
+        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        when(dockerClient.infoCmd()).thenReturn(infoCmd);
+        when(infoCmd.exec()).thenReturn(info);
+        when(info.getMemTotal()).thenReturn(hostMemoryBytes);
+        when(info.getNCPU()).thenReturn(16);
+
+        ContainerBuilder containerBuilder = Mockito.mock(ContainerBuilder.class);
+        ContainerBuilder.Builder builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
+        when(containerBuilder.newContainer(anyString())).thenReturn(builder);
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
+
+        RegionResolver regionResolver = Mockito.mock(RegionResolver.class);
+        when(regionResolver.getAccountId()).thenReturn("000000000000");
+        when(regionResolver.getDefaultRegion()).thenReturn("us-east-1");
+        when(regionResolver.buildGlobalArn(anyString(), anyString(), anyString())).thenAnswer(invocation ->
+                "arn:aws:" + invocation.getArgument(0) + "::" + invocation.getArgument(1) + ":" + invocation.getArgument(2));
+
+        EksClusterManager manager = new EksClusterManager(containerBuilder, lifecycleManager,
+                Mockito.mock(ContainerDetector.class), Mockito.mock(PortAllocator.class),
+                Mockito.mock(DockerHostResolver.class), Mockito.mock(EcrRegistryManager.class),
+                config, regionResolver);
+
+        Cluster cluster = new Cluster();
+        cluster.setName("my-cluster");
+
+        manager.startCluster(cluster);
+
+        EksNodeCapacity.Limits typeLimits = EksNodeCapacity.calculate(
+                new Ec2InstanceTypeCatalog().find("m5.large").orElseThrow(), hostMemoryBytes, 16, 0, 0);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, String>> labels = ArgumentCaptor.forClass(Map.class);
+        verify(builder).withLabels(labels.capture());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<String>> cmd = ArgumentCaptor.forClass(List.class);
+        verify(builder).withCmd(cmd.capture());
+        boolean reserved = cmd.getValue().stream()
+                .anyMatch(arg -> arg.startsWith("--kubelet-arg=system-reserved="));
+        String capacity = labels.getValue().get("io.floci.eks.node-capacity");
+
+        if (nodeResourceLimits) {
+            verify(builder).withMemoryBytes(typeLimits.memoryBytes());
+            verify(builder).withCpuUnits(typeLimits.vcpus() * 1024);
+            assertTrue(capacity.startsWith("m5.large:" + typeLimits.memoryBytes() + ":" + typeLimits.vcpus() + ":"));
+            assertTrue(reserved);
+        } else {
+            verify(builder, never()).withMemoryBytes(anyLong());
+            verify(builder, never()).withCpuUnits(anyInt());
+            assertEquals("m5.large:unbounded", capacity);
+            assertFalse(reserved);
+        }
     }
 
     @Test
@@ -3299,6 +3375,7 @@ class EksClusterManagerTest {
             when(services.eks()).thenReturn(eks);
             when(eks.defaultImage()).thenReturn("rancher/k3s:latest");
             when(eks.imageTemplate()).thenReturn(Optional.empty());
+            when(eks.nodeResourceLimits()).thenReturn(true);
             when(eks.apiServerBasePort()).thenReturn(6500);
             when(eks.apiServerMaxPort()).thenReturn(6599);
             when(eks.dockerNetwork()).thenReturn(Optional.empty());

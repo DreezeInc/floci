@@ -1286,6 +1286,9 @@ public class EksClusterManager
     }
 
     private EksNodeCapacity.Limits resolveNodeCapacity(Cluster cluster) {
+        if (!config.services().eks().nodeResourceLimits()) {
+            return null;
+        }
         try {
             Info host = lifecycleManager.getDockerClient().infoCmd().exec();
             CatalogInstanceType type = instanceTypeCatalog.find(nodeInstanceType(cluster)).orElseThrow();

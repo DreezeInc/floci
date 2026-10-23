@@ -613,6 +613,12 @@ run. `floci.services.eks.max-memory-mib` and `floci.services.eks.max-vcpus` prov
 ceilings; zero means no extra ceiling. Their environment variables are `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB`
 and `FLOCI_SERVICES_EKS_MAX_VCPUS`.
 
+With `floci.services.eks.node-resource-limits: false` (or `FLOCI_SERVICES_EKS_NODE_RESOURCE_LIMITS=false`),
+the node container runs without the quota, the limit and the derived kubelet arguments, and its
+capacity label reads `<type>:unbounded`. Use it where the emulator itself runs inside a container
+whose own limits already bound the node: the instance type's two vCPUs would otherwise cap a
+cluster that has more.
+
 The same calculation sets kubelet's `kube-reserved`, `system-reserved`, and `eviction-hard` flags.
 The EKS AMI reserves `255 + 11 * maxPods` MiB and a tiered CPU fraction for kubelet and the
 container runtime. Floci derives `maxPods` from the catalog's primary network card and IPv4
@@ -775,6 +781,7 @@ With `floci.services.eks.agent-nodes: true` (or `FLOCI_SERVICES_EKS_AGENT_NODES=
 | `FLOCI_SERVICES_EKS_MOCK` | `false` | Metadata-only mode (no Docker) |
 | `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB` | `0` | Optional k3s container memory ceiling in MiB |
 | `FLOCI_SERVICES_EKS_MAX_VCPUS` | `0` | Optional k3s container vCPU ceiling |
+| `FLOCI_SERVICES_EKS_NODE_RESOURCE_LIMITS` | `true` | Bound the k3s node container by its instance type's vCPUs and memory |
 | `FLOCI_SERVICES_EKS_DEFAULT_IMAGE` | `rancher/k3s:latest` | k3s Docker image fallback |
 | `FLOCI_SERVICES_EKS_IMAGE_TEMPLATE` | *(unset)* | Format string for custom k3s images (e.g. `myregistry.io/k3s:v%s`), taking cluster version |
 | `FLOCI_SERVICES_EKS_API_SERVER_BASE_PORT` | `6500` | First port in the k3s API server range |
