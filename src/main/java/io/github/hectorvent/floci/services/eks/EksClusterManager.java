@@ -1250,7 +1250,8 @@ public class EksClusterManager
         // Strict: a container Docker could not remove may still be running and publishing the
         // port, so the delete fails and keeps the cluster record, its metadata endpoint, log
         // handle and port reservation; a retried delete releases them once the container is gone.
-        lifecycleManager.stopAndRemoveStrict(cluster.getContainerId(), logStream);
+        // No stop grace: the record and data go with the container, so a clean k3s shutdown buys nothing.
+        lifecycleManager.stopAndRemoveStrict(cluster.getContainerId(), logStream, 0);
         removeAgentNodeContainers(cluster);
         unregisterMetadataEndpoint(cluster);
         // Removed by value so an overlapping delete cannot drop a handle it does not own.
@@ -3576,7 +3577,7 @@ public class EksClusterManager
                 }
                 try {
                     execInContainerForResult(containerId,
-                            new String[]{"kubectl", "delete", "node", nodeName, "--ignore-not-found=true"}, 15);
+                            new String[]{"kubectl", "delete", "node", nodeName, "--ignore-not-found=true", "--wait=false"}, 15);
                 } catch (Exception ignored) {
                     // Node cleanup best effort on join failure
                 }
@@ -3876,7 +3877,10 @@ public class EksClusterManager
         lifecycleManager.removeIfExists(containerName);
     }
 
-    /** Takes a terminated instance out of its cluster: its agent container, if any, and its Node. */
+    /**
+     * Takes a terminated instance out of its cluster: its agent container, if any, and its Node.
+     * The Node's deletion is issued, not awaited: EC2 never waits for a cluster's finalizers.
+     */
     void leaveInstance(Cluster cluster, Instance instance) {
         if (cluster == null || instance == null) {
             return;
@@ -3897,7 +3901,7 @@ public class EksClusterManager
         String region = instance.getRegion() != null ? instance.getRegion() : clusterRegion(cluster);
         String nodeName = deriveInstanceNodeName(instance, region);
         ContainerExec.Result res = execInContainerForResult(containerId,
-                new String[]{"kubectl", "delete", "node", nodeName, "--ignore-not-found=true"}, 15);
+                new String[]{"kubectl", "delete", "node", nodeName, "--ignore-not-found=true", "--wait=false"}, 15);
         if (res.exitCode() != 0) {
             throw new IllegalStateException("Failed to delete node " + nodeName + " of terminated instance "
                     + instance.getInstanceId() + " from cluster " + cluster.getName() + ": " + res.stderr());

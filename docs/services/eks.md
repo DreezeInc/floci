@@ -771,7 +771,8 @@ With `floci.services.eks.agent-nodes: true` (or `FLOCI_SERVICES_EKS_AGENT_NODES=
 ### Differences and limitations
 
 - Without agent nodes, Floci registers the `Node` directly in the control plane with matching provider ID, labels, and ready status, and no kubelet keeps it Ready.
-- A terminated instance's `Node` is deleted, and so is its agent container; an instance can belong to at most one cluster at a time.
+- Terminating an instance removes its agent container and issues its `Node`'s deletion without waiting for the Node's finalizers, as EC2 never waits for a cluster: a node autoscaler such as Karpenter completes the deletion on its own. An instance can belong to at most one cluster at a time.
+- `DeleteCluster` kills the control plane container outright instead of letting k3s shut down: the cluster's record and data go away with it, and the call returns once the container is gone.
 
 ## Configuration
 

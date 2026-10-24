@@ -213,6 +213,20 @@ class ContainerLifecycleManagerVolumeTest {
     }
 
     @Test
+    void strictContainerCleanupGivesTheContainerTheCallersStopGrace() {
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.stopContainerCmd("container-id")).thenReturn(stop);
+        when(dockerClient.removeContainerCmd("container-id")).thenReturn(remove);
+
+        manager.stopAndRemoveStrict("container-id", null, 0);
+        manager.stopAndRemoveStrict("container-id", null);
+
+        verify(stop).withTimeout(0);
+        verify(stop).withTimeout(5);
+    }
+
+    @Test
     void strictContainerCleanupClosesTheLogStreamOfAnAlreadyMissingContainer() {
         StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
         when(dockerClient.stopContainerCmd("container-id")).thenReturn(stop);

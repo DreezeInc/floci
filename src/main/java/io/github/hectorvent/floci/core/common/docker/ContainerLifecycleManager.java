@@ -529,11 +529,19 @@ public class ContainerLifecycleManager {
      * only once the container is gone; when removal fails it is left open for the retry.
      */
     public void stopAndRemoveStrict(String containerId, Closeable logStream) {
+        stopAndRemoveStrict(containerId, logStream, 5);
+    }
+
+    /**
+     * {@link #stopAndRemoveStrict(String, Closeable)} with the caller's stop grace: the seconds
+     * Docker waits after SIGTERM before SIGKILL, {@code 0} to kill the container outright.
+     */
+    public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds) {
         LOG.infov("Stopping container {0}", containerId);
 
         Exception stopFailure = null;
         try {
-            dockerClient.stopContainerCmd(containerId).withTimeout(5).exec();
+            dockerClient.stopContainerCmd(containerId).withTimeout(stopTimeoutSeconds).exec();
         } catch (NotFoundException e) {
             LOG.debugv("Container {0} not found (already removed)", containerId);
             closeLogStreamIfPresent(logStream);
