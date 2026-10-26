@@ -18,7 +18,7 @@
 | `DeleteRepository` | Delete a repository (with `force=true` semantics for non-empty repos) |
 | `GetAuthorizationToken` | Returns a docker-login token + proxy endpoint |
 | `ListImages` | Enumerate tags and digests in a repository |
-| `DescribeImages` | Image metadata: digest, size, push timestamp, manifest media type |
+| `DescribeImages` | Every stored image, tagged or untagged: digest, tags, size, push timestamp, manifest media type |
 | `BatchGetImage` | Fetch image manifests, honoring `acceptedMediaTypes` |
 | `BatchDeleteImage` | Delete images by tag or digest |
 | `PutImageTagMutability` | Set tag mutability and reject replacement pushes to immutable tags |
@@ -44,6 +44,8 @@
 - **Image tag mutability.** `IMMUTABLE` repositories allow the first manifest write for a tag and reject every replacement, including a replacement with the same manifest. The proxy forwards blob uploads and digest-addressed manifests unchanged.
 - **Authorization.** `GetAuthorizationToken` returns `Base64("AWS:floci")` plus a proxy endpoint. The backing `registry:2` runs without auth, so any `aws ecr get-login-password | docker login` succeeds.
 - **Pull through cache rule configuration.** Pull-through cache rule actions persist AWS-compatible rule metadata with account and Region isolation. `UpdatePullThroughCacheRule` preserves fields omitted by the request and refreshes `updatedAt`. `ValidatePullThroughCacheRule` checks that the rule exists and reports it as valid; Floci does not contact the upstream registry or validate credentials. Rules do not proxy or cache images from the configured upstream registry.
+- **Untagged images.** `DescribeImages` without `imageIds` lists one image per stored manifest, as ECR does: a digest several tags point at carries them all, and a manifest no tag points at (the platform children of a pushed index, the manifest a re-tagged tag left behind) is an untagged image. The registry's revision links are the source, since the Distribution API enumerates tags only.
+- **CloudFormation encryption.** `AWS::ECR::Repository` applies its `EncryptionConfiguration` at create, so `DescribeRepositories` reports a template's KMS repository with its `kmsKey`.
 - **Manifest format negotiation.** `BatchGetImage` forwards the caller's `acceptedMediaTypes` as the upstream `Accept` header. Modern OCI manifests (`application/vnd.oci.image.manifest.v1+json`) and Docker v2 schema 2 are both supported.
 - **Cross-account / cross-region isolation.** Internally the registry namespaces repositories as `<account>/<region>/<repoName>`, so the same repository name in different accounts or regions cannot collide.
 - **Reconcile on first start.** When the registry container starts, Floci queries `GET /v2/_catalog` and recreates `Repository` metadata entries for any namespaces present in the registry but missing from local storage. This means image bytes are never orphaned across restarts.
