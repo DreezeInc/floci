@@ -275,6 +275,16 @@ class LambdaCfnProvisionerTest {
         verify(lambda, times(1)).getFunction(REGION, "my-fn");
     }
 
+    @Test
+    void theTemplatesKmsKeyArnReachesCreateFunction() {
+        when(lambda.createFunction(eq(REGION), anyMap())).thenReturn(lambdaFunction("my-fn"));
+        ObjectNode props = props("my-fn").put("KmsKeyArn", "arn:aws:kms:us-east-1:000000000000:key/k1");
+
+        provisioner.provision(function(null), props, ctx());
+
+        assertEquals("arn:aws:kms:us-east-1:000000000000:key/k1", capturedCreateRequest().get("KMSKeyArn"));
+    }
+
     @SuppressWarnings("unchecked")
     private Map<String, Object> capturedCreateRequest() {
         ArgumentCaptor<Map<String, Object>> request = ArgumentCaptor.forClass(Map.class);
