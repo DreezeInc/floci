@@ -3142,6 +3142,25 @@ public class LambdaService implements ResourceProvider {
         return lookupFunctionUrlConfig(region, functionName, qualifier);
     }
 
+    /**
+     * Nothing can put a provisioned concurrency config, so a lookup ends in the not-found error AWS
+     * gives a version or alias without one, once the checks AWS makes first pass: the qualifier is
+     * present, is not $LATEST, and names an existing version or alias of an existing function.
+     */
+    public AwsException provisionedConcurrencyConfigNotFound(String region, String functionName, String qualifier) {
+        if (qualifier == null || qualifier.isBlank()) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value null at 'qualifier' failed to satisfy constraint: Member must not be null", 400);
+        }
+        if ("$LATEST".equals(qualifier)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Provisioned Concurrency Configs cannot be applied to the $LATEST version", 400);
+        }
+        getFunction(region, functionName, qualifier);
+        return new AwsException("ProvisionedConcurrencyConfigNotFoundException",
+                "No Provisioned Concurrency Config found for this function", 404);
+    }
+
     /** The function's own URL config first, then its aliases' in alias order; empty when none has one. */
     public List<LambdaUrlConfig> listFunctionUrlConfigs(String region, String functionName) {
         LambdaFunction fn = getFunction(region, functionName);
