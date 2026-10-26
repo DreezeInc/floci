@@ -336,6 +336,22 @@ class LeafCfnProvisionerTest {
         }
 
         @Test
+        void theEncryptionConfigurationReachesTheCreate() {
+            when(ecr.createRepository(anyString(), any(), any(), any(), any(), any(), any(), anyString()))
+                    .thenReturn(repo("arn", "uri"));
+
+            provisioner.provision(resource("Repo", "AWS::ECR::Repository"), props("""
+                    {
+                      "RepositoryName": "app",
+                      "EncryptionConfiguration": {"EncryptionType": "KMS", "KmsKey": "arn:aws:kms:us-east-1:000000000000:key/k"}
+                    }
+                    """), ctx);
+
+            verify(ecr).createRepository("app", null, null, null, "KMS", "arn:aws:kms:us-east-1:000000000000:key/k",
+                    Map.of(), REGION);
+        }
+
+        @Test
         void deleteForcesRemovalSoANonEmptyRepositoryStillGoes() {
             provisioner.delete("AWS::ECR::Repository", "app", REGION);
             verify(ecr).deleteRepository("app", null, true, REGION);

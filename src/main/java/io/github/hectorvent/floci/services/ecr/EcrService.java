@@ -32,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -479,24 +480,23 @@ public class EcrService implements ResourceProvider {
         String internal = resolveRegistryRepoName(repo.getRegistryId(), region, repositoryName);
         RegistryHttpClient http = registryManager.httpClient();
 
-        List<String> refs = new ArrayList<>();
-        if (requested == null || requested.isEmpty()) {
-            try {
-                refs.addAll(http.listTags(internal));
-            } catch (Exception e) {
-                LOG.warnv("DescribeImages tag enumeration failed for {0}: {1}", repositoryName, e.getMessage());
+        boolean explicitRequest = requested != null && !requested.isEmpty();
+        // One entry per image, as ECR lists them: every tag of a digest on that digest's entry,
+        // and the manifests no tag points at (index children, re-pointed tags) as untagged images.
+        Map<String, List<String>> tagsByRef = new LinkedHashMap<>();
+        if (explicitRequest) {
+            for (ImageIdentifier id : requested) {
+                if (id.getImageTag() != null) tagsByRef.put(id.getImageTag(), List.of(id.getImageTag()));
+                else if (id.getImageDigest() != null) tagsByRef.put(id.getImageDigest(), List.of());
             }
         } else {
-            for (ImageIdentifier id : requested) {
-                if (id.getImageTag() != null) refs.add(id.getImageTag());
-                else if (id.getImageDigest() != null) refs.add(id.getImageDigest());
-            }
+            tagsByRef.putAll(storedImages(internal, repositoryName));
         }
 
-        boolean explicitRequest = requested != null && !requested.isEmpty();
         List<ImageDetail> details = new ArrayList<>();
         List<ImageFailure> failures = new ArrayList<>();
-        for (String ref : refs) {
+        for (Map.Entry<String, List<String>> entry : tagsByRef.entrySet()) {
+            String ref = entry.getKey();
             try {
                 RegistryHttpClient.ManifestResult m = http.getManifest(internal, ref, null);
                 if (m == null) {
@@ -510,8 +510,8 @@ public class EcrService implements ResourceProvider {
                 d.setRegistryId(repo.getRegistryId());
                 d.setRepositoryName(repositoryName);
                 d.setImageDigest(m.digest());
-                if (!ref.startsWith("sha256:")) {
-                    d.setImageTags(new ArrayList<>(List.of(ref)));
+                if (!entry.getValue().isEmpty()) {
+                    d.setImageTags(new ArrayList<>(entry.getValue()));
                 }
                 d.setImageSizeInBytes(RegistryHttpClient.sizeFromManifest(m.body()));
                 d.setImageManifestMediaType(m.mediaType());
@@ -542,6 +542,36 @@ public class EcrService implements ResourceProvider {
                             + repositoryName + "' in the registry with id '" + repo.getRegistryId() + "'", 400);
         }
         return new DescribeImagesResult(details, failures);
+    }
+
+    /**
+     * The repository's images keyed by digest, each with the tags pointing at it, in tag order
+     * and then the untagged ones; the registry's stored manifests are the ground truth, the tag
+     * list alone would miss every manifest no tag points at.
+     */
+    private Map<String, List<String>> storedImages(String internal, String repositoryName) {
+        RegistryHttpClient http = registryManager.httpClient();
+        Map<String, List<String>> tagsByDigest = new LinkedHashMap<>();
+        try {
+            for (String tag : http.listTags(internal)) {
+                String digest = http.headManifestDigest(internal, tag, null);
+                if (digest == null) {
+                    LOG.warnv("DescribeImages: tag {0}/{1} resolves to no manifest", repositoryName, tag);
+                    continue;
+                }
+                tagsByDigest.computeIfAbsent(digest, ignored -> new ArrayList<>()).add(tag);
+            }
+        } catch (Exception e) {
+            LOG.warnv("DescribeImages tag enumeration failed for {0}: {1}", repositoryName, e.getMessage());
+        }
+        try {
+            for (String digest : registryManager.listManifestDigests(internal)) {
+                tagsByDigest.computeIfAbsent(digest, ignored -> new ArrayList<>());
+            }
+        } catch (Exception e) {
+            LOG.warnv("DescribeImages manifest enumeration failed for {0}: {1}", repositoryName, e.getMessage());
+        }
+        return tagsByDigest;
     }
 
     public BatchGetImageResult batchGetImage(String repositoryName,

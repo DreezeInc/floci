@@ -539,9 +539,11 @@ public class EcrJsonHandler {
         n.put("registryId", d.getRegistryId());
         n.put("repositoryName", d.getRepositoryName());
         if (d.getImageDigest() != null) n.put("imageDigest", d.getImageDigest());
-        ArrayNode tags = objectMapper.createArrayNode();
-        for (String t : d.getImageTags()) tags.add(t);
-        n.set("imageTags", tags);
+        if (!d.getImageTags().isEmpty()) {
+            ArrayNode tags = objectMapper.createArrayNode();
+            for (String t : d.getImageTags()) tags.add(t);
+            n.set("imageTags", tags);
+        }
         n.put("imageSizeInBytes", d.getImageSizeInBytes());
         if (d.getImagePushedAt() != null) {
             n.put("imagePushedAt", d.getImagePushedAt().getEpochSecond());

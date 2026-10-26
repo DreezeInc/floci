@@ -696,6 +696,72 @@ class EcrServiceTest {
     // ------------------------------------------------------------
 
     @Test
+    void describeImagesListsUntaggedManifestsAndGroupsTagsByDigest() throws Exception {
+        // An index push stores its platform children with no tag, and re-pointing a tag
+        // leaves the previous manifest untagged; ECR lists both as untagged images, and a
+        // digest two tags point at as one image carrying both tags.
+        String repositoryName = "fixture";
+        String internalRepository = ACCOUNT + "/" + REGION + "/" + repositoryName;
+        String tagged = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        String untagged = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+        String manifest = """
+                {
+                  "schemaVersion": 2,
+                  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                  "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 1, "digest": "sha256:c"},
+                  "layers": []
+                }
+                """;
+
+        try (FakeRegistryServer registry = new FakeRegistryServer(internalRepository, List.of("v1", "latest"), tagged,
+                manifest, untagged)) {
+            when(registryManager.getRepositoryUri(ACCOUNT, REGION, repositoryName))
+                    .thenReturn("localhost:" + registry.port() + "/" + internalRepository);
+            when(registryManager.httpClient())
+                    .thenReturn(new RegistryHttpClient("http://localhost:" + registry.port()));
+            when(registryManager.listManifestDigests(internalRepository)).thenReturn(List.of(tagged, untagged));
+
+            service.createRepository(repositoryName, null, null, null, null, null, null, REGION);
+
+            EcrService.DescribeImagesResult described = service.describeImages(repositoryName, null, null, REGION);
+            assertTrue(described.failures().isEmpty());
+            assertEquals(2, described.imageDetails().size());
+            assertEquals(tagged, described.imageDetails().get(0).getImageDigest());
+            assertEquals(List.of("v1", "latest"), described.imageDetails().get(0).getImageTags());
+            assertEquals(untagged, described.imageDetails().get(1).getImageDigest());
+            assertTrue(described.imageDetails().get(1).getImageTags().isEmpty());
+        }
+    }
+
+    @Test
+    void describeImagesByDigestCarriesNoTagsAndByTagOnlyThatTag() throws Exception {
+        String repositoryName = "fixture";
+        String internalRepository = ACCOUNT + "/" + REGION + "/" + repositoryName;
+        String digest = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+        String manifest = """
+                {"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                 "config": {"mediaType": "application/vnd.docker.container.image.v1+json", "size": 1, "digest": "sha256:c"},
+                 "layers": []}
+                """;
+
+        try (FakeRegistryServer registry = new FakeRegistryServer(internalRepository, "v1", digest, manifest)) {
+            when(registryManager.getRepositoryUri(ACCOUNT, REGION, repositoryName))
+                    .thenReturn("localhost:" + registry.port() + "/" + internalRepository);
+            when(registryManager.httpClient())
+                    .thenReturn(new RegistryHttpClient("http://localhost:" + registry.port()));
+
+            service.createRepository(repositoryName, null, null, null, null, null, null, REGION);
+
+            EcrService.DescribeImagesResult byDigest = service.describeImages(repositoryName,
+                    List.of(new ImageIdentifier(null, digest)), null, REGION);
+            assertTrue(byDigest.imageDetails().get(0).getImageTags().isEmpty());
+            EcrService.DescribeImagesResult byTag = service.describeImages(repositoryName,
+                    List.of(new ImageIdentifier("v1", null)), null, REGION);
+            assertEquals(List.of("v1"), byTag.imageDetails().get(0).getImageTags());
+        }
+    }
+
+    @Test
     void hostnameStylePushesUnderBareRepoNameAreVisibleViaListAndDescribeImages() throws Exception {
         // A docker push to <account>.dkr.ecr.<region>.localhost:<port>/<repo>
         // reaches the raw registry, so the image is stored under the bare repo
@@ -1050,16 +1116,24 @@ class EcrServiceTest {
     private static final class FakeRegistryServer implements AutoCloseable {
         private final HttpServer server;
         private final String repository;
-        private final String tag;
+        private final List<String> tags;
         private final String digest;
         private final String manifest;
+        private final String untaggedDigest;
         private final List<String> deletedDigests = new java.util.ArrayList<>();
 
         private FakeRegistryServer(String repository, String tag, String digest, String manifest) throws IOException {
+            this(repository, List.of(tag), digest, manifest, null);
+        }
+
+        /** Every tag points at {@code digest}; {@code untaggedDigest} is served by digest alone. */
+        private FakeRegistryServer(String repository, List<String> tags, String digest, String manifest,
+                                   String untaggedDigest) throws IOException {
             this.repository = repository;
-            this.tag = tag;
+            this.tags = tags;
             this.digest = digest;
             this.manifest = manifest;
+            this.untaggedDigest = untaggedDigest;
             this.server = HttpServer.create(new InetSocketAddress(0), 0);
             this.server.createContext("/v2/", this::handle);
             this.server.start();
@@ -1095,19 +1169,21 @@ class EcrServiceTest {
                 return;
             }
             if (("/v2/" + repository + "/tags/list").equals(path) && "GET".equals(method)) {
-                sendJson(exchange, 200, "{\"name\":\"" + repository + "\",\"tags\":[\"" + tag + "\"]}");
+                String quoted = tags.stream().map(t -> "\"" + t + "\"").collect(java.util.stream.Collectors.joining(","));
+                sendJson(exchange, 200, "{\"name\":\"" + repository + "\",\"tags\":[" + quoted + "]}");
                 return;
             }
-            if (("/v2/" + repository + "/manifests/" + tag).equals(path) && "HEAD".equals(method)) {
+            String reference = path.startsWith("/v2/" + repository + "/manifests/")
+                    ? path.substring(("/v2/" + repository + "/manifests/").length()) : null;
+            boolean taggedReference = reference != null && (tags.contains(reference) || digest.equals(reference));
+            if (taggedReference && "HEAD".equals(method)) {
                 exchange.getResponseHeaders().add("Docker-Content-Digest", digest);
                 exchange.sendResponseHeaders(200, -1);
                 exchange.close();
                 return;
             }
-            if ((("/v2/" + repository + "/manifests/" + tag).equals(path)
-                    || ("/v2/" + repository + "/manifests/" + digest).equals(path))
-                    && "GET".equals(method)) {
-                exchange.getResponseHeaders().add("Docker-Content-Digest", digest);
+            if ((taggedReference || (untaggedDigest != null && untaggedDigest.equals(reference))) && "GET".equals(method)) {
+                exchange.getResponseHeaders().add("Docker-Content-Digest", taggedReference ? digest : untaggedDigest);
                 exchange.getResponseHeaders().add("Content-Type",
                         "application/vnd.docker.distribution.manifest.v2+json");
                 send(exchange, 200, manifest);

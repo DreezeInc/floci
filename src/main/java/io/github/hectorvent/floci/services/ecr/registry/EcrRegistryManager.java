@@ -576,6 +576,56 @@ public class EcrRegistryManager {
         }
     }
 
+    /**
+     * Every manifest the registry stores for a repository, tagged or not: the revision links of
+     * its {@code _manifests} directory, which the Registry HTTP API has no way to enumerate.
+     */
+    public synchronized List<String> listManifestDigests(String internalRepoName) {
+        ensureStarted();
+        if (!started || containerId == null) {
+            throw new IllegalStateException("ECR registry is not started");
+        }
+        String revisions = repositoryStoragePath(internalRepoName) + "/_manifests/revisions/sha256";
+        StringBuilder output = new StringBuilder();
+        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        ExecCreateCmdResponse exec = dockerClient
+                .execCreateCmd(containerId)
+                .withCmd("sh", "-c", "[ -d \"$1\" ] && find \"$1\" -mindepth 2 -maxdepth 2 -name link || true",
+                        "sh", revisions)
+                .withAttachStdout(true)
+                .withAttachStderr(true)
+                .exec();
+        try {
+            boolean completed = dockerClient.execStartCmd(exec.getId())
+                    .exec(new ResultCallback.Adapter<Frame>() {
+                        @Override
+                        public void onNext(Frame frame) {
+                            output.append(new String(frame.getPayload(), StandardCharsets.UTF_8));
+                        }
+                    })
+                    .awaitCompletion(REPOSITORY_DELETION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!completed) {
+                throw new RuntimeException("manifest enumeration timed out");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("manifest enumeration interrupted", e);
+        }
+        Long exitCode = dockerClient.inspectExecCmd(exec.getId()).exec().getExitCodeLong();
+        if (exitCode == null || exitCode != 0) {
+            throw new RuntimeException("manifest enumeration failed: " + output);
+        }
+        List<String> digests = new ArrayList<>();
+        for (String line : output.toString().split("\n")) {
+            String path = line.trim();
+            if (path.endsWith("/link")) {
+                String hex = path.substring(0, path.length() - "/link".length());
+                digests.add("sha256:" + hex.substring(hex.lastIndexOf('/') + 1));
+            }
+        }
+        return digests;
+    }
+
     /** Stops the container if {@code keepRunningOnShutdown=false}. Called from EmulatorLifecycle hooks. */
     public synchronized void shutdown() {
         if (config.services().ecr().keepRunningOnShutdown()) {
