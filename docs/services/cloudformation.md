@@ -291,6 +291,15 @@ because their backing services are not implemented. A `SecretId` change is appli
 than reproducing CloudFormation's replacement event sequence; failed changes restore affected secret
 data and attachment ownership.
 
+## Secrets Manager Rotation Schedules
+
+`AWS::SecretsManager::RotationSchedule` calls `RotateSecret` on the referenced secret with the
+template's `RotationLambdaARN` and `RotationRules`. `RotateImmediatelyOnUpdate` is passed through:
+the default rotates at once, and `false` runs only the rotation function's `testSecret` step, as on
+AWS. An update is the same call again. `Ref` and `Fn::GetAtt Id` return the secret ARN, and deleting
+the schedule turns rotation off and keeps the secret. `HostedRotationLambda` is not supported, since
+it deploys one of Secrets Manager's own rotation functions from a serverless application.
+
 ## Organizations
 
 `AWS::Organizations::Organization` uses the stack's calling account as the management account, so

@@ -108,6 +108,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Route53Cf
 import io.github.hectorvent.floci.services.cloudformation.provisioners.S3CfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SchedulerScheduleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SchedulerScheduleGroupCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.SecretRotationScheduleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SecretTargetAttachmentCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SecretsManagerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.SnsCfnProvisioner;
@@ -478,6 +479,7 @@ final class CfnProvisionerFixture {
             }
             if (secretsManagerService != null) {
                 discovered.add(new SecretsManagerCfnProvisioner(secretsManagerService));
+                discovered.add(new SecretRotationScheduleCfnProvisioner(secretsManagerService));
                 discovered.add(new SecretTargetAttachmentCfnProvisioner(
                         secretsManagerService, rdsService, docDbService, objectMapper));
             }
