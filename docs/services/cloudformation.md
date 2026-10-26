@@ -149,7 +149,7 @@ cross-resource references.
 | SNS | `Topic`, `Subscription`, `TopicPolicy` |
 | DynamoDB | `Table` (`TimeToLiveSpecification` applied on create and update; to rename an enabled TTL attribute, disable TTL in one update and enable the new attribute in a later one), `GlobalTable` |
 | Lambda | `Function` (Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket), `LayerVersion`, `EventSourceMapping` (SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored), `Version`, `Alias` (also what SAM's `AutoPublishAlias` expands into), `Permission`, `EventInvokeConfig` (also what a SAM function's `EventInvokeConfig` expands into), `MicrovmImage`, `NetworkConnector`, `Url`. Inline `ZipFile` packages include the `cfn-response` (Node.js) / `cfnresponse` (Python) module AWS injects for that code path, so Solutions-style custom-resource handlers work. |
-| IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile`, `OIDCProvider` (a reused provider is not reconciled on update) |
+| IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile`, `OIDCProvider` (a reused provider is not reconciled on update), `Group`, `UserToGroupAddition` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
 | SSM | `Parameter` |
 | KMS | `Key`, `Alias` |

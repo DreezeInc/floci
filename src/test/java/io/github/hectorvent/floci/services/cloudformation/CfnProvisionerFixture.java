@@ -77,12 +77,14 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.EventsCfn
 import io.github.hectorvent.floci.services.cloudformation.provisioners.FirehoseCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.GuardDutyMalwareProtectionPlanCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamAccessKeyCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.IamGroupCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamInstanceProfileCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamManagedPolicyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamOidcProviderCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamPolicyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamRoleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IamUserCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.IamUserToGroupAdditionCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IotAuthorizerCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IotCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.IotDomainConfigurationCfnProvisioner;
@@ -370,6 +372,8 @@ final class CfnProvisionerFixture {
             if (iamService != null) {
                 discovered.add(new IamRoleCfnProvisioner(iamService));
                 discovered.add(new IamUserCfnProvisioner(iamService));
+                discovered.add(new IamGroupCfnProvisioner(iamService));
+                discovered.add(new IamUserToGroupAdditionCfnProvisioner(iamService));
                 discovered.add(new IamAccessKeyCfnProvisioner(iamService));
                 discovered.add(new IamInstanceProfileCfnProvisioner(iamService));
                 discovered.add(new IamPolicyCfnProvisioner(iamService));
