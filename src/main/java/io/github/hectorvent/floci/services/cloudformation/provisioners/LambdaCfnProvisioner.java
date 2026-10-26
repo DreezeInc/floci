@@ -250,7 +250,7 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
         configRequest.put("MemorySize", intOrDefault(ctx.resolveOptional(props, "MemorySize"),
                 LAMBDA_DEFAULT_MEMORY_MB));
         configRequest.put("Description", ctx.resolveOptional(props, "Description"));
-        configRequest.put("KMSKeyArn", ctx.resolveOptional(props, "KMSKeyArn"));
+        configRequest.put("KMSKeyArn", ctx.resolveOptional(props, "KmsKeyArn"));
         configRequest.put("Environment", Map.of("Variables", resolveLambdaEnvironment(props, engine)));
         putStringListIfPresent(configRequest, props, "Architectures", "Architectures", engine);
         configRequest.put("Layers", resolveStringListOrEmpty(props, "Layers", engine));
