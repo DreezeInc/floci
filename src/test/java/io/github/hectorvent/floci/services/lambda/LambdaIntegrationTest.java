@@ -572,13 +572,16 @@ class LambdaIntegrationTest {
         .then()
             .statusCode(201);
 
-        // GetFunction → Code.Location must be an S3-style URL on this endpoint.
+        // GetFunction → Code.Location must be a presigned S3-style URL on this endpoint.
         String location = given()
             .when()
             .get(BASE_PATH + "/functions/code-dl-fn")
         .then()
             .statusCode(200)
             .body("Code.RepositoryType", equalTo("S3"))
+            .body("Code.Location", containsString("/awslambda-us-east-1-tasks/snapshots/000000000000/code-dl-fn?"))
+            .body("Code.Location", containsString("X-Amz-Algorithm=AWS4-HMAC-SHA256"))
+            .body("Code.Location", containsString("X-Amz-Signature="))
             .extract().path("Code.Location");
 
         String expectedSha256 = given()
@@ -588,11 +591,11 @@ class LambdaIntegrationTest {
             .statusCode(200)
             .extract().path("CodeSha256");
 
-        // Follow Code.Location against the same test server via its path.
-        String path = java.net.URI.create(location).getRawPath();
+        // Follow Code.Location as a client does: the signed URL, no Authorization header.
         byte[] pkg = given()
-            .when()
-            .get(path)
+            .urlEncodingEnabled(false)
+        .when()
+            .get(location)
         .then()
             .statusCode(200)
             .extract().asByteArray();
@@ -621,7 +624,13 @@ class LambdaIntegrationTest {
             .put(BASE_PATH + "/functions/code-dl-fn/code")
         .then()
             .statusCode(200);
-        byte[] pkg2 = given().when().get(path).then().statusCode(200).extract().asByteArray();
+        byte[] pkg2 = given()
+            .urlEncodingEnabled(false)
+        .when()
+            .get(location)
+        .then()
+            .statusCode(200)
+            .extract().asByteArray();
         org.junit.jupiter.api.Assertions.assertFalse(java.util.Arrays.equals(pkg, pkg2),
                 "redeploy must replace the stored package");
 
@@ -632,10 +641,73 @@ class LambdaIntegrationTest {
         .then()
             .statusCode(anyOf(is(200), is(204)));
         given()
-            .when()
-            .get(path)
+            .urlEncodingEnabled(false)
+        .when()
+            .get(location)
         .then()
             .statusCode(404);
+    }
+
+    @Test
+    @Order(41)
+    void getFunction_codeLocation_ofNonDefaultAccountFunction_isFetchable() throws Exception {
+        // The Location URL is fetched without an Authorization header, so its presigned
+        // credential must target the function's owning account, where the package is stored.
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("index.js"));
+            zos.write("exports.handler = async () => ({ statusCode: 200 });\n".getBytes());
+            zos.closeEntry();
+        }
+        String zipB64 = Base64.getEncoder().encodeToString(baos.toByteArray());
+        String authorization = "AWS4-HMAC-SHA256 Credential=000000000001/20260215/us-east-1/lambda/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+
+        given()
+            .header("Authorization", authorization)
+            .contentType("application/json")
+            .body("""
+                {
+                    "FunctionName": "code-dl-alt-fn",
+                    "Runtime": "nodejs20.x",
+                    "Role": "arn:aws:iam::000000000001:role/lambda-role",
+                    "Handler": "index.handler",
+                    "Code": {
+                        "ZipFile": "%s"
+                    }
+                }
+                """.formatted(zipB64))
+        .when()
+            .post(BASE_PATH + "/functions")
+        .then()
+            .statusCode(201);
+
+        String location = given()
+            .header("Authorization", authorization)
+        .when()
+            .get(BASE_PATH + "/functions/code-dl-alt-fn")
+        .then()
+            .statusCode(200)
+            .body("Code.Location", containsString("/snapshots/000000000001/code-dl-alt-fn?"))
+            .body("Code.Location", containsString("X-Amz-Signature="))
+            .extract().path("Code.Location");
+
+        byte[] pkg = given()
+            .urlEncodingEnabled(false)
+        .when()
+            .get(location)
+        .then()
+            .statusCode(200)
+            .extract().asByteArray();
+        org.junit.jupiter.api.Assertions.assertArrayEquals(baos.toByteArray(), pkg,
+                "the signed Location must serve the owning account's package");
+
+        given()
+            .header("Authorization", authorization)
+        .when()
+            .delete(BASE_PATH + "/functions/code-dl-alt-fn")
+        .then()
+            .statusCode(204);
     }
 
     // ── Environment is omitted, not empty, when no variables are set ──
