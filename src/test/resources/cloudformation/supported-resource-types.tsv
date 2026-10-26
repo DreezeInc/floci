@@ -179,6 +179,7 @@ AWS::SQS::QueuePolicy	SqsCfnProvisioner
 AWS::SSM::Parameter	SsmCfnProvisioner
 AWS::Scheduler::Schedule	SchedulerScheduleCfnProvisioner
 AWS::Scheduler::ScheduleGroup	SchedulerScheduleGroupCfnProvisioner
+AWS::SecretsManager::RotationSchedule	SecretRotationScheduleCfnProvisioner
 AWS::SecretsManager::Secret	SecretsManagerCfnProvisioner
 AWS::SecretsManager::SecretTargetAttachment	SecretTargetAttachmentCfnProvisioner
 AWS::ServiceDiscovery::HttpNamespace	CloudMapCfnProvisioner
