@@ -41,6 +41,7 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `ListCodeSigningConfigs` | List the configurations in the region |
 | `CreateFunctionUrlConfig` | Provision a function URL |
 | `GetFunctionUrlConfig` | Read function URL config |
+| `ListFunctionUrlConfigs` | List the URL configs of a function and of its aliases |
 | `UpdateFunctionUrlConfig` | Update function URL config |
 | `DeleteFunctionUrlConfig` | Delete function URL config |
 | `ListTags` | List tags on a function or event source mapping |

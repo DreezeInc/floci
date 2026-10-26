@@ -3142,6 +3142,23 @@ public class LambdaService implements ResourceProvider {
         return lookupFunctionUrlConfig(region, functionName, qualifier);
     }
 
+    /** The function's own URL config first, then its aliases' in alias order; empty when none has one. */
+    public List<LambdaUrlConfig> listFunctionUrlConfigs(String region, String functionName) {
+        LambdaFunction fn = getFunction(region, functionName);
+        List<LambdaUrlConfig> configs = new ArrayList<>();
+        if (fn.getUrlConfig() != null) {
+            configs.add(fn.getUrlConfig());
+        }
+        if (aliasStore != null) {
+            for (LambdaAlias alias : aliasStore.list(region, fn.getFunctionName())) {
+                if (alias.getUrlConfig() != null) {
+                    configs.add(alias.getUrlConfig());
+                }
+            }
+        }
+        return configs;
+    }
+
     private LambdaUrlConfig lookupFunctionUrlConfig(String region, String functionName, String qualifier) {
         LambdaArnUtils.ResolvedFunctionRef ref = resolveWithRegion(region, functionName, qualifier);
         functionName = ref.name();
