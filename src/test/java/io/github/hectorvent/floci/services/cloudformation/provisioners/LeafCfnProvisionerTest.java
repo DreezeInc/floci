@@ -85,7 +85,8 @@ class LeafCfnProvisionerTest {
             KmsKey key = new KmsKey();
             key.setKeyId("k-123");
             key.setArn("arn:aws:kms:us-east-1:000000000000:key/k-123");
-            when(kms.createKey(eq("a key"), eq(null), any(), eq(REGION))).thenReturn(key);
+            when(kms.createKey(eq("a key"), eq("ENCRYPT_DECRYPT"), eq("SYMMETRIC_DEFAULT"), eq(null), any(),
+                    eq(null), eq(false), eq(REGION))).thenReturn(key);
 
             StackResource r = resource("Key", "AWS::KMS::Key");
             provisioner.provision(r, props("""
@@ -103,13 +104,60 @@ class LeafCfnProvisionerTest {
             KmsKey key = new KmsKey();
             key.setKeyId("k-1");
             ArgumentCaptor<Map<String, String>> tags = ArgumentCaptor.forClass(Map.class);
-            when(kms.createKey(any(), any(), tags.capture(), anyString())).thenReturn(key);
+            when(kms.createKey(any(), any(), any(), any(), tags.capture(), any(), eq(false), anyString()))
+                    .thenReturn(key);
 
             provisioner.provision(resource("Key", "AWS::KMS::Key"), props("""
                     {"Tags": [{"Key": "team", "Value": "core"}]}
                     """), ctx);
 
             assertEquals(Map.of("team", "core"), tags.getValue());
+        }
+
+        @Test
+        void keyWithoutRotationOrDisablingLeavesTheCreatedKeyAlone() {
+            KmsKey key = new KmsKey();
+            key.setKeyId("k-1");
+            when(kms.createKey(any(), any(), any(), any(), any(), any(), eq(false), anyString())).thenReturn(key);
+
+            provisioner.provision(resource("Key", "AWS::KMS::Key"), props("""
+                    {"Description": "plain"}
+                    """), ctx);
+
+            verify(kms, never()).enableKeyRotation(anyString(), anyString());
+            verify(kms, never()).disableKey(anyString(), anyString());
+        }
+
+        @Test
+        void keyPolicySpecUsageAndRotationReachTheService() {
+            KmsKey key = new KmsKey();
+            key.setKeyId("k-rot");
+            when(engine.resolveJsonAttributeStrict(any())).thenAnswer(i -> i.getArgument(0).toString());
+            when(kms.createKey(eq("rotating"), eq("ENCRYPT_DECRYPT"), eq("SYMMETRIC_DEFAULT"),
+                    eq("{\"Version\":\"2012-10-17\",\"Statement\":[]}"), any(), eq(null), eq(false), eq(REGION)))
+                    .thenReturn(key);
+
+            provisioner.provision(resource("Key", "AWS::KMS::Key"), props("""
+                    {"Description": "rotating", "EnableKeyRotation": true, "KeySpec": "SYMMETRIC_DEFAULT",
+                     "KeyUsage": "ENCRYPT_DECRYPT", "KeyPolicy": {"Version": "2012-10-17", "Statement": []}}
+                    """), ctx);
+
+            verify(kms).enableKeyRotation("k-rot", REGION);
+            verify(kms, never()).disableKey(anyString(), anyString());
+        }
+
+        @Test
+        void keyDeclaredDisabledIsDisabledAfterCreation() {
+            KmsKey key = new KmsKey();
+            key.setKeyId("k-off");
+            when(kms.createKey(any(), any(), any(), any(), any(), any(), eq(false), anyString())).thenReturn(key);
+
+            provisioner.provision(resource("Key", "AWS::KMS::Key"), props("""
+                    {"Enabled": false, "EnableKeyRotation": false}
+                    """), ctx);
+
+            verify(kms).disableKey("k-off", REGION);
+            verify(kms, never()).enableKeyRotation(anyString(), anyString());
         }
 
         @Test

@@ -41,11 +41,31 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
 
     private void provisionKey(StackResource r, JsonNode props, ProvisionContext ctx) {
         String description = ctx.resolveOptional(props, "Description");
+        String keyUsage = ctx.resolveOrDefault(props, "KeyUsage", "ENCRYPT_DECRYPT");
+        String keySpec = ctx.resolveOrDefault(props, "KeySpec", "SYMMETRIC_DEFAULT");
+        String origin = ctx.resolveOptional(props, "Origin");
+        boolean multiRegion = Boolean.parseBoolean(ctx.resolveOptional(props, "MultiRegion"));
         Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
-        KmsKey key = kmsService.createKey(description, null, tags, ctx.region());
+        KmsKey key = kmsService.createKey(description, keyUsage, keySpec, resolveKeyPolicy(props, ctx),
+                tags, origin, multiRegion, ctx.region());
+        if (Boolean.parseBoolean(ctx.resolveOptional(props, "EnableKeyRotation"))) {
+            kmsService.enableKeyRotation(key.getKeyId(), ctx.region());
+        }
+        if ("false".equalsIgnoreCase(ctx.resolveOptional(props, "Enabled"))) {
+            kmsService.disableKey(key.getKeyId(), ctx.region());
+        }
         r.setPhysicalId(key.getKeyId());
         r.getAttributes().put("Arn", key.getArn());
         r.getAttributes().put("KeyId", key.getKeyId());
+    }
+
+    /** The template's {@code KeyPolicy} as a JSON string, or null so the service applies its default policy. */
+    private String resolveKeyPolicy(JsonNode props, ProvisionContext ctx) {
+        JsonNode policyNode = props != null ? props.get("KeyPolicy") : null;
+        if (policyNode == null || policyNode.isNull()) {
+            return null;
+        }
+        return ctx.engine().resolveJsonAttributeStrict(policyNode);
     }
 
     private void provisionAlias(StackResource r, JsonNode props, ProvisionContext ctx) {
