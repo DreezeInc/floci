@@ -112,6 +112,16 @@ class LambdaCfnProvisionerTest {
     }
 
     @Test
+    void theTemplatesKmsKeyArnReachesCreateFunctionUnderTheApiName() {
+        when(lambda.createFunction(eq(REGION), anyMap())).thenReturn(lambdaFunction("my-fn"));
+        String keyArn = "arn:aws:kms:us-east-1:000000000000:key/k1";
+
+        provisioner.provision(function(null), props("my-fn").put("KmsKeyArn", keyArn), ctx());
+
+        assertEquals(keyArn, capturedCreateRequest().get("KMSKeyArn"));
+    }
+
+    @Test
     void functionTagsFromTheTemplateReachCreateFunction() {
         when(lambda.createFunction(eq(REGION), anyMap())).thenReturn(lambdaFunction("my-fn"));
         StackResource r = function(null);
