@@ -5,6 +5,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.wafv2.WafV2Service;
 import io.github.hectorvent.floci.services.wafv2.model.IpSet;
+import io.github.hectorvent.floci.services.wafv2.model.RegexPatternSet;
+import io.github.hectorvent.floci.services.wafv2.model.RuleGroup;
 import io.github.hectorvent.floci.services.wafv2.model.WebAcl;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -25,6 +27,8 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String WEB_ACL_ASSOCIATION = "AWS::WAFv2::WebACLAssociation";
     private static final String IP_SET = "AWS::WAFv2::IPSet";
     private static final String LOGGING_CONFIGURATION = "AWS::WAFv2::LoggingConfiguration";
+    private static final String REGEX_PATTERN_SET = "AWS::WAFv2::RegexPatternSet";
+    private static final String RULE_GROUP = "AWS::WAFv2::RuleGroup";
 
     private final WafV2Service wafV2Service;
 
@@ -35,11 +39,13 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public Set<String> resourceTypes() {
-        return Set.of(WEB_ACL, WEB_ACL_ASSOCIATION, IP_SET, LOGGING_CONFIGURATION);
+        return Set.of(WEB_ACL, WEB_ACL_ASSOCIATION, IP_SET, LOGGING_CONFIGURATION, REGEX_PATTERN_SET,
+                RULE_GROUP);
     }
 
     /**
-     * A web ACL or IP set id is its own {@code name|id|scope}, which names no parent. An
+     * A web ACL, IP set, regex pattern set or rule group id is its own {@code name|id|scope}, which
+     * names no parent. An
      * association's, {@code resourceArn|webAclArn}, starts with the resource it is attached to.
      */
     @Override
@@ -59,6 +65,14 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         }
         if (LOGGING_CONFIGURATION.equals(resource.getResourceType())) {
             provisionLoggingConfiguration(resource, props, ctx);
+            return;
+        }
+        if (REGEX_PATTERN_SET.equals(resource.getResourceType())) {
+            provisionRegexPatternSet(resource, props, ctx);
+            return;
+        }
+        if (RULE_GROUP.equals(resource.getResourceType())) {
+            provisionRuleGroup(resource, props, ctx);
             return;
         }
         JsonNode resolved = ctx.engine().resolveNode(props);
@@ -152,6 +166,65 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         ReplacementCleanup.record(resource, ctx, attributesBefore);
     }
 
+    /**
+     * Follows the IP set arm: {@code Name} and {@code Scope} are create-only and replace the set
+     * through {@link ReplacementCleanup}, while {@code RegularExpressionList}, {@code Description}
+     * and {@code Tags} update in place.
+     */
+    private void provisionRegexPatternSet(StackResource resource, JsonNode props, ProvisionContext ctx) {
+        JsonNode resolved = ctx.engine().resolveNode(props);
+        String scope = required(text(resolved, "Scope"), REGEX_PATTERN_SET, "Scope");
+        List<String> expressions = requiredStrings(resolved, "RegularExpressionList", REGEX_PATTERN_SET);
+        Map<String, String> attributesBefore = new HashMap<>(resource.getAttributes());
+        RegexPatternSet existing = findExistingRegexPatternSet(resource.getPhysicalId());
+        String name = nameOrDefault(resolved, resource, ctx, existing == null ? null : existing.getName());
+        if (existing != null && existing.getName().equals(name) && existing.getScope().equals(scope)) {
+            wafV2Service.updateRegexPatternSet(scope, existing.getId(), text(resolved, "Description"),
+                    expressions, name, existing.getLockToken());
+            RegexPatternSet updated = wafV2Service.getRegexPatternSet(scope, existing.getId(), name);
+            reconcileTags(updated.getArn(), tags(resolved));
+            setRegexPatternSetReferences(resource, updated);
+            return;
+        }
+        RegexPatternSet desired = new RegexPatternSet();
+        desired.setDescription(text(resolved, "Description"));
+        desired.setRegularExpressionList(expressions);
+        desired.setTags(tags(resolved));
+        setRegexPatternSetReferences(resource,
+                wafV2Service.createRegexPatternSet(desired, scope, name, ctx.region()));
+        ReplacementCleanup.record(resource, ctx, attributesBefore);
+    }
+
+    /**
+     * Follows the IP set arm for {@code Name} and {@code Scope}. {@code Rules}, {@code Description},
+     * {@code VisibilityConfig}, {@code CustomResponseBodies} and {@code Tags} update in place.
+     * {@code Capacity} is fixed at create, as UpdateRuleGroup takes none.
+     */
+    private void provisionRuleGroup(StackResource resource, JsonNode props, ProvisionContext ctx) {
+        JsonNode resolved = ctx.engine().resolveNode(props);
+        String scope = required(text(resolved, "Scope"), RULE_GROUP, "Scope");
+        long capacity = requiredCapacity(resolved);
+        RuleGroup desired = new RuleGroup();
+        desired.setDescription(text(resolved, "Description"));
+        desired.setRules(raw(resolved, "Rules"));
+        desired.setVisibilityConfig(required(raw(resolved, "VisibilityConfig"), RULE_GROUP, "VisibilityConfig"));
+        desired.setCustomResponseBodies(raw(resolved, "CustomResponseBodies"));
+        Map<String, String> attributesBefore = new HashMap<>(resource.getAttributes());
+        RuleGroup existing = findExistingRuleGroup(resource.getPhysicalId());
+        String name = nameOrDefault(resolved, resource, ctx, existing == null ? null : existing.getName());
+        if (existing != null && existing.getName().equals(name) && existing.getScope().equals(scope)) {
+            wafV2Service.updateRuleGroup(desired, scope, existing.getId(), name, existing.getLockToken());
+            RuleGroup updated = wafV2Service.getRuleGroup(scope, existing.getId(), name);
+            reconcileTags(updated.getArn(), tags(resolved));
+            setRuleGroupReferences(resource, updated);
+            return;
+        }
+        desired.setCapacity(capacity);
+        desired.setTags(tags(resolved));
+        setRuleGroupReferences(resource, wafV2Service.createRuleGroup(desired, scope, name, ctx.region()));
+        ReplacementCleanup.record(resource, ctx, attributesBefore);
+    }
+
     private void provisionLoggingConfiguration(StackResource resource, JsonNode props, ProvisionContext ctx) {
         resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_SNAPSHOT_ATTR);
         resource.getAttributes().remove(CfnRollback.WAF_LOGGING_UPDATE_ABSENT_ATTR);
@@ -214,6 +287,14 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
             wafV2Service.deleteLoggingConfiguration(physicalId);
             return;
         }
+        if (REGEX_PATTERN_SET.equals(resourceType)) {
+            deleteRegexPatternSet(physicalId);
+            return;
+        }
+        if (RULE_GROUP.equals(resourceType)) {
+            deleteRuleGroup(physicalId);
+            return;
+        }
         WebAcl existing = findExisting(physicalId);
         if (existing != null) {
             wafV2Service.deleteWebAcl(existing.getScope(), existing.getId(), existing.getName(),
@@ -228,6 +309,28 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         }
         CfnDeletes.safeDelete("WAFv2 IP set", physicalId,
                 () -> wafV2Service.deleteIpSet(existing.getScope(), existing.getId(), existing.getName(),
+                        existing.getLockToken()),
+                "WAFNonexistentItemException");
+    }
+
+    private void deleteRegexPatternSet(String physicalId) {
+        RegexPatternSet existing = findExistingRegexPatternSet(physicalId);
+        if (existing == null) {
+            return;
+        }
+        CfnDeletes.safeDelete("WAFv2 regex pattern set", physicalId,
+                () -> wafV2Service.deleteRegexPatternSet(existing.getScope(), existing.getId(),
+                        existing.getName(), existing.getLockToken()),
+                "WAFNonexistentItemException");
+    }
+
+    private void deleteRuleGroup(String physicalId) {
+        RuleGroup existing = findExistingRuleGroup(physicalId);
+        if (existing == null) {
+            return;
+        }
+        CfnDeletes.safeDelete("WAFv2 rule group", physicalId,
+                () -> wafV2Service.deleteRuleGroup(existing.getScope(), existing.getId(), existing.getName(),
                         existing.getLockToken()),
                 "WAFNonexistentItemException");
     }
@@ -287,7 +390,8 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
             }
             return true;
         }
-        if (IP_SET.equals(resource.getResourceType())) {
+        if (IP_SET.equals(resource.getResourceType()) || REGEX_PATTERN_SET.equals(resource.getResourceType())
+                || RULE_GROUP.equals(resource.getResourceType())) {
             return ReplacementCleanup.rollback(resource, this::delete);
         }
         if (LOGGING_CONFIGURATION.equals(resource.getResourceType())) {
@@ -359,6 +463,45 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         return addresses;
     }
 
+    private List<String> requiredStrings(JsonNode props, String property, String resourceType) {
+        JsonNode node = props.get(property);
+        if (node == null || node.isNull() || !node.isArray()) {
+            throw new AwsException("ValidationError", resourceType + " requires " + property, 400);
+        }
+        List<String> values = new ArrayList<>();
+        node.forEach(value -> values.add(value.asText()));
+        return values;
+    }
+
+    private long requiredCapacity(JsonNode props) {
+        JsonNode node = props.get("Capacity");
+        if (node == null || node.isNull()) {
+            throw new AwsException("ValidationError", RULE_GROUP + " requires Capacity", 400);
+        }
+        long capacity = node.isNumber() ? node.asLong() : parseCapacity(node.asText());
+        if (capacity < 0) {
+            throw new AwsException("ValidationError", RULE_GROUP + " Capacity must be at least 0", 400);
+        }
+        return capacity;
+    }
+
+    private static long parseCapacity(String value) {
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            throw new AwsException("ValidationError", RULE_GROUP + " Capacity must be an integer", 400);
+        }
+    }
+
+    /** An omitted {@code Name} keeps the existing entity's name on an update and is generated on a create. */
+    private String nameOrDefault(JsonNode props, StackResource resource, ProvisionContext ctx, String existingName) {
+        String name = text(props, "Name");
+        if (name != null && !name.isBlank()) {
+            return name;
+        }
+        return existingName == null ? ctx.generatePhysicalName(resource.getLogicalId(), 128, false) : existingName;
+    }
+
     private String ipAddressVersion(JsonNode props) {
         String version = required(text(props, "IPAddressVersion"), IP_SET, "IPAddressVersion");
         WafV2Service.requireIpAddressVersion(version);
@@ -405,6 +548,28 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
                 .orElse(null);
     }
 
+    private RegexPatternSet findExistingRegexPatternSet(String physicalId) {
+        String[] parts = physicalId == null ? new String[0] : physicalId.split("\\|", -1);
+        if (parts.length != 3) {
+            return null;
+        }
+        return wafV2Service.listRegexPatternSets(parts[2]).stream()
+                .filter(set -> parts[1].equals(set.getId()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private RuleGroup findExistingRuleGroup(String physicalId) {
+        String[] parts = physicalId == null ? new String[0] : physicalId.split("\\|", -1);
+        if (parts.length != 3) {
+            return null;
+        }
+        return wafV2Service.listRuleGroups(parts[2]).stream()
+                .filter(group -> parts[1].equals(group.getId()))
+                .findFirst()
+                .orElse(null);
+    }
+
     private void setReferences(StackResource resource, WebAcl acl) {
         resource.setPhysicalId(acl.getName() + "|" + acl.getId() + "|" + acl.getScope());
         resource.getAttributes().put("Arn", acl.getArn());
@@ -417,6 +582,19 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         resource.setPhysicalId(ipSet.getName() + "|" + ipSet.getId() + "|" + ipSet.getScope());
         resource.getAttributes().put("Arn", ipSet.getArn());
         resource.getAttributes().put("Id", ipSet.getId());
+    }
+
+    private void setRegexPatternSetReferences(StackResource resource, RegexPatternSet set) {
+        resource.setPhysicalId(set.getName() + "|" + set.getId() + "|" + set.getScope());
+        resource.getAttributes().put("Arn", set.getArn());
+        resource.getAttributes().put("Id", set.getId());
+    }
+
+    private void setRuleGroupReferences(StackResource resource, RuleGroup group) {
+        resource.setPhysicalId(group.getName() + "|" + group.getId() + "|" + group.getScope());
+        resource.getAttributes().put("Arn", group.getArn());
+        resource.getAttributes().put("Id", group.getId());
+        resource.getAttributes().put("LabelNamespace", group.getLabelNamespace());
     }
 
     private String text(JsonNode node, String field) {

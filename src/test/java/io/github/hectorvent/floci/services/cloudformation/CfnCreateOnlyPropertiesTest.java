@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -105,6 +106,18 @@ class CfnCreateOnlyPropertiesTest {
         assertEquals(Set.of("Name", "ReplicateTo"),
                 CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::DeploymentStrategy"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::DeploymentStrategy", "GrowthFactor"));
+    }
+
+    @Test
+    void isCreateOnly_regexPatternSetAndRuleGroupReplaceOnlyForNameAndScope() {
+        for (String type : List.of("AWS::WAFv2::RegexPatternSet", "AWS::WAFv2::RuleGroup")) {
+            assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "Name"));
+            assertTrue(CfnCreateOnlyProperties.isCreateOnly(type, "Scope"));
+            assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "Description"));
+            assertFalse(CfnCreateOnlyProperties.isCreateOnly(type, "Tags"));
+        }
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::WAFv2::RegexPatternSet", "RegularExpressionList"));
+        assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::WAFv2::RuleGroup", "Rules"));
     }
 
     @Test

@@ -208,6 +208,8 @@ AWS::Transfer::Server	TransferCfnProvisioner
 AWS::Transfer::User	TransferCfnProvisioner
 AWS::WAFv2::IPSet	WafV2CfnProvisioner
 AWS::WAFv2::LoggingConfiguration	WafV2CfnProvisioner
+AWS::WAFv2::RegexPatternSet	WafV2CfnProvisioner
+AWS::WAFv2::RuleGroup	WafV2CfnProvisioner
 AWS::WAFv2::WebACL	WafV2CfnProvisioner
 AWS::WAFv2::WebACLAssociation	WafV2CfnProvisioner
 Custom::DynamoDBReplica	DynamoDbCfnProvisioner

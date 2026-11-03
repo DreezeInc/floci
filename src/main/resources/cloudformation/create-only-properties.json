@@ -791,6 +791,14 @@
   "AWS::WAFv2::LoggingConfiguration": [
     "ResourceArn"
   ],
+  "AWS::WAFv2::RegexPatternSet": [
+    "Name",
+    "Scope"
+  ],
+  "AWS::WAFv2::RuleGroup": [
+    "Name",
+    "Scope"
+  ],
   "AWS::WAFv2::WebACL": [
     "Name",
     "Scope"

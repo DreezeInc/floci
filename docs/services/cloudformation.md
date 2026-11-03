@@ -218,7 +218,7 @@ cross-resource references.
 | CloudFront | `CachePolicy`, `Distribution`, `Function` (`KeyValueStoreAssociations` is ignored), `KeyGroup`, `OriginAccessControl`, `OriginRequestPolicy`, `PublicKey`, `ResponseHeadersPolicy` |
 | CloudWatch | `Alarm`, `CompositeAlarm`, `Dashboard`. Composite alarms have backing definitions with name Ref and Arn GetAtt, rollback, and replacement cleanup. Composite actions are stored only; suppression properties are rejected. |
 | CloudWatch Logs | `LogGroup`, `LogStream`, `MetricFilter` |
-| WAFv2 | `IPSet`, `LoggingConfiguration`, `WebACL`, `WebACLAssociation` |
+| WAFv2 | `IPSet`, `LoggingConfiguration`, `RegexPatternSet`, `RuleGroup`, `WebACL`, `WebACLAssociation` |
 | Config | `ConfigRule` |
 | Bedrock AgentCore | `Runtime` (Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored), `RuntimeEndpoint` (Ref returns the endpoint ARN; Tags are accepted and not stored), `Memory` (Ref returns the memory ARN; MemoryStrategies, IndexedKeys, NamespaceKeys and StreamDeliveryResources are accepted and not stored) |
 | CloudFormation | `CustomResource`, `Custom::DynamoDBReplica` (applied natively against DynamoDB, not via a provider Lambda), `Stack` (nested stacks), `Custom::*` (Lambda-backed) |
