@@ -108,6 +108,24 @@ class WafV2IntegrationTest {
     }
 
     @Test
+    @Order(4)
+    void getWebAclByArn() {
+        call("GetWebACL", "{\"ARN\":\"" + webAclArn + "\"}")
+                .then().statusCode(200)
+                .body("WebACL.Id", equalTo(webAclId))
+                .body("WebACL.Name", equalTo("floci-waf-acl"))
+                .body("LockToken", notNullValue());
+    }
+
+    @Test
+    @Order(4)
+    void getWebAclByUnknownArnReturnsNonexistentItem() {
+        call("GetWebACL", "{\"ARN\":\"" + webAclArn.replace(webAclId, "00000000-0000-0000-0000-000000000000") + "\"}")
+                .then().statusCode(400)
+                .body("__type", equalTo("WAFNonexistentItemException"));
+    }
+
+    @Test
     @Order(5)
     void getWebAclWithWrongNameReturnsNonexistentItem() {
         call("GetWebACL",

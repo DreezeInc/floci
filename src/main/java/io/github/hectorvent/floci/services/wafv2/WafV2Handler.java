@@ -122,7 +122,10 @@ public class WafV2Handler {
     }
 
     private Response handleGetWebAcl(JsonNode request) {
-        WebAcl acl = service.getWebAcl(text(request, "Scope"), text(request, "Id"), text(request, "Name"));
+        String arn = text(request, "ARN");
+        WebAcl acl = arn != null && !arn.isBlank()
+                ? service.getWebAclByArn(arn)
+                : service.getWebAcl(text(request, "Scope"), text(request, "Id"), text(request, "Name"));
         ObjectNode response = objectMapper.createObjectNode();
         response.set("WebACL", webAclNode(acl));
         response.put("LockToken", acl.getLockToken());

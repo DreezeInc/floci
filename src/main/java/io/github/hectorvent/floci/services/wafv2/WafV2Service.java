@@ -99,6 +99,14 @@ public class WafV2Service {
         return require(webAclStore, scope, id, name);
     }
 
+    public WebAcl getWebAclByArn(String arn) {
+        WebAcl acl = scanArn(webAclStore, arn);
+        if (acl == null) {
+            throw nonexistentItem();
+        }
+        return acl;
+    }
+
     public String updateWebAcl(WebAcl changes, String scope, String id, String name, String lockToken) {
         WebAcl existing = require(webAclStore, scope, id, name);
         checkLock(existing.getLockToken(), lockToken);
