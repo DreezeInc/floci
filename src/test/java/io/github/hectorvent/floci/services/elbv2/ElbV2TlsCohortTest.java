@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
+import io.github.hectorvent.floci.services.wafv2.WafV2RequestInspector;
 import io.github.hectorvent.floci.testing.InlineMocks;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
@@ -66,6 +67,7 @@ class ElbV2TlsCohortTest {
         when(dataPlane.tlsProxyServer.reservesPort(anyInt())).thenReturn(false);
         dataPlane.vertx = mock(Vertx.class);
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
         dataPlane.certificateResolver = mock(CertificateReferenceResolver.class);
         HttpServer server = mock(HttpServer.class);
         HttpServer otherServer = mock(HttpServer.class);

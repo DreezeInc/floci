@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
+import io.github.hectorvent.floci.services.wafv2.WafV2RequestInspector;
 import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
@@ -65,6 +66,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -121,6 +123,9 @@ public class ElbV2DataPlane {
 
     @Inject
     ObjectMapper objectMapper;
+
+    @Inject
+    WafV2RequestInspector wafInspector;
 
     private final Map<Integer, HttpServer> servers = new ConcurrentHashMap<>();
     private final Map<Integer, PortState> portStates = new ConcurrentHashMap<>();
@@ -811,6 +816,15 @@ public class ElbV2DataPlane {
     }
 
     private void dispatch(HttpServerRequest req, RoutedListener listener) {
+        ListenerBinding binding = listenerBindings.get(listener.arn());
+        Optional<WafV2RequestInspector.BlockResponse> blocked = binding == null ? Optional.empty()
+                : wafInspector.inspect(binding.loadBalancerArn(), () -> inspected(req));
+        if (blocked.isPresent()) {
+            HttpServerResponse response = req.response().setStatusCode(blocked.get().status());
+            blocked.get().headers().forEach(response::putHeader);
+            response.putHeader("Content-Type", blocked.get().contentType()).end(blocked.get().body());
+            return;
+        }
         for (CompiledRule compiled : listener.chain()) {
             if (compiled.matches(req)) {
                 executeAction(req, compiled.action, listener.region(), listener.arn());
@@ -818,6 +832,15 @@ public class ElbV2DataPlane {
             }
         }
         req.response().setStatusCode(502).end("No matching rule");
+    }
+
+    private static WafV2RequestInspector.InspectedRequest inspected(HttpServerRequest req) {
+        Map<String, List<String>> headers = new LinkedHashMap<>();
+        req.headers().forEach(header ->
+                headers.computeIfAbsent(header.getKey(), name -> new ArrayList<>()).add(header.getValue()));
+        String clientIp = req.remoteAddress() == null ? null : req.remoteAddress().hostAddress();
+        return new WafV2RequestInspector.InspectedRequest(req.method().name(), req.path(), req.query(), headers,
+                clientIp);
     }
 
     /**

@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
+import io.github.hectorvent.floci.services.wafv2.WafV2RequestInspector;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Promise;
@@ -553,6 +554,7 @@ class ElbV2ListenerOwnershipTest {
                     HOST, List.of(), KeyAlgorithm.RSA_2048);
             CertificateMaterial material = new CertificateMaterial(CERTIFICATE, pair.certificatePem(), pair.privateKeyPem(), null);
             when(plane.certificateResolver.publishedMaterial(anyString(), eq(REGION), eq(CERTIFICATE))).thenReturn(material);
+            plane.wafInspector = mock(WafV2RequestInspector.class);
             plane.vertx = mock(Vertx.class);
             when(plane.vertx.createHttpServer(any(HttpServerOptions.class))).thenAnswer(call -> {
                 int port = ((HttpServerOptions) call.getArgument(0)).getPort();

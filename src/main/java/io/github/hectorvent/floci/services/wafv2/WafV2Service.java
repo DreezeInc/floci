@@ -294,6 +294,18 @@ public class WafV2Service {
                 .findFirst().orElse(null);
     }
 
+    public IpSet findIpSetByArn(String arn) {
+        return scanArn(ipSetStore, arn);
+    }
+
+    public RegexPatternSet findRegexPatternSetByArn(String arn) {
+        return scanArn(regexStore, arn);
+    }
+
+    public RuleGroup findRuleGroupByArn(String arn) {
+        return scanArn(ruleGroupStore, arn);
+    }
+
     public List<String> listResourcesForWebAcl(String webAclArn) {
         List<String> resources = new ArrayList<>();
         for (String resourceArn : associationStore.keys()) {

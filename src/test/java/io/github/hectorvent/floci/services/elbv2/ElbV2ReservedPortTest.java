@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
+import io.github.hectorvent.floci.services.wafv2.WafV2RequestInspector;
 import io.github.hectorvent.floci.testing.InlineMocks;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
@@ -145,6 +146,7 @@ class ElbV2ReservedPortTest {
         dataPlane.tlsProxyServer = proxy;
         dataPlane.vertx = vertx;
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
 
         Listener listener = new Listener();
         listener.setListenerArn("arn:aws:elasticloadbalancing:us-west-2:000000000000:listener/app/lb/1/2");
@@ -172,6 +174,7 @@ class ElbV2ReservedPortTest {
         when(dataPlane.config.services()).thenReturn(services);
         dataPlane.vertx = mock(Vertx.class);
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
         dataPlane.certificateResolver = mock(CertificateReferenceResolver.class);
         HttpServer server = mock(HttpServer.class);
         when(server.requestHandler(any())).thenReturn(server);
@@ -230,6 +233,7 @@ class ElbV2ReservedPortTest {
         when(dataPlane.config.services()).thenReturn(services);
         dataPlane.vertx = mock(Vertx.class);
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
         dataPlane.certificateResolver = mock(CertificateReferenceResolver.class);
         HttpServer oldServer = mock(HttpServer.class);
         HttpServer newServer = mock(HttpServer.class);
@@ -301,6 +305,7 @@ class ElbV2ReservedPortTest {
         when(dataPlane.config.services()).thenReturn(services);
         dataPlane.vertx = mock(Vertx.class);
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
         HttpServer oldServer = mock(HttpServer.class);
         HttpServer replacement = mock(HttpServer.class);
         Promise<Void> close = Promise.promise();
@@ -351,6 +356,7 @@ class ElbV2ReservedPortTest {
         when(dataPlane.config.services()).thenReturn(services);
         dataPlane.vertx = mock(Vertx.class);
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
         HttpServer oldServer = mock(HttpServer.class);
         HttpServer movedServer = mock(HttpServer.class);
         HttpServer reusedServer = mock(HttpServer.class);
@@ -417,6 +423,7 @@ class ElbV2ReservedPortTest {
         when(dataPlane.config.services()).thenReturn(services);
         dataPlane.vertx = mock(Vertx.class);
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
         HttpServer failed = mock(HttpServer.class);
         HttpServer replacement = mock(HttpServer.class);
         for (HttpServer server : List.of(failed, replacement)) {
@@ -475,6 +482,7 @@ class ElbV2ReservedPortTest {
         when(dataPlane.config.services()).thenReturn(services);
         dataPlane.vertx = mock(Vertx.class);
         dataPlane.elbV2Service = mock(ElbV2Service.class);
+        dataPlane.wafInspector = mock(WafV2RequestInspector.class);
         HttpServer oldServer = mock(HttpServer.class);
         HttpServer replacement = mock(HttpServer.class);
         Promise<HttpServer> oldListen = Promise.promise();
