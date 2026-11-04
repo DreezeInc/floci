@@ -9,6 +9,9 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
 import static io.github.hectorvent.floci.testing.WafV2Requests.waf;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
@@ -99,7 +102,7 @@ class CloudFormationWafV2RegexPatternSetRuleGroupIntegrationTest {
             .body("RuleGroup.ARN", equalTo(arn))
             .body("RuleGroup.Capacity", equalTo(10))
             .body("RuleGroup.LabelNamespace", equalTo(labelNamespace))
-            .body("RuleGroup.Rules[0].Statement.ByteMatchStatement.SearchString", equalTo("first"));
+            .body("RuleGroup.Rules[0].Statement.ByteMatchStatement.SearchString", equalTo(base64("first")));
 
         cfn("UpdateStack", stackName, ruleGroupTemplate(nameA, "second"));
         String updated = completedStack(stackName, "UPDATE_COMPLETE");
@@ -107,7 +110,7 @@ class CloudFormationWafV2RegexPatternSetRuleGroupIntegrationTest {
         assertEquals(id, output(updated, "GroupId"));
         ruleGroup(nameA, id)
             .body("RuleGroup.Capacity", equalTo(10))
-            .body("RuleGroup.Rules[0].Statement.ByteMatchStatement.SearchString", equalTo("second"));
+            .body("RuleGroup.Rules[0].Statement.ByteMatchStatement.SearchString", equalTo(base64("second")));
 
         cfn("UpdateStack", stackName, ruleGroupTemplate(nameB, "second"));
         String replaced = completedStack(stackName, "UPDATE_COMPLETE");
@@ -197,6 +200,58 @@ class CloudFormationWafV2RegexPatternSetRuleGroupIntegrationTest {
     }
 
     @Test
+    void webAclByteMatchSearchStringsReachTheApiBase64Encoded() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-wafv2-bytes-" + suffix;
+        String template = """
+                {
+                  "Resources": {
+                    "Acl": {
+                      "Type": "AWS::WAFv2::WebACL",
+                      "Properties": {
+                        "Scope": "REGIONAL",
+                        "DefaultAction": {"Allow": {}},
+                        "VisibilityConfig": %1$s,
+                        "Rules": [
+                          {
+                            "Name": "both", "Priority": 0, "Action": {"Block": {}},
+                            "Statement": {"AndStatement": {"Statements": [
+                              {"ByteMatchStatement": {
+                                "SearchString": "block",
+                                "FieldToMatch": {"SingleHeader": {"Name": "x-probe"}},
+                                "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                                "PositionalConstraint": "EXACTLY"}},
+                              {"ByteMatchStatement": {
+                                "SearchStringBase64": "%2$s",
+                                "FieldToMatch": {"UriPath": {}},
+                                "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                                "PositionalConstraint": "STARTS_WITH"}}
+                            ]}},
+                            "VisibilityConfig": %1$s
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "Outputs": {"AclRef": {"Value": {"Ref": "Acl"}}}
+                }
+                """.formatted(visibility("acl"), base64("/admin"));
+
+        cfn("CreateStack", stackName, template);
+        String[] acl = output(completedStack(stackName, "CREATE_COMPLETE"), "AclRef").split("\\|");
+
+        waf("GetWebACL", "{\"Name\":\"" + acl[0] + "\",\"Scope\":\"REGIONAL\",\"Id\":\"" + acl[1] + "\"}")
+            .statusCode(200)
+            .body("WebACL.Rules[0].Statement.AndStatement.Statements[0].ByteMatchStatement.SearchString",
+                    equalTo(base64("block")))
+            .body("WebACL.Rules[0].Statement.AndStatement.Statements[1].ByteMatchStatement.SearchString",
+                    equalTo(base64("/admin")))
+            .body(not(containsString("SearchStringBase64")));
+
+        cfn("DeleteStack", stackName, null);
+    }
+
+    @Test
     void createStackWithoutRuleGroupCapacityFailsWithRequiredPropertyReason() {
         String suffix = Long.toString(System.nanoTime(), 36);
         String stackName = "cfn-wafv2-rulegroup-required-" + suffix;
@@ -283,6 +338,10 @@ class CloudFormationWafV2RegexPatternSetRuleGroupIntegrationTest {
                   ]
                 }
                 """.formatted(nameProperty, searchString, visibility("rule"));
+    }
+
+    private static String base64(String text) {
+        return Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
     }
 
     private static String visibility(String metricName) {

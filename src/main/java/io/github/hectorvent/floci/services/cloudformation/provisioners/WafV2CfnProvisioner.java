@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.wafv2.WafV2Service;
@@ -12,7 +13,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -206,7 +209,7 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         long capacity = requiredCapacity(resolved);
         RuleGroup desired = new RuleGroup();
         desired.setDescription(text(resolved, "Description"));
-        desired.setRules(raw(resolved, "Rules"));
+        desired.setRules(rules(resolved));
         desired.setVisibilityConfig(required(raw(resolved, "VisibilityConfig"), RULE_GROUP, "VisibilityConfig"));
         desired.setCustomResponseBodies(raw(resolved, "CustomResponseBodies"));
         Map<String, String> attributesBefore = new HashMap<>(resource.getAttributes());
@@ -422,7 +425,7 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
         WebAcl acl = new WebAcl();
         acl.setDescription(text(props, "Description"));
         acl.setDefaultAction(raw(props, "DefaultAction"));
-        acl.setRules(raw(props, "Rules"));
+        acl.setRules(rules(props));
         acl.setVisibilityConfig(raw(props, "VisibilityConfig"));
         acl.setCustomResponseBodies(raw(props, "CustomResponseBodies"));
         acl.setCaptchaConfig(raw(props, "CaptchaConfig"));
@@ -600,6 +603,34 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
     private String text(JsonNode node, String field) {
         JsonNode value = node == null ? null : node.get(field);
         return value == null || value.isNull() ? null : value.asText();
+    }
+
+    /**
+     * The template's rules in API form: CloudFormation takes a ByteMatchStatement's search string as text in
+     * {@code SearchString} or as base64 in {@code SearchStringBase64}, while the API carries it as a base64 blob.
+     */
+    private String rules(JsonNode props) {
+        JsonNode rules = props == null ? null : props.get("Rules");
+        if (rules == null || !rules.isArray()) {
+            return raw(props, "Rules");
+        }
+        JsonNode apiRules = rules.deepCopy();
+        encodeSearchStrings(apiRules);
+        return apiRules.isEmpty() ? null : apiRules.toString();
+    }
+
+    private static void encodeSearchStrings(JsonNode node) {
+        if (node.get("ByteMatchStatement") instanceof ObjectNode match) {
+            JsonNode base64 = match.remove("SearchStringBase64");
+            JsonNode text = match.get("SearchString");
+            if (base64 != null) {
+                match.put("SearchString", base64.asText());
+            } else if (text != null && text.isTextual()) {
+                match.put("SearchString",
+                        Base64.getEncoder().encodeToString(text.asText().getBytes(StandardCharsets.UTF_8)));
+            }
+        }
+        node.forEach(WafV2CfnProvisioner::encodeSearchStrings);
     }
 
     private String raw(JsonNode node, String field) {

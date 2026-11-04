@@ -6713,6 +6713,10 @@ public class Ec2QueryHandler {
         if (snapshot.getVolumeSize() != null) {
             xml.elem("volumeSize", String.valueOf(snapshot.getVolumeSize()));
         }
+        if ("completed".equals(snapshot.getState())) {
+            // Emulated volumes hold no blocks, so a completed snapshot's full size is zero bytes.
+            xml.elem("fullSnapshotSizeInBytes", "0");
+        }
         if (snapshot.getStartTime() != null) {
             xml.elem("startTime", ISO_FMT.format(snapshot.getStartTime()));
         }

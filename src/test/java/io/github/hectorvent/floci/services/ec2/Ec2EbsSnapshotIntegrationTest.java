@@ -84,6 +84,7 @@ class Ec2EbsSnapshotIntegrationTest {
             .statusCode(200)
             .body("DescribeSnapshotsResponse.snapshotSet.item.status", equalTo("completed"))
             .body("DescribeSnapshotsResponse.snapshotSet.item.progress", equalTo("100%"))
+            .body("DescribeSnapshotsResponse.snapshotSet.item.fullSnapshotSizeInBytes", equalTo("0"))
             .body("DescribeSnapshotsResponse.snapshotSet.item.description", equalTo("before upgrade"))
             .body("DescribeSnapshotsResponse.snapshotSet.item.storageTier", equalTo("standard"))
             .body("DescribeSnapshotsResponse.snapshotSet.item.tagSet.item.value", equalTo("nightly"));
