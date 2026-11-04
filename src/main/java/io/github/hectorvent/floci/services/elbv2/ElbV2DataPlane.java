@@ -639,7 +639,11 @@ public class ElbV2DataPlane {
         requireCompatiblePort(binding.port(), binding.secure(), listenerArn);
     }
 
+    /** Listeners on a port Floci reserves never serve traffic, so their protocols cannot clash. */
     private void requireCompatiblePort(int port, boolean secure, String listenerArn) {
+        if (isReservedByFloci(port)) {
+            return;
+        }
         for (Map.Entry<String, ListenerBinding> entry : listenerBindings.entrySet()) {
             ListenerBinding existing = entry.getValue();
             if (!entry.getKey().equals(listenerArn)

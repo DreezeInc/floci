@@ -12,7 +12,9 @@ public final class ElbV2TestServices {
 
     public static ElbV2Service inMemory(String region, String accountId, Ec2Service ec2Service) {
         ElbV2Service service = new ElbV2Service();
-        service.dataPlane = mock(ElbV2DataPlane.class);
+        ElbV2DataPlane dataPlane = mock(ElbV2DataPlane.class);
+        ElbV2PublicationTestSupport.allowPublications(dataPlane);
+        service.dataPlane = dataPlane;
         service.healthChecker = mock(ElbV2HealthChecker.class);
         service.regionResolver = new RegionResolver(region, accountId);
         service.ec2Service = ec2Service;

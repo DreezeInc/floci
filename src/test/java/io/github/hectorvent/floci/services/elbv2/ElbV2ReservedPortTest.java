@@ -28,6 +28,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntConsumer;
 
@@ -102,6 +104,36 @@ class ElbV2ReservedPortTest {
         ElbV2DataPlane dataPlane = dataPlaneWith(4566, true, 0);
         assertFalse(dataPlane.isReservedByFloci(443),
                 "aws-https-port=0 is the documented escape hatch");
+    }
+
+    @Test
+    void listenersOfAnyProtocolShareAPortFlociReserves() {
+        ElbV2DataPlane dataPlane = dataPlaneWithHttpsListenersOn(443, 8443);
+
+        assertDoesNotThrow(() -> dataPlane.requireCompatibleListenerProtocol("tcp-listener", 443, "TCP"),
+                "nothing serves 443 while Floci holds it, so a TCP listener there cannot clash");
+        assertThrows(ElbV2DataPlane.IncompatibleListenerProtocolException.class,
+                () -> dataPlane.requireCompatibleListenerProtocol("tcp-listener", 8443, "TCP"));
+    }
+
+    private static ElbV2DataPlane dataPlaneWithHttpsListenersOn(int... ports) {
+        ConcurrentHashMap<String, ElbV2DataPlane.ListenerBinding> bindings =
+                new ConcurrentHashMap<>();
+        for (int port : ports) {
+            bindings.put("https-listener-" + port, new ElbV2DataPlane.ListenerBinding(port, "alb.example",
+                    "alb-arn", true, Set.of(), List.of()));
+        }
+        ElbV2DataPlane template = dataPlaneWith(4566, true, 443);
+        EmulatorConfig.ElbV2ServiceConfig elbv2 = mock(EmulatorConfig.ElbV2ServiceConfig.class);
+        when(elbv2.mock()).thenReturn(false);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        when(services.elbv2()).thenReturn(elbv2);
+        when(template.config.services()).thenReturn(services);
+
+        ElbV2DataPlane dataPlane = new ElbV2DataPlane(bindings);
+        dataPlane.config = template.config;
+        dataPlane.tlsProxyServer = template.tlsProxyServer;
+        return dataPlane;
     }
 
     /**
