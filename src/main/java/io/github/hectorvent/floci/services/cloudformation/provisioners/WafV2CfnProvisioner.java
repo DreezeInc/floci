@@ -32,6 +32,8 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String LOGGING_CONFIGURATION = "AWS::WAFv2::LoggingConfiguration";
     private static final String REGEX_PATTERN_SET = "AWS::WAFv2::RegexPatternSet";
     private static final String RULE_GROUP = "AWS::WAFv2::RuleGroup";
+    private static final List<String> ARN_REFERENCE_STATEMENTS = List.of(
+            "IPSetReferenceStatement", "RegexPatternSetReferenceStatement", "RuleGroupReferenceStatement");
 
     private final WafV2Service wafV2Service;
 
@@ -615,11 +617,11 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
             return raw(props, "Rules");
         }
         JsonNode apiRules = rules.deepCopy();
-        encodeSearchStrings(apiRules);
+        toApiShape(apiRules);
         return apiRules.isEmpty() ? null : apiRules.toString();
     }
 
-    private static void encodeSearchStrings(JsonNode node) {
+    private static void toApiShape(JsonNode node) {
         if (node.get("ByteMatchStatement") instanceof ObjectNode match) {
             JsonNode base64 = match.remove("SearchStringBase64");
             JsonNode text = match.get("SearchString");
@@ -630,7 +632,12 @@ public class WafV2CfnProvisioner implements CfnResourceProvisioner {
                         Base64.getEncoder().encodeToString(text.asText().getBytes(StandardCharsets.UTF_8)));
             }
         }
-        node.forEach(WafV2CfnProvisioner::encodeSearchStrings);
+        for (String reference : ARN_REFERENCE_STATEMENTS) {
+            if (node.get(reference) instanceof ObjectNode statement && statement.has("Arn")) {
+                statement.set("ARN", statement.remove("Arn"));
+            }
+        }
+        node.forEach(WafV2CfnProvisioner::toApiShape);
     }
 
     private String raw(JsonNode node, String field) {

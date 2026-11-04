@@ -188,8 +188,10 @@ class CloudFormationWafV2RegexPatternSetRuleGroupIntegrationTest {
 
         waf("GetWebACL", "{\"Name\":\"" + acl[0] + "\",\"Scope\":\"REGIONAL\",\"Id\":\"" + acl[1] + "\"}")
             .statusCode(200)
-            .body(containsString(output(created, "RegexArn")))
-            .body(containsString(output(created, "GroupArn")))
+            .body("WebACL.Rules[0].Statement.RegexPatternSetReferenceStatement.ARN",
+                    equalTo(output(created, "RegexArn")))
+            .body("WebACL.Rules[1].Statement.RuleGroupReferenceStatement.ARN",
+                    equalTo(output(created, "GroupArn")))
             .body("WebACL.Rules[2].Statement.LabelMatchStatement.Key",
                     equalTo(output(created, "GroupLabelNamespace") + "matched"));
 
