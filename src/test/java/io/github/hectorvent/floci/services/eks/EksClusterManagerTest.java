@@ -49,6 +49,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
@@ -3453,6 +3454,52 @@ class EksClusterManagerTest {
         }
 
         @Test
+        void sharedNodeInstanceIsTaggedWithTheNodegroupItStandsFor() {
+            Cluster cluster = new Cluster();
+            cluster.setName("prod-cluster");
+            cluster.setAccountId("123456789012");
+            cluster.setArn("arn:aws:eks:us-west-2:123456789012:cluster/prod-cluster");
+            Instant now = Instant.now();
+            Nodegroup first = new Nodegroup();
+            first.setNodegroupName("first-ng");
+            first.setCreatedAt(now.minusSeconds(60));
+            Nodegroup second = new Nodegroup();
+            second.setNodegroupName("second-ng");
+            second.setCreatedAt(now);
+            nodeGroupStorage.put("prod-cluster/second-ng", second);
+            nodeGroupStorage.put("prod-cluster/first-ng", first);
+
+            manager.startCluster(cluster);
+
+            List<Instance> nodes = manager.listInstances("123456789012", null);
+            assertEquals(1, nodes.size());
+            assertEquals(Optional.of("first-ng"), nodegroupTag(nodes.getFirst()));
+            assertEquals(Optional.of("first-ng"), manager.findInstance("123456789012", null,
+                    nodes.getFirst().getInstanceId()).flatMap(EksClusterManagerTest::nodegroupTag));
+        }
+
+        @Test
+        void sharedNodeInstanceFollowsNodegroupsCreatedAndDeletedAfterItStarted() {
+            Cluster cluster = new Cluster();
+            cluster.setName("prod-cluster");
+            cluster.setAccountId("123456789012");
+            cluster.setArn("arn:aws:eks:us-west-2:123456789012:cluster/prod-cluster");
+            manager.startCluster(cluster);
+            assertEquals(Optional.empty(), nodegroupTag(manager.listInstances("123456789012", null).getFirst()));
+
+            Nodegroup group = new Nodegroup();
+            group.setNodegroupName("late-ng");
+            group.setCreatedAt(Instant.now());
+            nodeGroupStorage.put("prod-cluster/late-ng", group);
+            assertEquals(Optional.of("late-ng"), nodegroupTag(manager.listInstances("123456789012", null).getFirst()));
+
+            nodeGroupStorage.delete("prod-cluster/late-ng");
+            Instance node = manager.listInstances("123456789012", null).getFirst();
+            assertEquals(Optional.empty(), nodegroupTag(node));
+            assertTrue(node.getTags().stream().anyMatch(tag -> "eks:cluster-name".equals(tag.getKey())));
+        }
+
+        @Test
         void topologyLabelsAndProviderIdPreservedWithNodegroup() {
             Cluster cluster = new Cluster();
             cluster.setName("prod-cluster");
@@ -5276,5 +5323,12 @@ class EksClusterManagerTest {
 
             assertEquals(Map.of(), manager.serviceAccountAnnotations(new Cluster(), "karpenter", "karpenter"));
         }
+    }
+
+    private static Optional<String> nodegroupTag(Instance instance) {
+        return instance.getTags().stream()
+                .filter(tag -> "eks:nodegroup-name".equals(tag.getKey()))
+                .map(Tag::getValue)
+                .findFirst();
     }
 }

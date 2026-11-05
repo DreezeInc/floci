@@ -155,6 +155,7 @@ public class EksClusterManager
     static final String CONTROL_PLANE_MANIFEST_TAR_ENTRY = "server/manifests/" + CONTROL_PLANE_MANIFEST_FILE;
     static final String CONTROL_PLANE_MANIFEST_RESOURCE = "eks/control-plane-objects.yaml";
     static final String EBS_CSI_PROVISIONER = "ebs.csi.aws.com";
+    static final String NODEGROUP_NAME_TAG = "eks:nodegroup-name";
     static final String EBS_CSI_SOCKET_IMAGE = "alpine/socat:1.8.0.3";
     static final String EBS_CSI_PROVISIONER_IMAGE = "registry.k8s.io/sig-storage/csi-provisioner:v5.2.0";
     /** The pod identity webhook reads service account annotations through the cluster's own kubectl. */
@@ -3604,11 +3605,11 @@ public class EksClusterManager
         if (accountId == null || accountId.isBlank() || instanceId == null || instanceId.isBlank()) {
             return Optional.empty();
         }
-        return clusterNodeInstances.values().stream()
-                .filter(rec -> accountId.equals(rec.accountId()))
-                .filter(rec -> region == null || region.equals(rec.region()))
-                .map(ClusterNodeRecord::instance)
-                .filter(i -> instanceId.equals(i.getInstanceId()))
+        return clusterNodeInstances.entrySet().stream()
+                .filter(entry -> accountId.equals(entry.getValue().accountId()))
+                .filter(entry -> region == null || region.equals(entry.getValue().region()))
+                .filter(entry -> instanceId.equals(entry.getValue().instance().getInstanceId()))
+                .map(entry -> withNodegroupTag(entry.getKey(), entry.getValue().instance()))
                 .findFirst();
     }
 
@@ -3617,11 +3618,27 @@ public class EksClusterManager
         if (accountId == null || accountId.isBlank()) {
             return List.of();
         }
-        return clusterNodeInstances.values().stream()
-                .filter(rec -> accountId.equals(rec.accountId()))
-                .filter(rec -> region == null || region.equals(rec.region()))
-                .map(ClusterNodeRecord::instance)
+        return clusterNodeInstances.entrySet().stream()
+                .filter(entry -> accountId.equals(entry.getValue().accountId()))
+                .filter(entry -> region == null || region.equals(entry.getValue().region()))
+                .map(entry -> withNodegroupTag(entry.getKey(), entry.getValue().instance()))
                 .toList();
+    }
+
+    /**
+     * Tags the cluster's one shared node with the node group it stands for, the first active one,
+     * as EKS tags a managed node group's instances. Groups come and go after the node registers,
+     * so the tag is settled each time the instance is read.
+     */
+    private Instance withNodegroupTag(String clusterKey, Instance instance) {
+        Cluster cluster = activeClusters.get(clusterKey);
+        Optional<String> nodegroupName = cluster == null ? Optional.empty()
+                : listActiveNodegroups(cluster).stream().findFirst().map(Nodegroup::getNodegroupName);
+        List<Tag> tags = new ArrayList<>(instance.getTags() != null ? instance.getTags() : List.of());
+        tags.removeIf(tag -> NODEGROUP_NAME_TAG.equals(tag.getKey()));
+        nodegroupName.ifPresent(name -> tags.add(new Tag(NODEGROUP_NAME_TAG, name)));
+        instance.setTags(tags);
+        return instance;
     }
 
     private String resolveInstanceRegion(Instance instance, String region) {
