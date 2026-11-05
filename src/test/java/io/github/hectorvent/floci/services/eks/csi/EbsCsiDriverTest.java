@@ -9,6 +9,8 @@ import io.github.hectorvent.floci.services.ec2.Ec2ContainerManager;
 import io.github.hectorvent.floci.services.ec2.Ec2ImageCatalog;
 import io.github.hectorvent.floci.services.ec2.Ec2InstanceTypeCatalog;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
@@ -68,8 +70,6 @@ class EbsCsiDriverTest {
     private static final String ACCOUNT = "000000000000";
     private static final String REGION = "us-east-1";
     private static final String NODE_ADDRESS = "172.18.0.2";
-    private static final EbsCsiNode NODE = new EbsCsiNode("demo", ACCOUNT, REGION, "us-east-1b", "container-1",
-            "i-0123456789abcdef0");
     private static final VolumeCapability MOUNT_RWO = VolumeCapability.newBuilder()
             .setMount(VolumeCapability.MountVolume.newBuilder().setFsType("ext4"))
             .setAccessMode(VolumeCapability.AccessMode.newBuilder()
@@ -81,13 +81,22 @@ class EbsCsiDriverTest {
     private final AtomicReference<String> callerAddress = new AtomicReference<>(NODE_ADDRESS);
     private final AtomicReference<Path> seed = new AtomicReference<>();
     private Ec2Service ec2;
+    private Set<String> nodeRootVolumeIds;
+    private EbsCsiNode node;
     private Server server;
     private ManagedChannel channel;
 
     @BeforeEach
     void setUp() throws Exception {
-        nodesByAddress.put(NODE_ADDRESS, NODE);
         ec2 = realEc2Service();
+        Instance instance = ec2.runInstances(REGION, "ami-test", "m5.large", 1, 1, null, List.of(), null, null,
+                List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        nodeRootVolumeIds = new HashSet<>();
+        ec2.describeVolumes(REGION, null, null).forEach(volume -> nodeRootVolumeIds.add(volume.getVolumeId()));
+        node = new EbsCsiNode("demo", ACCOUNT, REGION, instance.getPlacement().getAvailabilityZone(), "container-1",
+                instance.getInstanceId());
+        nodesByAddress.put(NODE_ADDRESS, node);
         EbsCsiNodes nodes = new FixedNodes(nodesByAddress);
         EbsCsiControllerService controller = new EbsCsiControllerService(nodes, disk, ec2);
         String name = InProcessServerBuilder.generateName();
@@ -141,7 +150,7 @@ class EbsCsiDriverTest {
         assertEquals(3L * EbsCsiControllerService.GIB, response.getVolume().getCapacityBytes());
         assertEquals(3, volume.getSize());
         assertEquals("gp3", volume.getVolumeType());
-        assertEquals("us-east-1b", volume.getAvailabilityZone());
+        assertEquals(node.availabilityZone(), volume.getAvailabilityZone());
         assertEquals(Map.of("CSIVolumeName", "pvc-1",
                 "ebs.csi.aws.com/cluster", "true",
                 "kubernetes.io/created-for/pvc/name", "data-db-0",
@@ -158,7 +167,7 @@ class EbsCsiDriverTest {
                 .getVolume().getVolumeId();
 
         assertEquals(first, second);
-        assertEquals(1, ec2.describeVolumes(REGION, null, null).size());
+        assertEquals(1, driverVolumes().size());
     }
 
     @Test
@@ -188,7 +197,7 @@ class EbsCsiDriverTest {
                             .clearVolumeCapabilities().addVolumeCapabilities(capability).build()));
             assertEquals(Status.Code.INVALID_ARGUMENT, e.getStatus().getCode());
         }
-        assertTrue(ec2.describeVolumes(REGION, null, null).isEmpty());
+        assertTrue(driverVolumes().isEmpty());
     }
 
     @Test
@@ -210,7 +219,7 @@ class EbsCsiDriverTest {
         controller().deleteVolume(DeleteVolumeRequest.newBuilder().setVolumeId(volumeId).build());
         controller().deleteVolume(DeleteVolumeRequest.newBuilder().setVolumeId(volumeId).build());
 
-        assertTrue(ec2.describeVolumes(REGION, null, null).isEmpty());
+        assertTrue(driverVolumes().isEmpty());
         assertEquals(List.of(volumeId, volumeId), disk.deleted);
     }
 
@@ -218,7 +227,7 @@ class EbsCsiDriverTest {
     void nodeInfoNamesTheNodeInstanceAndNoStageStep() {
         NodeGrpc.NodeBlockingStub node = NodeGrpc.newBlockingStub(channel);
 
-        assertEquals("i-0123456789abcdef0", node.nodeGetInfo(NodeGetInfoRequest.getDefaultInstance()).getNodeId());
+        assertEquals(this.node.instanceId(), node.nodeGetInfo(NodeGetInfoRequest.getDefaultInstance()).getNodeId());
         assertEquals(0, node.nodeGetCapabilities(NodeGetCapabilitiesRequest.getDefaultInstance()).getCapabilitiesCount());
     }
 
@@ -240,6 +249,58 @@ class EbsCsiDriverTest {
     }
 
     @Test
+    void aVolumeStaysAttachedToTheNodeInstanceUntilItsLastTargetIsUnpublished() {
+        String volumeId = controller().createVolume(createRequest("pvc-1", EbsCsiControllerService.GIB, Map.of()))
+                .getVolume().getVolumeId();
+        NodeGrpc.NodeBlockingStub kubelet = NodeGrpc.newBlockingStub(channel);
+        String first = "/var/lib/kubelet/pods/a/volumes/kubernetes.io~csi/pvc-1/mount";
+        String second = "/var/lib/kubelet/pods/b/volumes/kubernetes.io~csi/pvc-1/mount";
+
+        kubelet.nodePublishVolume(publishRequest(volumeId, first));
+        kubelet.nodePublishVolume(publishRequest(volumeId, second));
+        Volume attached = onlyVolume();
+        assertEquals("in-use", attached.getState());
+        assertEquals(1, attached.getAttachments().size());
+        assertEquals(node.instanceId(), attached.getAttachments().getFirst().getInstanceId());
+        assertEquals("/dev/xvdaa", attached.getAttachments().getFirst().getDevice());
+
+        kubelet.nodeUnpublishVolume(unpublishRequest(volumeId, first));
+        assertEquals("in-use", onlyVolume().getState());
+
+        kubelet.nodeUnpublishVolume(unpublishRequest(volumeId, second));
+        assertEquals("available", onlyVolume().getState());
+        assertTrue(onlyVolume().getAttachments().isEmpty());
+
+        controller().deleteVolume(DeleteVolumeRequest.newBuilder().setVolumeId(volumeId).build());
+        assertTrue(driverVolumes().isEmpty());
+    }
+
+    @Test
+    void eachVolumeOnTheNodeTakesTheNextFreeDeviceName() {
+        NodeGrpc.NodeBlockingStub kubelet = NodeGrpc.newBlockingStub(channel);
+        String first = controller().createVolume(createRequest("pvc-1", EbsCsiControllerService.GIB, Map.of()))
+                .getVolume().getVolumeId();
+        String second = controller().createVolume(createRequest("pvc-2", EbsCsiControllerService.GIB, Map.of()))
+                .getVolume().getVolumeId();
+
+        kubelet.nodePublishVolume(publishRequest(first, "/target/1"));
+        kubelet.nodePublishVolume(publishRequest(second, "/target/2"));
+
+        assertEquals("/dev/xvdaa", deviceOf(first));
+        assertEquals("/dev/xvdab", deviceOf(second));
+    }
+
+    @Test
+    void unpublishingAVolumeThatWasNeverPublishedLeavesItDetached() {
+        String volumeId = controller().createVolume(createRequest("pvc-1", EbsCsiControllerService.GIB, Map.of()))
+                .getVolume().getVolumeId();
+
+        NodeGrpc.newBlockingStub(channel).nodeUnpublishVolume(unpublishRequest(volumeId, "/target"));
+
+        assertEquals("available", onlyVolume().getState());
+    }
+
+    @Test
     void publishingAVolumeTheNodeAccountDoesNotHoldIsNotFound() {
         StatusRuntimeException e = assertThrows(StatusRuntimeException.class, () -> NodeGrpc.newBlockingStub(channel)
                 .nodePublishVolume(NodePublishVolumeRequest.newBuilder().setVolumeId("vol-0000000000000000a")
@@ -251,19 +312,32 @@ class EbsCsiDriverTest {
 
     @Test
     void theServerNamesTheCallingNodeByTheAddressItConnectsFrom() throws Exception {
-        nodesByAddress.put("127.0.0.1", NODE);
+        nodesByAddress.put("127.0.0.1", node);
         EmulatorConfig config = mock(EmulatorConfig.class);
         EbsCsiServer csi = new EbsCsiServer(config, new FixedNodes(nodesByAddress), disk, ec2);
         csi.start(0);
         ManagedChannel tcp = NettyChannelBuilder.forAddress("127.0.0.1", csi.port()).usePlaintext().build();
         try {
-            assertEquals("i-0123456789abcdef0", NodeGrpc.newBlockingStub(tcp)
+            assertEquals(node.instanceId(), NodeGrpc.newBlockingStub(tcp)
                     .nodeGetInfo(NodeGetInfoRequest.getDefaultInstance()).getNodeId());
         } finally {
             tcp.shutdownNow();
             csi.stop();
         }
         assertEquals(-1, csi.port());
+    }
+
+    private static NodePublishVolumeRequest publishRequest(String volumeId, String target) {
+        return NodePublishVolumeRequest.newBuilder()
+                .setVolumeId(volumeId).setTargetPath(target).setVolumeCapability(MOUNT_RWO).build();
+    }
+
+    private static NodeUnpublishVolumeRequest unpublishRequest(String volumeId, String target) {
+        return NodeUnpublishVolumeRequest.newBuilder().setVolumeId(volumeId).setTargetPath(target).build();
+    }
+
+    private String deviceOf(String volumeId) {
+        return ec2.describeVolumes(REGION, List.of(volumeId), null).getFirst().getAttachments().getFirst().getDevice();
     }
 
     private ControllerGrpc.ControllerBlockingStub controller() {
@@ -279,8 +353,14 @@ class EbsCsiDriverTest {
                 .build();
     }
 
+    private List<Volume> driverVolumes() {
+        return ec2.describeVolumes(REGION, null, null).stream()
+                .filter(volume -> !nodeRootVolumeIds.contains(volume.getVolumeId()))
+                .toList();
+    }
+
     private Volume onlyVolume() {
-        List<Volume> volumes = ec2.describeVolumes(REGION, null, null);
+        List<Volume> volumes = driverVolumes();
         assertEquals(1, volumes.size());
         return volumes.get(0);
     }

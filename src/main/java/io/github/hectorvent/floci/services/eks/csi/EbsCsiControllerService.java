@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
+import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.github.hectorvent.floci.services.eks.csi.v1.ControllerGetCapabilitiesRequest;
 import io.github.hectorvent.floci.services.eks.csi.v1.ControllerGetCapabilitiesResponse;
 import io.github.hectorvent.floci.services.eks.csi.v1.ControllerGrpc;
@@ -26,6 +27,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Creates and deletes the EC2 volumes behind claims, in the account and zone of the cluster that
@@ -200,6 +203,61 @@ final class EbsCsiControllerService extends ControllerGrpc.ControllerImplBase {
         List<Volume> found = RequestScopes.callAs(node.accountId(), node.region(),
                 () -> ec2.describeVolumes(node.region(), null, Map.of("tag:" + NAME_TAG, List.of(name))));
         return found.stream().findFirst();
+    }
+
+    /**
+     * Records the volume as attached to the node's instance, as the EBS CSI controller's publish
+     * step attaches it on AWS, under the first device name that instance has free.
+     */
+    synchronized void attach(EbsCsiNode node, String volumeId) {
+        Volume volume = find(node, volumeId).orElseThrow(() -> Status.NOT_FOUND
+                .withDescription("volume " + volumeId + " does not exist").asRuntimeException());
+        if (volume.getAttachments().stream().anyMatch(a -> node.instanceId().equals(a.getInstanceId()))) {
+            return;
+        }
+        if (!volume.getAttachments().isEmpty()) {
+            throw Status.FAILED_PRECONDITION.withDescription("volume " + volume.getVolumeId()
+                    + " is attached to instance " + volume.getAttachments().getFirst().getInstanceId())
+                    .asRuntimeException();
+        }
+        String device = freeDevice(node);
+        RequestScopes.runAs(node.accountId(), node.region(), () -> ec2.recordVolumeAttachment(
+                node.region(), volume.getVolumeId(), node.instanceId(), device));
+        LOG.infov("Attached EBS volume {0} to {1} as {2} for cluster {3}", volume.getVolumeId(),
+                node.instanceId(), device, node.clusterName());
+    }
+
+    /** Undoes {@link #attach}; a volume that is gone or not attached to the node is left alone. */
+    synchronized void detach(EbsCsiNode node, String volumeId) {
+        Optional<Volume> volume = find(node, volumeId);
+        if (volume.isEmpty() || volume.get().getAttachments().stream()
+                .noneMatch(a -> node.instanceId().equals(a.getInstanceId()))) {
+            return;
+        }
+        RequestScopes.runAs(node.accountId(), node.region(),
+                () -> ec2.recordVolumeDetachment(node.region(), volumeId, node.instanceId()));
+        LOG.infov("Detached EBS volume {0} from {1} for cluster {2}", volumeId, node.instanceId(),
+                node.clusterName());
+    }
+
+    /** The EBS CSI driver's device names run /dev/xvdaa to /dev/xvdzz. */
+    private String freeDevice(EbsCsiNode node) {
+        Set<String> used = RequestScopes.callAs(node.accountId(), node.region(), () -> ec2.describeVolumes(
+                        node.region(), null, Map.of("attachment.instance-id", List.of(node.instanceId()))))
+                .stream()
+                .flatMap(v -> v.getAttachments().stream())
+                .map(VolumeAttachment::getDevice)
+                .collect(Collectors.toSet());
+        for (char first = 'a'; first <= 'z'; first++) {
+            for (char second = 'a'; second <= 'z'; second++) {
+                String device = "/dev/xvd" + first + second;
+                if (!used.contains(device)) {
+                    return device;
+                }
+            }
+        }
+        throw Status.RESOURCE_EXHAUSTED.withDescription("instance " + node.instanceId()
+                + " has no free device name").asRuntimeException();
     }
 
     Optional<Volume> find(EbsCsiNode node, String volumeId) {

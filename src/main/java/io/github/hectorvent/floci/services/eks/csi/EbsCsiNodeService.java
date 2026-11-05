@@ -15,11 +15,16 @@ import io.grpc.stub.StreamObserver;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
 /**
  * Mounts a volume's directory into the pods that claim it. With no stage step, the kubelet goes
- * straight to publishing at each pod's target path.
+ * straight to publishing at each pod's target path. The first publish on the node attaches the
+ * volume to the node's instance and the last unpublish detaches it, as the attach/detach
+ * controller does on AWS.
  */
 final class EbsCsiNodeService extends NodeGrpc.NodeImplBase {
 
@@ -30,6 +35,8 @@ final class EbsCsiNodeService extends NodeGrpc.NodeImplBase {
     private final EbsCsiNodeDisk disk;
     private final EbsCsiControllerService volumes;
     private final Function<Volume, Path> seedOf;
+    private final Map<String, Set<String>> publishedTargets = new ConcurrentHashMap<>();
+    private final Map<String, Object> volumeLocks = new ConcurrentHashMap<>();
 
     EbsCsiNodeService(EbsCsiNodes nodes, EbsCsiNodeDisk disk, EbsCsiControllerService volumes,
                       Function<Volume, Path> seedOf) {
@@ -76,8 +83,17 @@ final class EbsCsiNodeService extends NodeGrpc.NodeImplBase {
                             .withDescription("volume " + request.getVolumeId() + " does not exist in account "
                                     + node.accountId() + " " + node.region())
                             .asRuntimeException());
-            disk.publish(node, volume.getVolumeId(), request.getTargetPath(), request.getReadonly(),
-                    seedOf.apply(volume));
+            synchronized (lockOf(node, volume.getVolumeId())) {
+                volumes.attach(node, volume.getVolumeId());
+                try {
+                    disk.publish(node, volume.getVolumeId(), request.getTargetPath(), request.getReadonly(),
+                            seedOf.apply(volume));
+                } catch (RuntimeException e) {
+                    detachIfUnpublished(node, volume.getVolumeId());
+                    throw e;
+                }
+                targetsOf(node, volume.getVolumeId()).add(request.getTargetPath());
+            }
             return NodePublishVolumeResponse.getDefaultInstance();
         });
     }
@@ -92,8 +108,32 @@ final class EbsCsiNodeService extends NodeGrpc.NodeImplBase {
             if (request.getTargetPath().isBlank()) {
                 throw CsiCalls.invalid("a target path is required");
             }
-            disk.unpublish(CsiCalls.callingNode(nodes), request.getTargetPath());
+            EbsCsiNode node = CsiCalls.callingNode(nodes);
+            synchronized (lockOf(node, request.getVolumeId())) {
+                disk.unpublish(node, request.getTargetPath());
+                targetsOf(node, request.getVolumeId()).remove(request.getTargetPath());
+                detachIfUnpublished(node, request.getVolumeId());
+            }
             return NodeUnpublishVolumeResponse.getDefaultInstance();
         });
+    }
+
+    private static String volumeKey(EbsCsiNode node, String volumeId) {
+        return node.clusterName() + "/" + volumeId;
+    }
+
+    private Object lockOf(EbsCsiNode node, String volumeId) {
+        return volumeLocks.computeIfAbsent(volumeKey(node, volumeId), key -> new Object());
+    }
+
+    private Set<String> targetsOf(EbsCsiNode node, String volumeId) {
+        return publishedTargets.computeIfAbsent(volumeKey(node, volumeId), key -> ConcurrentHashMap.newKeySet());
+    }
+
+    private void detachIfUnpublished(EbsCsiNode node, String volumeId) {
+        if (publishedTargets.computeIfPresent(volumeKey(node, volumeId),
+                (key, targets) -> targets.isEmpty() ? null : targets) == null) {
+            volumes.detach(node, volumeId);
+        }
     }
 }

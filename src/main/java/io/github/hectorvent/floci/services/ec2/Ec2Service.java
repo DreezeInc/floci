@@ -14819,6 +14819,25 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public VolumeAttachment attachVolume(String region, String volumeId, String instanceId, String device) {
+        VolumeAttachmentChange change = recordAttach(region, volumeId, instanceId, device);
+        if (volumeBlockDeviceManager != null) {
+            volumeBlockDeviceManager.attachVolume(change.volume(), change.instance(), device);
+        }
+        return change.attachment();
+    }
+
+    /**
+     * AttachVolume as a record only: DescribeVolumes shows the attachment, but no block device is
+     * made, for a caller that serves the volume's data to the instance itself.
+     */
+    public VolumeAttachment recordVolumeAttachment(String region, String volumeId, String instanceId, String device) {
+        return recordAttach(region, volumeId, instanceId, device).attachment();
+    }
+
+    /** The attachment an attach or detach wrote, with the volume and instance it joins. */
+    private record VolumeAttachmentChange(Volume volume, Instance instance, VolumeAttachment attachment) {}
+
+    private VolumeAttachmentChange recordAttach(String region, String volumeId, String instanceId, String device) {
         ensureDefaultResources(region);
         if (volumeId == null || volumeId.isEmpty()) {
             throw new AwsException("MissingParameter",
@@ -14883,15 +14902,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         volume.getAttachments().add(attachment);
         volume.setState("in-use");
         volumes.put(key(region, volumeId), volume);
-
-        if (volumeBlockDeviceManager != null) {
-            volumeBlockDeviceManager.attachVolume(volume, inst, device);
-        }
-
-        return attachment;
+        return new VolumeAttachmentChange(volume, inst, attachment);
     }
 
     public VolumeAttachment detachVolume(String region, String volumeId, String instanceId, String device, boolean force) {
+        VolumeAttachmentChange change = recordDetach(region, volumeId, instanceId, device, force);
+        if (volumeBlockDeviceManager != null) {
+            volumeBlockDeviceManager.detachVolume(change.volume(), change.instance(), change.attachment().getDevice());
+        }
+        return change.attachment();
+    }
+
+    /** DetachVolume as a record only, undoing {@link #recordVolumeAttachment}. */
+    public VolumeAttachment recordVolumeDetachment(String region, String volumeId, String instanceId) {
+        return recordDetach(region, volumeId, instanceId, null, false).attachment();
+    }
+
+    private VolumeAttachmentChange recordDetach(String region, String volumeId, String instanceId, String device,
+                                                boolean force) {
         if (volumeId == null || volumeId.isEmpty()) {
             throw new AwsException("MissingParameter", "The parameter VolumeId is missing", 400);
         }
@@ -14925,12 +14953,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         volume.getAttachments().clear();
         volume.setState("available");
         volumes.put(key(region, volumeId), volume);
-
-        if (volumeBlockDeviceManager != null) {
-            volumeBlockDeviceManager.detachVolume(volume, inst, target.getDevice());
-        }
-
-        return target;
+        return new VolumeAttachmentChange(volume, inst, target);
     }
 
     private Volume getRequiredVolume(String region, String volumeId) {
