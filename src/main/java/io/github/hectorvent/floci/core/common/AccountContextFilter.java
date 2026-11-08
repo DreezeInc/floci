@@ -101,7 +101,8 @@ public class AccountContextFilter implements ContainerRequestFilter {
             boolean sigV4a = auth.trim().startsWith(SigV4aSignature.ALGORITHM + " ");
             String region = sigV4a
                     ? regionResolver.resolveRegionFromRegionSet(ctx.getHeaderString("X-Amz-Region-Set"))
-                    : regionResolver.resolveRegionFromAuth(auth);
+                    : globalServiceRegion(regionResolver.resolveRegionFromAuth(auth),
+                            SigV4CredentialScope.serviceName(auth));
             applyRegion(region);
             if (rejectUnknownRegion(ctx, region, SigV4CredentialScope.serviceName(auth))) {
                 return;
@@ -125,7 +126,8 @@ public class AccountContextFilter implements ContainerRequestFilter {
                 String region = sigV4a
                         ? regionResolver.resolveRegionFromRegionSet(
                                 ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Region-Set"))
-                        : regionResolver.resolveRegionFromPresignedCredential(credential);
+                        : globalServiceRegion(regionResolver.resolveRegionFromPresignedCredential(credential),
+                                SigV4CredentialScope.serviceNameFromCredential(credential));
                 applyRegion(region);
                 if (rejectUnknownRegion(ctx, region, SigV4CredentialScope.serviceNameFromCredential(credential))) {
                     return;
@@ -161,6 +163,26 @@ public class AccountContextFilter implements ContainerRequestFilter {
     private void applyRegion(String region) {
         requestContext.setRegion(region);
         requestContext.setPartition(regionResolver.partitionForRegion(region));
+    }
+
+    /**
+     * A partition-wide service with no per-region endpoints (IAM, Route 53, CloudFront) is served
+     * at its partition's signing region whatever unpublished label the scope names. An SDK that
+     * resolves such a service's AWS endpoint signs with that region, never with its configured
+     * one; only a client pointed at a custom endpoint, as here, puts its configured label (often
+     * {@code global}) in the scope. Published regions, labels with a colon and regional services
+     * are returned untouched for {@link #rejectUnknownRegion} to judge.
+     */
+    private String globalServiceRegion(String region, Optional<String> signingName) {
+        if (signingName.isEmpty() || RegionResolver.isKnownRegion(region)
+                || RegionResolver.containsArnDelimiter(region)) {
+            return region;
+        }
+        return AwsPartitions.byId(regionResolver.partitionForRegion(region))
+                .globalEndpoint(signingName.get())
+                .filter(endpoint -> !endpoint.regionalized())
+                .map(AwsPartition.GlobalEndpoint::signingRegion)
+                .orElse(region);
     }
 
     /** Refuses delimiters in region interpretations used by request context or downstream dispatch. */

@@ -267,6 +267,49 @@ class AccountContextFilterTest {
         assertEquals(400, aborted.getValue().getStatus());
     }
 
+    /** An SDK pointed at a custom endpoint signs IAM with its configured label; AWS's IAM endpoint never sees it. */
+    @Test
+    void aGlobalServiceSignedForAnUnknownLabelIsServedAtItsSigningRegion() {
+        ContainerRequestContext ctx = mockContext(
+            "AWS4-HMAC-SHA256 Credential=AKID/20260617/global/iam/aws4_request, SignedHeaders=host, Signature=abc",
+            null);
+        filter.filter(ctx);
+        verify(ctx, never()).abortWith(any());
+        assertEquals("us-east-1", requestContext.getRegion());
+        assertEquals("aws", requestContext.getPartition());
+    }
+
+    @Test
+    void aGlobalServiceInAPresignedCredentialIsServedAtItsSigningRegionToo() {
+        ContainerRequestContext ctx = mockContext(null, "AKID/20260617/global/route53/aws4_request");
+        filter.filter(ctx);
+        verify(ctx, never()).abortWith(any());
+        assertEquals("us-east-1", requestContext.getRegion());
+    }
+
+    @Test
+    void aGlobalServiceSignedForAPublishedRegionKeepsThatRegion() {
+        ContainerRequestContext ctx = mockContext(
+            "AWS4-HMAC-SHA256 Credential=AKID/20260617/eu-west-1/iam/aws4_request, SignedHeaders=host, Signature=abc",
+            null);
+        filter.filter(ctx);
+        verify(ctx, never()).abortWith(any());
+        assertEquals("eu-west-1", requestContext.getRegion());
+    }
+
+    /** STS and S3 also have regional endpoints, so an SDK signs them with the label it resolved. */
+    @ParameterizedTest
+    @ValueSource(strings = {"sts", "sqs"})
+    void aRegionalServiceSignedForAnUnknownLabelIsStillRefused(String service) {
+        ContainerRequestContext ctx = mockContext(
+            "AWS4-HMAC-SHA256 Credential=AKID/20260617/global/" + service + "/aws4_request, "
+                + "SignedHeaders=host, Signature=abc",
+            null);
+        filter.filter(ctx);
+        verify(ctx).abortWith(any());
+        assertEquals("global", requestContext.getRegion());
+    }
+
     /** The pattern rule is the SDKs' own: an unpublished label of a known shape is served. */
     @Test
     void aPatternAdmittedUnpublishedRegionIsServed() {

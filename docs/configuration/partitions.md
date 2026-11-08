@@ -93,6 +93,14 @@ Such a label belongs to the deployment's partition. ARNs minted through Floci's 
 resolver use that partition too; services that build their ARNs directly still fall back to
 `aws` for a label no partition publishes.
 
+The one exception is a global service with no regional endpoints (IAM, Route 53, CloudFront,
+Organizations, ...). Against AWS the SDKs sign such a service with the partition's signing
+region whatever region the client was configured with; only a client pointed at a custom
+endpoint puts its configured label in the scope. So a request to such a service signed for an
+unknown label, such as `global`, is served as a request signed for the signing region of the
+deployment's partition (`us-east-1` in `aws`). STS and S3 also have regional endpoints and keep
+the rule above.
+
 A region label containing `:` is always refused because the colon separates ARN fields and
 storage identities. This also applies to `FLOCI_DEFAULT_REGION`; Floci refuses to start with
 a colon in that setting. Existing stored namespaces are not migrated or deleted by this check.
