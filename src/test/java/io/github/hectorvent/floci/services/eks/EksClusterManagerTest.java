@@ -465,6 +465,24 @@ class EksClusterManagerTest {
     }
 
     @Test
+    void serverArgsDisableOnlyTheNetworkPolicyControllerWhenNetworkPolicyIsOff() {
+        List<String> args = EksClusterManager.buildServerArgs(false, false, false, false, null, null);
+
+        assertTrue(args.contains("--disable-network-policy"));
+        assertFalse(args.contains("--flannel-backend=none"));
+        assertFalse(args.contains("--disable-kube-proxy"));
+        assertEquals(1, args.stream().filter("--disable-network-policy"::equals).count());
+    }
+
+    @Test
+    void serverArgsDisableTheNetworkPolicyControllerOnceWhenTheCniIsAlsoDisabled() {
+        List<String> args = EksClusterManager.buildServerArgs(true, false, false, false, null, null);
+
+        assertEquals(1, args.stream().filter("--disable-network-policy"::equals).count());
+        assertTrue(args.contains("--flannel-backend=none"));
+    }
+
+    @Test
     void serverArgsDisableServiceLoadBalancerAndCloudControllerOnlyWhenFlociServesLoadBalancers() {
         List<String> defaults = EksClusterManager.buildServerArgs(false);
         assertFalse(defaults.contains("--disable=servicelb"));

@@ -523,6 +523,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EKS_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Keep EKS containers running when Floci stops |
 | `FLOCI_SERVICES_EKS_DOCKER_NETWORK` | _(none)_ | Docker network for EKS containers |
 | `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
+| `FLOCI_SERVICES_EKS_NETWORK_POLICY` | `true` | Enforce `NetworkPolicy` objects with k3s's embedded controller; `false` matches an EKS VPC CNI without `enableNetworkPolicy` |
 | `FLOCI_SERVICES_EKS_AGENT_NODES` | `false` | Run a k3s agent container for each EC2 instance that joins a cluster, so its node has a kubelet, reports Ready and runs pods |
 | `FLOCI_SERVICES_EKS_FIXED_NODE_CAPACITY` | `false` | Keep the shared node as it started: the first node group records its instance type without recreating the node, so its workloads keep running |
 | `FLOCI_SERVICES_EKS_NODE_RESOURCE_LIMITS` | `true` | Bound the k3s node container by its instance type's vCPUs and memory; `false` leaves it to the Docker host |

@@ -3789,6 +3789,16 @@ public interface EmulatorConfig {
         boolean loadBalancerServices();
 
         /**
+         * When true (default), k3s's embedded network policy controller enforces every
+         * {@code NetworkPolicy}. When false, starts k3s with {@code --disable-network-policy}, as an
+         * EKS cluster whose VPC CNI add-on does not set {@code enableNetworkPolicy} stores
+         * NetworkPolicies without enforcing them. Applies only while the bundled CNI runs; with
+         * {@link #disableCni()} k3s already starts without the controller.
+         */
+        @WithDefault("true")
+        boolean networkPolicy();
+
+        /**
          * When true, each EC2 instance that joins a cluster through its user data runs a k3s agent
          * container of the cluster's image instead of getting a kubelet-less {@code Node} record:
          * the node reports Ready, carries the labels and taints its user data asked for, and runs

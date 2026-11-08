@@ -801,6 +801,7 @@ With `floci.services.eks.agent-nodes: true` (or `FLOCI_SERVICES_EKS_AGENT_NODES=
 | `FLOCI_SERVICES_EKS_EMULATE_EBS_STORAGE` | `false` | Define the stock `gp2` StorageClass and serve `ebs.csi.aws.com` claims as EC2 volumes whose data stays on the node's filesystem |
 | `FLOCI_SERVICES_EKS_EBS_CSI_PORT` | `4591` | Port Floci serves the EBS CSI driver on; cluster nodes reach it on the Docker host address |
 | `FLOCI_SERVICES_EKS_LOAD_BALANCER_SERVICES` | `false` | Start k3s without its service load balancer and give `nlb`-annotated `LoadBalancer` Services an ELBv2 network load balancer, as the EKS in-tree cloud provider does |
+| `FLOCI_SERVICES_EKS_NETWORK_POLICY` | `true` | Enforce `NetworkPolicy` objects with k3s's embedded network policy controller. `false` starts k3s with `--disable-network-policy`: an EKS cluster's VPC CNI enforces no NetworkPolicy unless its add-on configuration sets `enableNetworkPolicy` |
 | `FLOCI_SERVICES_EKS_AGENT_NODES` | `false` | Run a k3s agent container for each EC2 instance that joins a cluster, so its node has a kubelet, reports Ready and runs pods |
 | `FLOCI_SERVICES_EKS_SERIALIZE_IMAGE_PULLS` | `false` | Have each node's kubelet pull one image at a time, k3s's default; the default pulls in parallel, as the EKS AMI's kubelet does |
 | `FLOCI_SERVICES_EKS_IMAGE_CACHE` | `false` | Pull from the public registries below through one pull-through cache container each, on the cluster network, so a repeated pull is served from the cache's storage (see [Caching public images](#caching-public-images)) |

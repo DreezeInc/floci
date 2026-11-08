@@ -705,6 +705,7 @@ public class EksClusterManager
                 config.services().eks().disableCni(),
                 defaultStorageClass,
                 config.services().eks().loadBalancerServices(),
+                config.services().eks().networkPolicy(),
                 serviceCidr,
                 clusterCidr);
         String endpointHost = endpointHost();
@@ -1729,6 +1730,13 @@ public class EksClusterManager
      */
     static List<String> buildServerArgs(boolean disableCni, boolean defaultStorageClass,
             boolean loadBalancerServices, String serviceCidr, String clusterCidr) {
+        return buildServerArgs(disableCni, defaultStorageClass, loadBalancerServices, true,
+                serviceCidr, clusterCidr);
+    }
+
+    /** {@code networkPolicy} false starts k3s without its network policy controller. */
+    static List<String> buildServerArgs(boolean disableCni, boolean defaultStorageClass,
+            boolean loadBalancerServices, boolean networkPolicy, String serviceCidr, String clusterCidr) {
         List<String> serverArgs = new ArrayList<>(List.of("server",
                 "--disable=traefik",
                 "--disable=runtimes",
@@ -1746,6 +1754,8 @@ public class EksClusterManager
             serverArgs.add("--flannel-backend=none");
             serverArgs.add("--disable-network-policy");
             serverArgs.add("--disable-kube-proxy");
+        } else if (!networkPolicy) {
+            serverArgs.add("--disable-network-policy");
         }
         if (serviceCidr != null && !serviceCidr.isBlank()) {
             serverArgs.add("--service-cidr=" + serviceCidr);
