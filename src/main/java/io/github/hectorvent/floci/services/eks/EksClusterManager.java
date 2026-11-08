@@ -860,7 +860,8 @@ public class EksClusterManager
         // `mount --make-rshared /` before k3s starts fixes it; kind's own node image runs
         // the same fix in its entrypoint for the same reason. RSHARE_ENTRYPOINT is POSIX
         // sh-compatible (no bashisms) — the k3s image has no bash, only busybox sh.
-        specBuilder.withEntrypoint(RSHARE_ENTRYPOINT);
+        specBuilder.withEntrypoint(config.services().eks().disableCni()
+                ? RSHARE_ENTRYPOINT : BRIDGE_NETFILTER_ENTRYPOINT);
         specBuilder.withCmd(buildRshareWrappedCmd(serverArgs));
         ContainerSpec spec = specBuilder.build();
 
@@ -1784,6 +1785,26 @@ public class EksClusterManager
     static final List<String> RSHARE_ENTRYPOINT = List.of("sh", "-c",
             "mount --make-rshared / || echo 'floci: WARN: mount --make-rshared / failed; "
                     + "external CNI may not work' >&2; exec /bin/k3s \"$@\"");
+
+    /**
+     * {@link #RSHARE_ENTRYPOINT} that first gets the kernel to load {@code br_netfilter}. Without
+     * it, bridged replies between two pods on one node skip conntrack, so every Service whose
+     * backend shares the client's node fails, cluster DNS included. k3s's own modprobe finds no
+     * host modules inside its container; an iptables {@code physdev} match makes the kernel load
+     * the module itself, which k3s's network policy controller otherwise does as a side effect of
+     * its own rules. The chain is removed again so k3s's iptables backend detection sees no rules,
+     * and k3s does not start when the module is still missing.
+     */
+    static final List<String> BRIDGE_NETFILTER_ENTRYPOINT = List.of("sh", "-c",
+            "mount --make-rshared / || echo 'floci: WARN: mount --make-rshared / failed; "
+                    + "external CNI may not work' >&2; "
+                    + "iptables -N FLOCI-BR-NETFILTER && iptables -A FLOCI-BR-NETFILTER "
+                    + "-m physdev --physdev-is-bridged -j RETURN; "
+                    + "iptables -F FLOCI-BR-NETFILTER; iptables -X FLOCI-BR-NETFILTER; "
+                    + "[ -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || { echo 'floci: ERROR: "
+                    + "br_netfilter is not loaded, so Services between pods on one node cannot "
+                    + "work' >&2; exit 1; }; "
+                    + "exec /bin/k3s \"$@\"");
 
     /**
      * Builds the CMD to pair with {@link #RSHARE_ENTRYPOINT}: an unused $0 placeholder

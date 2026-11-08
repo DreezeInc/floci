@@ -567,6 +567,22 @@ class EksClusterManagerTest {
     }
 
     @Test
+    void bridgeNetfilterEntrypointLoadsTheModuleBeforeK3sAndRefusesToStartWithoutIt() {
+        List<String> entrypoint = EksClusterManager.BRIDGE_NETFILTER_ENTRYPOINT;
+        String script = entrypoint.get(2);
+
+        assertEquals(List.of("sh", "-c"), entrypoint.subList(0, 2));
+        assertTrue(script.startsWith(EksClusterManager.RSHARE_ENTRYPOINT.get(2).split(";")[0]));
+        assertTrue(script.contains("-m physdev --physdev-is-bridged"));
+        assertTrue(script.indexOf("iptables -X FLOCI-BR-NETFILTER") > script.indexOf("-m physdev"));
+        int check = script.indexOf("[ -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || {");
+        assertTrue(check > script.indexOf("iptables -X FLOCI-BR-NETFILTER"));
+        assertTrue(script.indexOf("exit 1; }") > check);
+        assertTrue(script.endsWith("exec /bin/k3s \"$@\""));
+        assertFalse(script.contains("bash"), "the k3s image has no bash, only busybox sh");
+    }
+
+    @Test
     void rshareWrappedCmdPreservesServerArgsAfterThePlaceholder() {
         List<String> serverArgs = EksClusterManager.buildServerArgs(true);
         List<String> wrapped = EksClusterManager.buildRshareWrappedCmd(serverArgs);
@@ -4169,12 +4185,21 @@ class EksClusterManagerTest {
         }
 
         @Test
-        void startClusterAlwaysWrapsK3sInTheRshareEntrypoint() {
-            when(eks.disableCni()).thenReturn(false);
+        void startClusterWithAnExternalCniWrapsK3sInTheRshareEntrypoint() {
+            when(eks.disableCni()).thenReturn(true);
 
             manager.startCluster(cluster());
 
             verify(builder).withEntrypoint(EksClusterManager.RSHARE_ENTRYPOINT);
+        }
+
+        @Test
+        void startClusterWithFlannelLoadsBrNetfilterBeforeK3s() {
+            when(eks.disableCni()).thenReturn(false);
+
+            manager.startCluster(cluster());
+
+            verify(builder).withEntrypoint(EksClusterManager.BRIDGE_NETFILTER_ENTRYPOINT);
             @SuppressWarnings("unchecked")
             ArgumentCaptor<List<String>> cmdCaptor = ArgumentCaptor.forClass(List.class);
             verify(builder).withCmd(cmdCaptor.capture());
