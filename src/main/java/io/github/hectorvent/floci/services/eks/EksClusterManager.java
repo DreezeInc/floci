@@ -156,6 +156,7 @@ public class EksClusterManager
     static final String CONTROL_PLANE_MANIFEST_RESOURCE = "eks/control-plane-objects.yaml";
     static final String EBS_CSI_PROVISIONER = "ebs.csi.aws.com";
     static final String NODEGROUP_NAME_TAG = "eks:nodegroup-name";
+    static final String AUTO_SCALING_GROUP_TAG = "aws:autoscaling:groupName";
     static final String EBS_CSI_SOCKET_IMAGE = "alpine/socat:1.8.0.3";
     static final String EBS_CSI_PROVISIONER_IMAGE = "registry.k8s.io/sig-storage/csi-provisioner:v5.2.0";
     /** The pod identity webhook reads service account annotations through the cluster's own kubectl. */
@@ -3627,18 +3628,36 @@ public class EksClusterManager
 
     /**
      * Tags the cluster's one shared node with the node group it stands for, the first active one,
-     * as EKS tags a managed node group's instances. Groups come and go after the node registers,
-     * so the tag is settled each time the instance is read.
+     * and with that group's Auto Scaling group, as EKS and Auto Scaling tag a managed node group's
+     * instances. Groups come and go after the node registers, so the tags are settled each time the
+     * instance is read.
      */
     private Instance withNodegroupTag(String clusterKey, Instance instance) {
         Cluster cluster = activeClusters.get(clusterKey);
-        Optional<String> nodegroupName = cluster == null ? Optional.empty()
-                : listActiveNodegroups(cluster).stream().findFirst().map(Nodegroup::getNodegroupName);
+        Optional<Nodegroup> nodegroup = cluster == null ? Optional.empty()
+                : listActiveNodegroups(cluster).stream().findFirst();
         List<Tag> tags = new ArrayList<>(instance.getTags() != null ? instance.getTags() : List.of());
-        tags.removeIf(tag -> NODEGROUP_NAME_TAG.equals(tag.getKey()));
-        nodegroupName.ifPresent(name -> tags.add(new Tag(NODEGROUP_NAME_TAG, name)));
+        tags.removeIf(tag -> NODEGROUP_NAME_TAG.equals(tag.getKey())
+                || AUTO_SCALING_GROUP_TAG.equals(tag.getKey()));
+        nodegroup.ifPresent(group -> {
+            tags.add(new Tag(NODEGROUP_NAME_TAG, group.getNodegroupName()));
+            autoScalingGroupName(group).ifPresent(name -> tags.add(new Tag(AUTO_SCALING_GROUP_TAG, name)));
+        });
         instance.setTags(tags);
         return instance;
+    }
+
+    /** The first Auto Scaling group DescribeNodegroup reports under {@code resources}. */
+    static Optional<String> autoScalingGroupName(Nodegroup nodegroup) {
+        if (nodegroup.getResources() instanceof Map<?, ?> resources
+                && resources.get("autoScalingGroups") instanceof List<?> groups
+                && !groups.isEmpty()
+                && groups.getFirst() instanceof Map<?, ?> group
+                && group.get("name") instanceof String name
+                && !name.isBlank()) {
+            return Optional.of(name);
+        }
+        return Optional.empty();
     }
 
     private String resolveInstanceRegion(Instance instance, String region) {

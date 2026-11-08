@@ -3463,9 +3463,11 @@ class EksClusterManagerTest {
             Nodegroup first = new Nodegroup();
             first.setNodegroupName("first-ng");
             first.setCreatedAt(now.minusSeconds(60));
+            first.setResources(autoScalingGroups("eks-first-ng-1a2b3c4d"));
             Nodegroup second = new Nodegroup();
             second.setNodegroupName("second-ng");
             second.setCreatedAt(now);
+            second.setResources(autoScalingGroups("eks-second-ng-5e6f7a8b"));
             nodeGroupStorage.put("prod-cluster/second-ng", second);
             nodeGroupStorage.put("prod-cluster/first-ng", first);
 
@@ -3474,8 +3476,30 @@ class EksClusterManagerTest {
             List<Instance> nodes = manager.listInstances("123456789012", null);
             assertEquals(1, nodes.size());
             assertEquals(Optional.of("first-ng"), nodegroupTag(nodes.getFirst()));
-            assertEquals(Optional.of("first-ng"), manager.findInstance("123456789012", null,
-                    nodes.getFirst().getInstanceId()).flatMap(EksClusterManagerTest::nodegroupTag));
+            assertEquals(Optional.of("eks-first-ng-1a2b3c4d"), autoScalingGroupTag(nodes.getFirst()));
+            Optional<Instance> found = manager.findInstance("123456789012", null,
+                    nodes.getFirst().getInstanceId());
+            assertEquals(Optional.of("first-ng"), found.flatMap(EksClusterManagerTest::nodegroupTag));
+            assertEquals(Optional.of("eks-first-ng-1a2b3c4d"),
+                    found.flatMap(EksClusterManagerTest::autoScalingGroupTag));
+        }
+
+        @Test
+        void sharedNodeInstanceHasNoAutoScalingGroupTagWhenItsNodegroupReportsNone() {
+            Cluster cluster = new Cluster();
+            cluster.setName("prod-cluster");
+            cluster.setAccountId("123456789012");
+            cluster.setArn("arn:aws:eks:us-west-2:123456789012:cluster/prod-cluster");
+            Nodegroup group = new Nodegroup();
+            group.setNodegroupName("bare-ng");
+            group.setCreatedAt(Instant.now());
+            nodeGroupStorage.put("prod-cluster/bare-ng", group);
+
+            manager.startCluster(cluster);
+
+            Instance node = manager.listInstances("123456789012", null).getFirst();
+            assertEquals(Optional.of("bare-ng"), nodegroupTag(node));
+            assertEquals(Optional.empty(), autoScalingGroupTag(node));
         }
 
         @Test
@@ -3490,12 +3514,16 @@ class EksClusterManagerTest {
             Nodegroup group = new Nodegroup();
             group.setNodegroupName("late-ng");
             group.setCreatedAt(Instant.now());
+            group.setResources(autoScalingGroups("eks-late-ng-9c0d1e2f"));
             nodeGroupStorage.put("prod-cluster/late-ng", group);
-            assertEquals(Optional.of("late-ng"), nodegroupTag(manager.listInstances("123456789012", null).getFirst()));
+            Instance tagged = manager.listInstances("123456789012", null).getFirst();
+            assertEquals(Optional.of("late-ng"), nodegroupTag(tagged));
+            assertEquals(Optional.of("eks-late-ng-9c0d1e2f"), autoScalingGroupTag(tagged));
 
             nodeGroupStorage.delete("prod-cluster/late-ng");
             Instance node = manager.listInstances("123456789012", null).getFirst();
             assertEquals(Optional.empty(), nodegroupTag(node));
+            assertEquals(Optional.empty(), autoScalingGroupTag(node));
             assertTrue(node.getTags().stream().anyMatch(tag -> "eks:cluster-name".equals(tag.getKey())));
         }
 
@@ -5326,9 +5354,21 @@ class EksClusterManagerTest {
     }
 
     private static Optional<String> nodegroupTag(Instance instance) {
+        return tagValue(instance, "eks:nodegroup-name");
+    }
+
+    private static Optional<String> autoScalingGroupTag(Instance instance) {
+        return tagValue(instance, "aws:autoscaling:groupName");
+    }
+
+    private static Optional<String> tagValue(Instance instance, String key) {
         return instance.getTags().stream()
-                .filter(tag -> "eks:nodegroup-name".equals(tag.getKey()))
+                .filter(tag -> key.equals(tag.getKey()))
                 .map(Tag::getValue)
                 .findFirst();
+    }
+
+    private static Map<String, Object> autoScalingGroups(String name) {
+        return Map.of("autoScalingGroups", List.of(Map.of("name", name)));
     }
 }
